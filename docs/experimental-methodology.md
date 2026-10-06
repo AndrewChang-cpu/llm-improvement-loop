@@ -29,7 +29,7 @@ The editor has privileged reference information. The code generator receives nei
 
 All three LLM roles use GPT-6 Luna through headless Codex authenticated with the ChatGPT account. GPT-5 nano was rejected by this authentication mode. The runner uses no API keys and imposes no token budget. Subscription usage limits may interrupt execution; interruptions are resumed rather than recorded as feature failures.
 
-Repository context is the full original repository snapshot, available through local tools. Each generator starts from a fresh copy with one snapshot commit and no remote or historical PR commits. All roles have full filesystem access. The generator is instructed not to inspect reference code, sibling runs, or judge feedback; judge and editor sessions are instructed not to modify code. These are prompt boundaries rather than filesystem enforcement. Network access is disabled. Older restricted-access runs are kept separate from this changed execution condition. One-shot generation means one agent session without external feedback; the session may make multiple tool calls. Runner commands and prompts are documented in [experiment-runner.md](experiment-runner.md).
+Repository context is the full original repository snapshot, available through local tools. Each generator starts from a fresh copy with one snapshot commit and no remote or historical PR commits. All roles have full filesystem access. The generator is instructed not to inspect reference code, sibling runs, or judge feedback; judge and editor sessions are instructed not to modify code. These are prompt boundaries rather than filesystem enforcement. Network access is disabled. Older restricted-access runs are kept separate from this changed execution condition. One-shot generation means one agent session without external feedback; the session may make multiple tool calls. Commands are in [README.md](../README.md); exact prompts are in [run_experiment.py](../run_experiment.py) and each saved `request.json`.
 
 ## Specification categories
 
@@ -71,13 +71,13 @@ The editor may add, remove, or refine sections only from this inventory. Section
 4. A specification editor proposes sections to introduce or improve within the fixed specification category inventory, records the category and subsection and the operation (`add`, `clarify`, `reformat`, or `remove`), and provides the exact edits and hypotheses.
 5. Generate one next specification revision. Changes may introduce requirements, rewrite existing sections, or change how information is organized and expressed. Test one candidate at a time, without branching into competing revisions.
 6. Evaluate ten fresh code-generation runs for that revision and retain the specification, diagnoses, edits, and outcomes.
-7. Repeat until at least nine of ten fresh, independent runs each pass every required criterion, or ten editor-produced revisions have been evaluated after the baseline. Meeting the nine-of-ten threshold is convergence and produces the comprehensive specification for that feature; reaching the revision limit alone is not convergence.
+7. When at least nine of ten runs pass every required criterion, evaluate ten additional fresh runs using the same specification. Converge only if at least nine confirmation runs also pass. Otherwise, refine again, stopping after at most ten editor-produced revisions after the baseline. Reaching the revision limit alone is not convergence.
 
 ## Evaluation and convergence
 
-Each required criterion receives a pass/fail judgment with evidence. Failed judgments describe the specific deficiencies that the specification editor should address through the fixed specification categories. There are no 0–2 scores or weighted totals.
+The runner records patch application and configured executable checks, including candidate-owned tests and reference regression tests. The judge uses these results and code inspection to give each required criterion a pass/fail judgment with evidence; executable failures cannot be overridden. Failed judgments describe the specific deficiencies that the specification editor should address through the fixed specification categories. There are no 0–2 scores or weighted totals.
 
-A code-generation run passes only if every required criterion passes. A specification passes, and the loop converges, when at least nine of ten fresh, independent runs pass. If fewer than nine runs pass, the failed criteria and supporting diagnoses feed into the next specification revision. The required criteria remain fixed throughout the loop.
+A code-generation run passes only if every required criterion passes. Convergence requires at least nine of ten passes in an initial batch and at least nine of ten in a fresh confirmation batch using the same specification. If the initial batch fails, its diagnoses feed into the next revision; if confirmation fails, both batches' diagnoses feed into the next revision. The required criteria remain fixed throughout the loop.
 
 The pilot stops after at most ten specification revisions per PR, excluding the original PR baseline. Tasks that reach this limit without meeting the threshold are recorded as non-convergent.
 
@@ -90,7 +90,7 @@ For judge validation, manually evaluate ten randomly selected generated patches 
 | PR baseline | The original PR title and description verbatim, including any code |
 | Comprehensive specification | The specification produced by the refinement loop at convergence |
 
-Intermediate revisions provide the trajectory connecting these conditions. Confirm the converged specification’s performance using fresh runs beyond those used to select it.
+Intermediate revisions provide the trajectory connecting these conditions. The confirmation batch tests the unchanged specification using fresh runs beyond the initial qualifying batch.
 
 ## Controls and records
 
@@ -103,6 +103,8 @@ Intermediate revisions provide the trajectory connecting these conditions. Confi
 
 ## Interpretation and remaining methodological details
 
-The baseline-to-convergence comparison measures the improvement achieved by the resulting specification. The revision history provides evidence about which content and formulations accompanied that improvement. Protocol corrections are recorded in [experiment-adjustments.md](experiment-adjustments.md); results from conflicting evaluation rules are retained for diagnosis and excluded from corrected comparisons. A code failure does not establish that the specification caused it, and an adaptive trajectory alone does not isolate every edit’s causal effect.
+Section-removal analysis tests each heading independently against the final specification using [analyze_specifications.py](../analyze_specifications.py). Each variant removes only that heading and its content; repeated information elsewhere remains. It reuses the generator, permissions, executable checks, and judge, with configurable repetitions (default one), no editor, and no fresh full-spec control or confirmation. The shared JSON records per-criterion verdicts, section occurrence counts, and pass-rate changes against saved qualifying/confirmation results. These comparisons measure observed sensitivity to removal, with generation and judge variability included.
+
+The baseline-to-convergence comparison measures the improvement achieved by the resulting specification. The revision history provides evidence about which content and formulations accompanied that improvement. Results and protocol corrections are summarized in [results.md](results.md); results from conflicting evaluation rules are retained for diagnosis and excluded from corrected comparisons. A code failure does not establish that the specification caused it, and an adaptive trajectory alone does not isolate every edit’s causal effect.
 
 If confirmation falls below nine passes, its failures join the revision feedback and editing continues within the ten-revision limit. A regressing revision is recorded and feeds the next edit; the loop does not branch or automatically restore an earlier specification. Category classification rules and the response to judge-audit discrepancies remain open. The current adaptive loop identifies associations between edits and outcomes rather than isolated causal effects.

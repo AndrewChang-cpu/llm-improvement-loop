@@ -66,7 +66,7 @@ Toulmin Role: Backing
 
 Wohlin et al. (2024), Experimentation in Software Engineering. Springer.
 
-This textbook describes how to design controlled software engineering experiments, specifically covering factor isolation (holding blocking variables constant while mutating a single independent variable) and categorizing various validity threats. This justifies my methodology of holding the target repository and base LLM constant while mutating one RE category at a time.
+This textbook describes how to design controlled software engineering experiments, specifically covering factor isolation (holding blocking variables constant while mutating a single independent variable) and categorizing various validity threats. It informs the controls and validity assessment for this project. The refinement loop holds the target repository and model constant but may change multiple specification categories in one revision; it does not isolate individual category effects.
 
 Toulmin Role: Backing
 

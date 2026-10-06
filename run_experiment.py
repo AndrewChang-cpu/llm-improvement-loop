@@ -305,7 +305,9 @@ def judge_prompt(task, generated, checks=None):
                           "reference": task["reference"], "generated": str(generated)}, indent=2))
 
 
-def evaluate_batch(task, output, agent, specification):
+def evaluate_batch(task, output, agent, specification, runs=10):
+    if runs < 1:
+        raise ValueError("Batch size must be positive")
     def evaluate_run(number):
         run = output / f"run-{number:02d}"
         generated = run / "generated"
@@ -351,8 +353,8 @@ def evaluate_batch(task, output, agent, specification):
         return verdict
 
     # Each lane has its own repository and logs; only the frozen reference is shared read-only.
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        results = list(pool.map(evaluate_run, range(10)))
+    with ThreadPoolExecutor(max_workers=min(10, runs)) as pool:
+        results = list(pool.map(evaluate_run, range(runs)))
     write_json(output / "batch.json", {"passes": sum(r["passed"] for r in results), "runs": results})
     return results
 
