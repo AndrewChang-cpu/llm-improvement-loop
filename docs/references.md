@@ -174,6 +174,7 @@ Toulmin Role: Context/Terminology
 
 ## Model documentation
 
-- GPT-5 nano: https://developers.openai.com/api/docs/models/gpt-5-nano
+- Codex models: https://developers.openai.com/codex/models
+- Headless Codex: https://developers.openai.com/codex/noninteractive
 
-The initial pilot uses GPT-5 nano for code generation. Model assignments for the behavioral-prompt generator, specification editor, and judge are not yet specified.
+All pilot roles use GPT-6 Luna through ChatGPT-authenticated Codex. The installed CLI successfully completed a GPT-6 Luna request; GPT-5 nano was rejected for ChatGPT account authentication.
