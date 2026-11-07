@@ -44,25 +44,30 @@ class SimplificationTests(unittest.TestCase):
             factory.return_value.run.return_value = {
                 "specification": "word " * 95, "changes": "Removed repetition"}
             result = simplification.simplify("example", self.output)
-            self.assertEqual(result["stop_reason"], "reduction_below_10_percent")
+            self.assertEqual(result["stop_reason"], "no_qualifying_candidate")
             self.assertEqual(result["starting_results"]["full_passes"], 10)
             evaluate.assert_not_called()
             self.assertTrue((self.output / "starting-batch-source.json").exists())
 
-    def test_accepts_exact_ten_percent_then_stops_on_regression_and_keeps_incumbent(self):
+    def test_selects_shortest_passing_candidate_then_stops_and_resumes(self):
         with patch.object(runner, "Codex") as factory, patch.object(
-                runner, "evaluate_batch", side_effect=[verdicts(10), verdicts(10), verdicts(9)]) as evaluate:
+                runner, "evaluate_batch", side_effect=[verdicts(n) for n in [10, 10, 9, 10, 9, 9, 9]]) as evaluate:
             factory.return_value.run.side_effect = [
-                {"specification": "word " * 90, "changes": "Removed repetition"},
-                {"specification": "word " * 81, "changes": "Shortened instructions"}]
+                {"specification": "word " * n, "changes": "Removed repetition"}
+                for n in [90, 70, 80, 72, 56, 60]]
             result = simplification.simplify("example", self.output)
-            self.assertEqual(result["stop_reason"], "candidate_below_10_of_10")
-            self.assertEqual(result["final_words"], 90)
-            self.assertEqual(len(result["accepted_attempts"]), 1)
-            self.assertEqual(evaluate.call_count, 3)
-            self.assertEqual(simplification.word_count((self.output / "simplified-specification.md").read_text()), 90)
-            self.assertTrue((self.output / "attempt-02/candidate-specification.md").exists())
+            self.assertEqual(result["stop_reason"], "no_qualifying_candidate")
+            self.assertEqual(result["final_words"], 80)
+            self.assertEqual(len(result["accepted_rounds"]), 1)
+            self.assertEqual(result["accepted_rounds"][0]["selected_candidate"], 3)
+            self.assertEqual(evaluate.call_count, 7)
+            self.assertEqual(simplification.word_count((self.output / "simplified-specification.md").read_text()), 80)
             self.assertFalse((self.output / "confirmation").exists())
+            calls = factory.return_value.run.call_args_list
+            self.assertEqual([call.args[1] for call in calls[:3]], [calls[0].args[1]] * 3)
+            for i, call in enumerate(calls):
+                feedback = runner.read_json(call.args[2] / "feedback.json")
+                self.assertEqual(simplification.word_count(feedback["current_specification"]), 100 if i < 3 else 80)
             evaluate.reset_mock()
             factory.return_value.run.reset_mock()
             self.assertEqual(simplification.simplify("example", self.output), result)
@@ -73,16 +78,27 @@ class SimplificationTests(unittest.TestCase):
                 simplification.simplify("example", self.output)
             self.assertEqual(runner.read_json(self.output / "result.json"), result)
 
-    def test_insufficient_reduction_stops_without_evaluating_candidate(self):
+    def test_both_out_of_range_bounds_skip_evaluation(self):
         with patch.object(runner, "Codex") as factory, patch.object(
                 runner, "evaluate_batch", return_value=verdicts(10)) as evaluate:
-            factory.return_value.run.return_value = {
-                "specification": "word " * 91, "changes": "A small reduction"}
+            factory.return_value.run.side_effect = [
+                {"specification": "word " * n, "changes": "A reduction"} for n in [91, 69, 65]]
             result = simplification.simplify("example", self.output)
-            self.assertEqual(result["stop_reason"], "reduction_below_10_percent")
+            self.assertEqual(result["stop_reason"], "no_qualifying_candidate")
             self.assertEqual(result["final_words"], 100)
             self.assertEqual(evaluate.call_count, 1)
-            self.assertFalse((self.output / "attempt-01/batch.json").exists())
+            self.assertFalse(any(c["length_passed"] for c in result["last_round"]["candidates"]))
+
+    def test_word_bounds_round_inward(self):
+        self.input = (*self.input[:3], "word " * 101, self.input[4])
+        with patch.object(simplification, "load_experiment", return_value=self.input), patch.object(
+                runner, "Codex") as factory, patch.object(
+                runner, "evaluate_batch", side_effect=[verdicts(10), verdicts(9)]) as evaluate:
+            factory.return_value.run.side_effect = [
+                {"specification": "word " * n, "changes": "A reduction"} for n in [70, 91, 71]]
+            result = simplification.simplify("example", self.output)
+            self.assertEqual([c["length_passed"] for c in result["last_round"]["candidates"]], [False, False, True])
+            self.assertEqual(evaluate.call_count, 2)
 
     def test_nine_pass_starting_batch_does_not_qualify_or_call_editor(self):
         with patch.object(runner, "Codex") as factory, patch.object(

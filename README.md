@@ -34,10 +34,10 @@ Runner validation, when needed: `python3 -m unittest discover -s tests -v`.
 The section-removal analysis below records the earlier protocol. New simplification validation uses:
 
 ```sh
-python3 simplify_specifications.py sphinx-heading-reru seaborn-heading-run --output .experiments/simplification-validation-2026-11-07
+python3 simplify_specifications.py .experiments/new-sphinx-run .experiments/new-seaborn-run --output .experiments/simplification-search
 ```
 
-It reuses a current-protocol 10/10 qualifying batch, or rechecks a historical starting specification with ten fresh implementations, then asks the editor for at least a 10% word-count reduction. Only 10/10 candidates are retained. The first insufficient reduction or failed batch stops simplification and preserves the last passing version. A starting batch below 10/10 does not qualify for simplification. There is no confirmation batch or one-section restriction. Counts use whitespace-separated words, including headings. Historical runs remain unchanged; new refinement runs use the current 10/10 stopping rule.
+It reuses a current-protocol 10/10 qualifying batch, or rechecks a historical starting specification with ten fresh implementations. Each round asks three independent editor sessions to shorten the same retained specification by 10–30%. All three drafts are proposed before evaluation. Each in-range draft receives ten fresh implementations; the shortest draft scoring 10/10 becomes the next incumbent. Ties use candidate order. The first round without a qualifying candidate stops the search and preserves the previous passing version. There is no confirmation batch or one-section restriction. Word counts include headings. Historical runs remain unchanged.
 
 Results and word counts are in the output directory's `summary.json`; each experiment keeps proposals, decisions, and detailed evaluation artifacts. Repeating the command resumes saved calls; changed inputs require a fresh output directory.
 
