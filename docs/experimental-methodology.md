@@ -4,6 +4,12 @@ Research framing and evaluation criteria: [research-design.md](research-design.m
 
 The main experiment investigates how specification content and formulation evolve in response to structural failures, and whether that refinement converges to a specification that reliably communicates the intended implementation. The loop produces the comprehensive specification; it is not assembled in advance by adding every selected category to an unchanged baseline.
 
+## Current simplification validation
+
+The current agreed protocol targets 10/10 passing implementations in one batch, without confirmation. After finding a passing specification, an editor proposes a version at least 10% shorter than the current passing version. The script counts whitespace-separated words, including headings. It retains a candidate only if it meets the reduction threshold and all ten fresh implementations pass every criterion. It stops at the first insufficient reduction or failed batch, retaining the last passing specification. There is no restriction to adding one section, no repair of rejected simplifications, and no separate ablation analysis for this protocol.
+
+First validate simplification on the existing Sphinx and Seaborn experiments using `simplify_specifications.py`. Each starting specification receives a fresh ten-run qualification batch; a score below 10/10 is recorded as not qualified, without editing or repeated attempts to obtain a passing batch. Historical results remain unchanged. The implementation currently adds standalone simplification validation; `run_experiment.py` still implements the older refinement/confirmation procedure described below. Integration into the full refinement command and the 100-PR run await review of validation results.
+
 ## Initial pilot
 
 The first run covers two FEA-Bench tasks:

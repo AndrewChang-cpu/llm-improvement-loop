@@ -31,6 +31,16 @@ Runner validation, when needed: `python3 -m unittest discover -s tests -v`.
 
 ## Section-removal analysis
 
+The section-removal analysis below records the earlier protocol. New simplification validation uses:
+
+```sh
+python3 simplify_specifications.py sphinx-heading-reru seaborn-heading-run --output .experiments/simplification-validation-2026-11-07
+```
+
+It rechecks each starting specification with ten fresh implementations, then asks the editor for at least a 10% word-count reduction. Only 10/10 candidates are retained. The first insufficient reduction or failed batch stops simplification and preserves the last passing version. A starting batch below 10/10 does not qualify for simplification. There is no confirmation batch or one-section restriction. Counts use whitespace-separated words, including headings. Historical runs remain unchanged; the original refinement command above still uses its earlier stopping rule.
+
+Results and word counts are in the output directory's `summary.json`; each experiment keeps proposals, decisions, and detailed evaluation artifacts. Repeating the command resumes saved calls; changed inputs require a fresh output directory.
+
 ```sh
 python3 analyze_specifications.py sphinx-heading-reru seaborn-heading-run
 ```

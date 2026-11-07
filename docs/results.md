@@ -1,5 +1,34 @@
 # Pilot results
 
+## Simplification validation (2026-11-07)
+
+Fresh starting-specification batches used the current 10/10 requirement, with no confirmation. Historical results below remain unchanged.
+
+| Existing experiment | Starting words | Fresh passes | Outcome |
+| --- | ---: | ---: | --- |
+| `sphinx-heading-reru` | 667 | 6/10 | Did not qualify for simplification |
+| `seaborn-heading-run` | 588 | 9/10 | Did not qualify for simplification |
+
+Sphinx had four runs with executable failures: two index-caption mismatches, one runtime error, and one malformed generated-test fixture. Seaborn passed every executable check; one judge rejected documentation example naming. Original judgments were retained. Neither task reached the simplification editor, so no live evidence of shortening or retained quality was obtained. The simplification acceptance/stopping logic passed mocked checks as part of 22 passing local tests; the Luna/tool smoke and both reference environments passed. No 100-PR run was started.
+
+[Results JSON](../.experiments/simplification-validation-2026-11-07/summary.json) records the batches and criterion counts. Detailed outputs and logs are in the same validation directory. A shorter specification is accepted only if it reduces whitespace-separated word count by at least 10% and passes 10/10 fresh generations; the first unsuccessful attempt stops the loop and retains its previous passing version.
+
+## Sphinx fresh-batch comparison
+
+The starting specification is byte-for-byte identical to the historical final specification. All patches start from the same implementation-file Git blob (`75c2cdd`). This comparison examines generated patches and recorded checks, not a complete access-log audit for leakage.
+
+| Fresh run | Difference from historical passing implementations | Recorded result |
+| --- | --- | --- |
+| `run-01`, `run-03` | Index text adds the literal words `containing class`: `Alias2 (type alias in containing class example.Class)` instead of `Alias2 (type alias in example.Class)`. Historical passing patches omit those words. | Candidate tests pass; reference tests reject the caption. |
+| `run-02` | `get_index_text` unpacks `name, _ = name_cls`, shadowing the imported translation function `_`. For a nested alias, `_` is `None`, so calling it raises `TypeError`. Historical passing code uses another unpacking name. | Both candidate and reference tests fail. |
+| `run-04` | Implementation passes reference tests, but its generated test strings omit a blank line between `.. py:class:: Container` and the nested directive. The parser interprets the nested directive as signature text instead of class content. | Candidate tests fail. The judge repeats the symptom as a nested-alias implementation deficiency; this comparison instead identifies malformed test input. No verdict was changed. |
+
+The unchanged specification itself uses the ambiguous example “alias (type alias in containing class)”. Two fresh implementations interpret `containing class` literally. This is a concrete specification defect that earlier passing implementations happened to avoid. The two historical failed implementations instead used a different node structure for the `type` marker (`desc_sig_keyword` rather than plain text), which failed reference tree/HTML assertions. Thus the old and new failed samples do not share a single implementation defect.
+
+Sources: [historical revision](../.experiments/sphinx-heading-reru/results/sphinx-doc__sphinx-11989/revision-02/), [fresh batch](../.experiments/simplification-validation-2026-11-07/sphinx-heading-reru/starting-batch/), and [unchanged specification](../.experiments/simplification-validation-2026-11-07/sphinx-heading-reru/starting-specification.md). These findings explain the observed failures but do not establish why their frequency changed or rule out leakage.
+
+## Historical refinement and ablation results
+
 All roles used GPT-6 Luna. A run passes every required criterion; convergence requires at least 9/10 in an initial batch and 9/10 in a fresh confirmation batch using the same specification.
 
 ## Current runs
