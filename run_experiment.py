@@ -127,8 +127,8 @@ def validate_verdict(verdict):
 
 
 def converged(passes):
-    # A run passes only when every criterion passes; convergence requires nine such runs.
-    return len(passes) == 10 and sum(passes) >= 9
+    # Every implementation must pass every criterion; there is no confirmation batch.
+    return len(passes) == 10 and all(passes)
 
 
 def categories_from_docs():
@@ -364,6 +364,7 @@ def run_task(task, output, agent, categories):
     # Refuse to mix cached results with a changed model, task, rubric, or runner.
     settings = {"task": task, "model": agent.model, "categories": categories,
                 "runs": 10, "parallel_runs": 10, "max_revisions": 10,
+                "required_passes": 10, "confirmation": False,
                 "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
     if (output / "settings.json").exists() and read_json(output / "settings.json") != settings:
         raise ValueError("Experiment settings changed. Use a new output directory.")
@@ -395,16 +396,11 @@ def run_task(task, output, agent, categories):
         if baseline_passes is None:
             baseline_passes = passes
         if converged([r["passed"] for r in results]):
-            # Confirm a qualifying specification with ten additional independent generations.
-            confirmation = evaluate_batch(task, directory / "confirmation", agent, specification)
-            if converged([r["passed"] for r in confirmation]):
-                (output / "comprehensive-specification.md").write_text(specification + "\n")
-                result = {"task": task["id"], "status": "converged", "revision": revision,
-                          "baseline_passes": baseline_passes, "final_passes": passes,
-                          "confirmation_passes": sum(r["passed"] for r in confirmation)}
-                write_json(output / "result.json", result)
-                return result
-            results += confirmation
+            (output / "comprehensive-specification.md").write_text(specification + "\n")
+            result = {"task": task["id"], "status": "converged", "revision": revision,
+                      "baseline_passes": baseline_passes, "final_passes": passes}
+            write_json(output / "result.json", result)
+            return result
         if revision == 10:
             break
         editor_context = directory / "editor-context"

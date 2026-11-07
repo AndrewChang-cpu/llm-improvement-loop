@@ -45,8 +45,9 @@ class RunnerTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     runner.validate_verdict(verdict)
 
-    def test_only_nine_complete_run_passes_converge(self):
-        self.assertTrue(runner.converged([True] * 9 + [False]))
+    def test_only_ten_complete_run_passes_converge(self):
+        self.assertTrue(runner.converged([True] * 10))
+        self.assertFalse(runner.converged([True] * 9 + [False]))
         self.assertFalse(runner.converged([True] * 8 + [False] * 2))
         self.assertFalse(runner.converged([True] * 9))
 
@@ -250,7 +251,7 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse((output / "complete.json").exists())
         self.assertEqual((output / "protected-inputs/00-specification.md").read_text(), "original")
 
-    def test_loop_refines_once_confirms_and_resumes_without_new_calls(self):
+    def test_loop_refines_once_without_confirmation_and_resumes_without_new_calls(self):
         base = self.root / "base"
         base.mkdir()
         (base / "feature.py").write_text("value = 0\n")
@@ -270,7 +271,9 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["baseline_passes"], 0)
         self.assertEqual((output / "baseline.md").read_text(), task["description"])
         self.assertFalse(any(role == "baseline" for role, _, _ in fake.calls))
-        self.assertEqual(result["confirmation_passes"], 10)
+        self.assertNotIn("confirmation_passes", result)
+        self.assertFalse((output / "revision-01/confirmation").exists())
+        self.assertEqual(sum(role == "generate" for role, _, _ in fake.calls), 20)
         calls = len(fake.calls)
         self.assertEqual(runner.run_task(task, output, fake, categories), result)
         self.assertEqual(len(fake.calls), calls)

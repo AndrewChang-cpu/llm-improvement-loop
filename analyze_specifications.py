@@ -101,7 +101,10 @@ def load_experiment(value):
     if specification != (revision / "specification.md").read_text():
         raise ValueError("Final specification differs from its evaluated revision")
     saved = []
-    for batch in (revision / "batch.json", revision / "confirmation/batch.json"):
+    batches = [revision / "batch.json"]
+    if settings.get("confirmation", True):
+        batches.append(revision / "confirmation/batch.json")
+    for batch in batches:
         saved.extend(runner.read_json(batch)["runs"])
     for verdict in saved:
         if runner.validate_verdict(verdict) != verdict["passed"]:

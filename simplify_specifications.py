@@ -51,9 +51,19 @@ def simplify(value, output, executable="codex"):
     agent = runner.Codex(settings["model"], executable)
     initial_words = word_count(specification)
     (output / "starting-specification.md").write_text(specification + "\n")
-    print(f"{directory.name}: checking starting specification ({initial_words} words)", flush=True)
-    # Historical convergence may use 9/10; qualify the starting point with fresh runs.
-    verdicts = runner.evaluate_batch(task, output / "starting-batch", agent, specification)
+    if original_settings.get("required_passes") == 10 and original_settings.get("confirmation") is False:
+        # Reuse the qualifying batch instead of reintroducing a confirmation requirement.
+        revision = runner.read_json(source / "result.json")["revision"]
+        batch = source / f"revision-{revision:02d}" / "batch.json"
+        verdicts = runner.read_json(batch)["runs"]
+        if not runner.converged([v["passed"] for v in verdicts]):
+            raise ValueError("Source specification did not pass its recorded 10/10 batch")
+        runner.write_json(output / "starting-batch-source.json", {"batch": str(batch)})
+        print(f"{directory.name}: using qualifying batch ({initial_words} words, 10/10)", flush=True)
+    else:
+        print(f"{directory.name}: checking starting specification ({initial_words} words)", flush=True)
+        # Historical convergence may use 9/10; qualify those specifications with fresh runs.
+        verdicts = runner.evaluate_batch(task, output / "starting-batch", agent, specification)
     starting_results = counts(verdicts)
     accepted = []
 

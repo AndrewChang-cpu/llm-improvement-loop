@@ -36,6 +36,19 @@ class SimplificationTests(unittest.TestCase):
         self.addCleanup(categories.stop)
         self.output = self.root / "output"
 
+    def test_current_protocol_reuses_qualifying_batch_without_confirmation(self):
+        self.settings.update(required_passes=10, confirmation=False)
+        runner.write_json(self.source / "result.json", {"revision": 2})
+        runner.write_json(self.source / "revision-02/batch.json", {"runs": verdicts(10)})
+        with patch.object(runner, "Codex") as factory, patch.object(runner, "evaluate_batch") as evaluate:
+            factory.return_value.run.return_value = {
+                "specification": "word " * 95, "changes": "Removed repetition"}
+            result = simplification.simplify("example", self.output)
+            self.assertEqual(result["stop_reason"], "reduction_below_10_percent")
+            self.assertEqual(result["starting_results"]["full_passes"], 10)
+            evaluate.assert_not_called()
+            self.assertTrue((self.output / "starting-batch-source.json").exists())
+
     def test_accepts_exact_ten_percent_then_stops_on_regression_and_keeps_incumbent(self):
         with patch.object(runner, "Codex") as factory, patch.object(
                 runner, "evaluate_batch", side_effect=[verdicts(10), verdicts(10), verdicts(9)]) as evaluate:
