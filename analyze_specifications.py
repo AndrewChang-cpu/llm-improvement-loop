@@ -88,7 +88,9 @@ def load_experiment(value):
     directory = Path(value).resolve()
     if not directory.is_dir():
         directory = (runner.ROOT / ".experiments" / value).resolve()
-    candidates = list((directory / "results").glob("*/comprehensive-specification.md"))
+    candidates = ([directory / "comprehensive-specification.md"]
+                  if (directory / "comprehensive-specification.md").is_file()
+                  else list((directory / "results").glob("*/comprehensive-specification.md")))
     if len(candidates) != 1:
         raise ValueError(f"Expected one completed task in {directory}")
     source = candidates[0].parent

@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import analyze_specifications as analysis
 import run_experiment as runner
 import simplify_specifications as simplification
 
@@ -35,6 +36,34 @@ class SimplificationTests(unittest.TestCase):
         categories.start()
         self.addCleanup(categories.stop)
         self.output = self.root / "output"
+
+    def test_load_experiment_accepts_a_single_task_directory(self):
+        task_dir = self.root / "direct-task"
+        (task_dir / "revision-00").mkdir(parents=True)
+        for name in ("base", "reference", "generator"):
+            (task_dir / name).mkdir()
+        specification = "# Purpose\nImplement the feature.\n"
+        (task_dir / "comprehensive-specification.md").write_text(specification)
+        (task_dir / "revision-00/specification.md").write_text(specification)
+        rows = [{"criterion": criterion, "passed": True, "evidence": ["feature.py:1"],
+                 "deficiency": ""} for criterion in runner.CRITERIA]
+        runner.write_json(task_dir / "settings.json", {
+            "confirmation": False,
+            "task": {"id": "fixture", "base": str(task_dir / "base"),
+                     "reference": str(task_dir / "reference"),
+                     "generator_python": str(task_dir / "generator"),
+                     "requirements": dict(runner.CRITERIA)},
+            "model": "fake"})
+        runner.write_json(task_dir / "result.json", {"status": "converged", "revision": 0})
+        runner.write_json(task_dir / "revision-00/batch.json", {"runs": [
+            {"passed": True, "criteria": rows} for _ in range(10)]})
+
+        directory, source, _, loaded, historical = analysis.load_experiment(task_dir)
+
+        self.assertEqual(directory, task_dir.resolve())
+        self.assertEqual(source, task_dir.resolve())
+        self.assertEqual(loaded, specification)
+        self.assertEqual(historical["full_passes"], 10)
 
     def test_current_protocol_reuses_qualifying_batch_without_confirmation(self):
         self.settings.update(required_passes=10, confirmation=False)
