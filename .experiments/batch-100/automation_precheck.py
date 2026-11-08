@@ -9,7 +9,7 @@ import sys
 import time
 
 
-def should_run(state_path, lock_path, now=None, max_idle_seconds=7200):
+def should_run(state_path, lock_path, now=None, max_idle_seconds=3600):
     if not state_path.is_file():
         return False
     state = json.loads(state_path.read_text())
@@ -34,7 +34,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--lock", type=Path, required=True)
-    parser.add_argument("--max-idle-seconds", type=int, default=7200)
+    parser.add_argument("--max-idle-seconds", type=int, default=3600)
     args = parser.parse_args()
     if should_run(args.state, args.lock, max_idle_seconds=args.max_idle_seconds):
         return 0

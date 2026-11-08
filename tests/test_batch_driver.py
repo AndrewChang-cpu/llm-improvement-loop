@@ -39,7 +39,7 @@ class BatchDriverTests(unittest.TestCase):
                                          "heartbeat_epoch": heartbeat}))
         write("setup", time.time())
         self.assertFalse(automation_precheck.should_run(state, lock_path))
-        write("setup", time.time() - 7201)
+        write("setup", time.time() - 3601)
         self.assertTrue(automation_precheck.should_run(state, lock_path))
         write("waiting_quota", time.time())
         self.assertTrue(automation_precheck.should_run(state, lock_path))
