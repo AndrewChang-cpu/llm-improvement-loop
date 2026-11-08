@@ -1,0 +1,44 @@
+## Goals
+Add Perc, a statistical transformation for the seaborn objects interface. It replaces observations with values computed at requested percentiles and records each requested percentile level with its computed value.
+
+## Scope
+Define Perc in seaborn._stats.order, export it through seaborn.objects, and make it usable as a Stat in the existing Plot.add workflow. Document the public statistic, including usage examples, in the API documentation and release notes.
+
+## Workflows
+Callers can apply Perc to a plot layer. For each group supplied by the Stat workflow, it computes percentiles of the value variable opposite the plot orientation and returns rows for downstream marks. Group formation and result ordering follow the supplied GroupBy behavior, including orientation grouping and any additional grouping variables chosen by the plot workflow.
+
+## Data model
+Return one row per requested percentile in each group. Each result row contains the computed value in the value column opposite the orientation and the requested level in a percentile column. Retain grouping columns and their group labels when GroupBy combines results. Do not require every non-grouping input column or original coordinate to appear in the result: GroupBy.apply combines the columns returned by the per-group transformation with the grouping keys. Computed values may be floating point, including when source observations are integers. This transformation returns percentile rows, not a single summary estimate or a min/max interval.
+
+## API contracts
+The public statistic is named Perc. Its k parameter accepts either an integer count or a list of percentile levels and defaults to 5. An integer requests that many evenly spaced levels from 0 through 100, inclusive; a list supplies levels directly. Its method parameter is a string selecting NumPy percentile behavior and defaults to linear. The statistic follows the existing Stat call contract: it receives a data frame, a GroupBy, an orientation, and a mapping from variables to Scale objects, and returns a data frame.
+
+## Module architecture
+Define Perc in seaborn._stats.order, alongside the ordering statistics. Export it from seaborn.objects by importing it from that module. Keep percentile computation in the statistics layer as a Stat subclass; do not move it to seaborn._stats.aggregation or implement it as a standalone plotting operation.
+
+## Implementation constraints
+Mark the statistic as grouping by orientation. The orientation identifies the independent axis; compute percentiles from the opposite, value axis: horizontal orientation uses y, and vertical orientation uses x. Apply the per-group data-frame transformation through GroupBy.apply so grouping labels, column arrangement, and established group ordering follow the existing GroupBy behavior. In the Plot workflow, the Stat dispatcher includes the orientation variable among the grouping variables when this statistic declares orientation grouping; consequently, distinct orientation values may form distinct groups. Exclude missing values from the observations used for percentile computation. Preserve requested percentile levels in the result. Accept the scales mapping required by the Stat contract.
+
+## Dependencies
+Use the existing NumPy, pandas, GroupBy, Scale, Stat, and version abstractions. Preserve NumPy compatibility by using its interpolation percentile keyword before version 1.22.0 and its method keyword from version 1.22.0 onward.
+
+## Naming
+Use the public name Perc and parameter names k and method. Use percentile as the result column for percentile levels.
+
+## Validation
+Support the integer-count and explicit-list forms for k. Pass the selected method through to NumPy percentile calculation and preserve the percentile operation's behavior for unsupported inputs or methods. Do not impose interval-only restrictions on list length or add validation that changes the established percentile operation.
+
+## Error handling
+Allow exceptions from the percentile operation for unsupported inputs or methods to propagate.
+
+## Documentation
+Document Perc's parameters and percentile-row output. Explain that integer k requests evenly spaced levels from 0 through 100, while a list supplies levels directly. Describe method as the NumPy percentile choice, with linear as the default, and identify all valid choices: inverted_cdf, averaged_inverted_cdf, closest_observation, interpolated_inverted_cdf, hazen, weibull, linear, median_unbiased, normal_unbiased, lower, higher, midpoint, and nearest. Include public usage examples showing the default quartiles and endpoints, an integer count, an explicit list, and combining percentile output with a range mark to show an interval. Add Perc to the public Stat objects autosummary in doc/api.rst and add a feature entry for objects.Perc to the v0.12.1 release notes.
+
+## Compatibility
+Keep both seaborn._stats.order.Perc and seaborn.objects.Perc available. Support the NumPy percentile keyword conventions on both sides of the 1.22.0 version boundary.
+
+## Behavioral acceptance criteria
+For an integer count, return that many evenly spaced percentile levels, including 0 and 100, with computed values and matching percentile entries. For an explicit list, return one result per listed level. Honor the selected interpolation method. Work with either orientation by computing from the opposite value variable, and with grouped data while preserving GroupBy-defined grouping labels and ordering. Ignore missing observations during computation. Return the calculated value, percentile level, and grouping keys produced by the GroupBy combination; do not require unrelated source columns to survive. Compose with Plot.add and remain usable by a mark when the plot inputs and properties are valid. Results represent percentile rows rather than a point estimate or interval.
+
+## Test requirements
+Follow the neighboring statistics tests' fixture and class-based organization: define a fixture class for shared data and GroupBy setup, then organize Perc tests in a test class inheriting those fixtures, with individual test methods for behaviors. Cover integer counts, explicit levels, computed values, both orientation mappings, interpolation method, grouped data and ordering, missing observations, both import paths, and use as a Plot.add transform. In direct statistic tests, choose GroupBy variables to express the groups intended by the case: grouping by a variable with distinct values creates separate groups, including when that variable is the orientation variable. Assert retained labels for actual grouping variables and the returned value and percentile columns; do not require non-grouping source columns to survive GroupBy.apply. Keep test imports limited to names used by the tests.
