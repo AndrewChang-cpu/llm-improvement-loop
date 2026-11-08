@@ -191,6 +191,9 @@ def run_task(task, agent, categories):
     save(state_path, state)
     write_checkpoint("preparing", task_id, f"prepare {task_id}")
     log_path = task_root / "attempts.log"
+    console = sys.stdout
+    print(f"{task_id}: preparing (attempt {state['attempts']}); log: {log_path}",
+          file=console, flush=True)
     phase = "prepare"
     try:
         with log_path.open("a") as log, redirect_stdout(log), redirect_stderr(log):
@@ -201,6 +204,7 @@ def run_task(task, agent, categories):
             state.update(status="running", updated_at=time.time(), phase=phase)
             save(state_path, state)
             write_checkpoint("running", task_id, f"run {task_id}")
+            print(f"{task_id}: running refinement loop", file=console, flush=True)
             result_dir = BATCH / "results" / task_id
             # Retain the prompt policy of an already-started task when resuming it.
             saved_settings = result_dir / "settings.json"
@@ -212,6 +216,7 @@ def run_task(task, agent, categories):
             result = runner.run_task(prepared, result_dir, agent, categories)
             if result["status"] == "converged":
                 write_checkpoint("simplifying", task_id, f"simplify {task_id}")
+                print(f"{task_id}: converged; running simplification loop", file=console, flush=True)
                 simplify_result = simplify_specifications.simplify(
                     result_dir, BATCH / "simplification" / task_id, agent.executable)
                 result["simplification_status"] = simplify_result["status"]
@@ -289,13 +294,14 @@ def main():
         active_task = None
         try:
             update_html()
-            for task in tasks:
+            for position, task in enumerate(tasks, 1):
                 active_task = task["id"]
                 task_state_path = BATCH / "task-state" / task["id"] / "state.json"
                 if task_state_path.exists() and runner.read_json(task_state_path).get("status") in TERMINAL:
                     continue
                 network_retries = 0
                 while True:
+                    print(f"[{position}/{len(tasks)}] {task['id']}", flush=True)
                     state = run_task(task, agent, categories)
                     summary(tasks)
                     if state["status"] in TERMINAL:
