@@ -47,6 +47,8 @@ def load_task(path):
         spec = spec_path.read_text()
         revisions.append({
             'number': int(folder.name.split('-')[-1]), 'spec': spec,
+            'label': f'Revision {int(folder.name.split("-")[-1])}',
+            'words': len(spec.split()),
             **load_counts(folder),
             'changes': ''.join(difflib.unified_diff(
                 previous.splitlines(keepends=True), spec.splitlines(keepends=True),
@@ -60,32 +62,46 @@ def load_simplification(path):
     settings = json.loads((path / 'settings.json').read_text())
     candidates = []
     for folder in sorted(path.glob('round-*/candidate-*')):
+        decision_path = folder / 'decision.json'
+        if not decision_path.exists():
+            continue
+        decision = json.loads(decision_path.read_text())
+        if not decision.get('accepted'):
+            continue
         spec_path = folder / 'candidate-specification.md'
         if not spec_path.exists():
             continue
         spec = spec_path.read_text()
         current = (folder / 'current-specification.md').read_text()
-        decision_path = folder / 'decision.json'
-        decision = json.loads(decision_path.read_text()) if decision_path.exists() else {}
-        status = ('Retained' if decision.get('accepted') else
-                  'Qualified; not selected' if decision.get('qualified') else
-                  'Rejected' if decision else 'Pending')
         round_number = int(folder.parent.name.split('-')[-1])
-        candidate_number = int(folder.name.split('-')[-1])
         candidates.append({
             'number': len(candidates) + 1,
-            'label': f'R{round_number} C{candidate_number}',
+            'label': f'Simplify {round_number}',
             'spec': spec, **load_counts(folder),
-            'status': status, 'words': len(spec.split()),
+            'words': len(spec.split()),
             'input_words': len(current.split()),
-            'length_rejected': decision.get('length_passed') is False,
             # Sibling proposals share an input; compare each against that input.
             'changes': ''.join(difflib.unified_diff(
                 current.splitlines(keepends=True), spec.splitlines(keepends=True),
                 fromfile='Round input specification', tofile=folder.name)),
         })
-    return {'name': settings['task']['id'] + ' — simplification',
-            'simplification': True, 'revisions': candidates}
+    return {'name': settings['task']['id'], 'revisions': candidates}
+
+
+def load_tasks(directory):
+    results = directory / 'results' if (directory / 'results').is_dir() else directory
+    paths = [results] if list(results.glob('revision-*')) else sorted(results.iterdir())
+    tasks = []
+    for path in paths:
+        if not path.is_dir():
+            continue
+        if (path / 'results').is_dir():
+            tasks.extend(load_tasks(path))
+        else:
+            task = load_task(path)
+            if task['revisions']:
+                tasks.append(task)
+    return tasks
 
 
 HTML = r'''<!doctype html>
@@ -107,14 +123,14 @@ details{margin-top:16px}summary{cursor:pointer;color:#315dcc}#status{margin:12px
 @media(max-width:600px){body{padding:0 12px}section{padding:16px}}
 </style>
 <h1>Specification loop evaluation</h1>
-<div class="controls"><label for="task">Task / phase</label><select id="task"></select></div>
+<div class="controls"><label for="task">Feature</label><select id="task"></select></div>
 <section><h2>Passes by evaluation category</h2>
 <p id="chart-note"></p>
 <div class="chart"><svg id="chart" viewBox="0 0 1100 360" role="img" aria-label="Category passes by revision"></svg></div>
 <div id="legend"></div><details><summary>Show exact counts</summary><div id="counts"></div></details></section>
 <section><h2>Input specifications</h2><div class="controls">
-<button id="previous">Previous</button><label for="revision">Revision</label><select id="revision"></select><button id="next">Next</button>
-<label><input id="diff" type="checkbox"> <span id="diff-label">Show changes from previous revision</span></label></div>
+<button id="previous">Previous</button><label for="revision">Step</label><select id="revision"></select><button id="next">Next</button>
+<label><input id="diff" type="checkbox"> Show changes from previous specification</label></div>
 <p id="status"></p><pre id="spec"></pre></section>
 <script id="data" type="application/json">__DATA__</script>
 <script>
@@ -130,7 +146,7 @@ function draw(){
  const maxY=Math.max(10,...rows.map(r=>r.judged)),first=rows[0].number,last=rows.at(-1).number;
  const x=n=>75+(last===first?465:(n-first)/(last-first)*930),y=n=>300-n/maxY*260;
  for(let n=0;n<=maxY;n++){const yy=y(n);chart.append(svg('line',{x1:75,x2:1005,y1:yy,y2:yy,stroke:'#e2e9f1'}),svg('text',{x:60,y:yy+4,'text-anchor':'end'},n));}
- chart.append(svg('text',{x:75,y:20},'Number of passes'),svg('text',{x:540,y:353,'text-anchor':'middle'},task.simplification?'Round / candidate (evaluation order)':'Revision'));
+ chart.append(svg('text',{x:75,y:20},'Number of passes'),svg('text',{x:540,y:353,'text-anchor':'middle'},'Refinement → accepted simplifications'));
  for(const r of rows)chart.append(svg('text',{x:x(r.number),y:324,'text-anchor':'middle'},r.label||r.number));
  keys.forEach((key,i)=>{if(!visible.has(key))return;
   // Partial batches are hollow points, so fewer judgments stay visible.
@@ -141,16 +157,15 @@ function draw(){
 }
 function showSpec(){const index=Number($('revision').value),r=task.revisions[index];
  $('spec').textContent=$('diff').checked?(r.changes|| (index===0?'Baseline: no previous specification.':'No changes.')):r.spec;
- $('status').textContent=`${entryLabel(r)}: ${r.passes}/${r.judged} judged runs pass every category. `+(task.simplification?`${r.words} words (input: ${r.input_words}). ${r.status}. `:'')+(r.length_rejected?'Not evaluated: outside length bounds.':r.complete?'Batch complete.':'Batch incomplete; counts include only saved judgments.');
+ $('status').textContent=`${entryLabel(r)}: ${r.passes}/${r.judged} judged runs pass every category. ${r.words} words. `+(r.complete?'Batch complete.':'Batch incomplete; counts include only saved judgments.');
  $('previous').disabled=index===0;$('next').disabled=index===task.revisions.length-1;
 }
 function selectTask(){task=data.tasks[Number($('task').value)];
- $('revision').replaceChildren(...task.revisions.map((r,i)=>new Option(`${entryLabel(r)}${task.simplification?` — ${r.words} words; ${r.status}`:''}${r.complete?'':' (partial)'}`,i)));
- $('chart-note').textContent=task.simplification?'Each point is an independent proposal; lines show evaluation order, not a sequence of accepted edits. R = round; C = candidate. Counts use saved verdicts.':'Counts use saved judge verdicts. Hover over a point for its count. Toggle categories below.';
- $('diff-label').textContent=task.simplification?'Show changes from round input':'Show changes from previous revision';
+ $('revision').replaceChildren(...task.revisions.map((r,i)=>new Option(`${entryLabel(r)} — ${r.words} words${r.complete?'':' (partial)'}`,i)));
+ $('chart-note').textContent='Refinement revisions followed by accepted simplifications. Rejected proposals are omitted. Counts use saved judge verdicts.';
  const table=document.createElement('table'),head=table.createTHead().insertRow();
- for(const text of ['Evaluation','Judged','All pass',...(task.simplification?['Words','Outcome']:[]),...keys.map(label)]){const cell=document.createElement('th');cell.textContent=text;head.append(cell);}
- for(const r of task.revisions){const row=table.insertRow();for(const value of [entryLabel(r),r.judged,r.passes,...(task.simplification?[r.words,r.status]:[]),...keys.map(k=>r.counts[k])])row.insertCell().textContent=value;}
+ for(const text of ['Step','Words','Judged','All pass',...keys.map(label)]){const cell=document.createElement('th');cell.textContent=text;head.append(cell);}
+ for(const r of task.revisions){const row=table.insertRow();for(const value of [entryLabel(r),r.words,r.judged,r.passes,...keys.map(k=>r.counts[k])])row.insertCell().textContent=value;}
  $('counts').replaceChildren(table);draw();showSpec();
 }
 data.tasks.forEach((t,i)=>$('task').add(new Option(t.name,i)));
@@ -164,29 +179,36 @@ $('previous').onclick=()=>{$('revision').selectedIndex--;showSpec();};$('next').
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('loop', help='Loop name under .experiments, or a loop/task directory')
-    parser.add_argument('--output', type=Path, help='HTML output (default: LOOP/evaluation.html)')
-    parser.add_argument('--simplification', type=Path, help='Include this task’s saved simplification rounds')
+    parser.add_argument('loop', nargs='+', help='Loop names or directories; a batch directory includes all its features')
+    parser.add_argument('--output', type=Path, help='HTML output (default: first LOOP/evaluation.html)')
+    parser.add_argument('--simplification', type=Path, action='append', default=[],
+                        help='Simplification task or batch directory; may be repeated')
     args = parser.parse_args()
     try:
-        directory = resolve_loop(args.loop)
-        results = directory / 'results' if (directory / 'results').is_dir() else directory
-        paths = [results] if list(results.glob('revision-*')) else sorted(results.iterdir())
-        tasks = [load_task(path) for path in paths if path.is_dir()]
-        tasks = [task for task in tasks if task['revisions']]
+        directories = [resolve_loop(name) for name in args.loop]
+        tasks = [task for directory in directories for task in load_tasks(directory)]
         if not tasks:
             raise ValueError('No saved revision specifications found.')
-        if args.simplification:
-            simplified = load_simplification(args.simplification)
-            task_id = json.loads((args.simplification / 'settings.json').read_text())['task']['id']
-            if task_id not in {task['name'] for task in tasks}:
-                raise ValueError('Simplification task does not match the refinement results.')
-            if not simplified['revisions']:
-                raise ValueError('No saved simplification specifications found.')
-            tasks.append(simplified)
+        by_name = {task['name']: task for task in tasks}
+        if len(by_name) != len(tasks):
+            raise ValueError('Multiple refinement runs for the same feature; select one per feature.')
+        for directory in args.simplification:
+            paths = ([directory] if (directory / 'settings.json').exists() else
+                     sorted(path for path in directory.iterdir() if (path / 'settings.json').exists()))
+            if not paths:
+                raise ValueError(f'No simplification tasks found in {directory}.')
+            for path in paths:
+                simplified = load_simplification(path)
+                if simplified['name'] not in by_name:
+                    raise ValueError('Simplification task does not match the refinement results.')
+                by_name[simplified['name']]['revisions'].extend(simplified['revisions'])
+        # Graph positions follow the combined sequence, not the original revision numbers.
+        for task in tasks:
+            for number, row in enumerate(task['revisions']):
+                row['number'] = number
         # Escape HTML delimiters in embedded JSON; render specs using textContent.
         payload = json.dumps({'criteria': CRITERIA, 'tasks': tasks}).replace('<', '\\u003c')
-        output = args.output or directory / 'evaluation.html'
+        output = args.output or directories[0] / 'evaluation.html'
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(HTML.replace('__DATA__', payload), encoding='utf-8')
         print(output.resolve())

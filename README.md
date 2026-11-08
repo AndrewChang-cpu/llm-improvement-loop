@@ -20,11 +20,11 @@ The loop tests ten fresh generations per revision, allows ten editor revisions a
 
 ```sh
 python3 view_experiment.py seaborn-heading-run
-python3 view_experiment.py .experiments/restart-simplification-2026-11-07/seaborn-restart --simplification .experiments/simplification-three-candidates-2026-11-07/seaborn-restart
+python3 view_experiment.py .experiments/restart-simplification-2026-11-07 --simplification .experiments/simplification-three-candidates-2026-11-07 --output .experiments/evaluation.html
 python3 run_experiment.py audit --output .experiments/seaborn-heading-run
 ```
 
-The viewer prints an HTML path for scores, specifications, and changes. Add `--simplification DIR` to include candidate scores, selection outcomes, and changes from each round's input in the phase selector. Before running `audit`, fill the manual verdicts in the run’s `audit/sample.json`; keep `judge-key.json` closed until review is complete.
+The viewer combines features in one HTML with a feature selector. Each graph shows refinement followed by accepted simplifications; rejected proposals are omitted. Supply a batch directory or multiple loop paths, and add `--simplification DIR` for saved simplification results. Before running `audit`, fill the manual verdicts in the run’s `audit/sample.json`; keep `judge-key.json` closed until review is complete.
 
 Exact prompts: [run_experiment.py](run_experiment.py) and saved `request.json` files. Task requirements, dependencies, and selected tests: [pilot.json](experiments/pilot.json). Filesystem access is unrestricted; network access is disabled for model sessions.
 
