@@ -31,6 +31,20 @@ QUOTA = ("usage limit", "quota", "rate_limit", "rate limit", "too many requests"
 AUTH = ("unauthorized", "authentication failed", "not authenticated", "login expired", "token expired")
 
 
+class BatchCodex(runner.Codex):
+    def run(self, role, prompt, cwd, output, *args, **kwargs):
+        settings_path = next((parent / "settings.json" for parent in output.parents
+                              if (parent / "settings.json").exists()), None)
+        settings = runner.read_json(settings_path) if settings_path else {}
+        if settings.get("task", {}).get("concise_test_output"):
+            prompt += ("\n\nFor test commands, redirect full stdout/stderr to a unique temporary log "
+                       "outside the repository (use mktemp). Initially display only the command's "
+                       "exit status, log path, and last 40 lines. Preserve the test command's exit "
+                       "status when displaying the tail. Read more of your own log when needed to "
+                       "diagnose failures. Do not skip tests or change evaluation requirements.")
+        return super().run(role, prompt, cwd, output, *args, **kwargs)
+
+
 def save(path, value):
     runner.write_json(path, value)
 
@@ -188,6 +202,13 @@ def run_task(task, agent, categories):
             save(state_path, state)
             write_checkpoint("running", task_id, f"run {task_id}")
             result_dir = BATCH / "results" / task_id
+            # Retain the prompt policy of an already-started task when resuming it.
+            saved_settings = result_dir / "settings.json"
+            if saved_settings.exists():
+                if runner.read_json(saved_settings)["task"].get("concise_test_output"):
+                    prepared["concise_test_output"] = True
+            else:
+                prepared["concise_test_output"] = True
             result = runner.run_task(prepared, result_dir, agent, categories)
             if result["status"] == "converged":
                 write_checkpoint("simplifying", task_id, f"simplify {task_id}")
@@ -261,6 +282,8 @@ def main():
         except BlockingIOError:
             print("Another batch driver owns the lock; no work started.", file=sys.stderr)
             return 2
+        # Share the adapter with simplification without changing the pinned runner source.
+        runner.Codex = BatchCodex
         agent = runner.Codex(args.model, args.codex)
         categories = runner.categories_from_docs()
         active_task = None

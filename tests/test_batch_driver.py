@@ -32,6 +32,25 @@ class BatchDriverTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             batch_driver.validate_manifest(tasks[:-1] + [{"id": "mwaskom__seaborn-3063"}])
 
+    def test_test_output_instruction_preserves_legacy_prompts(self):
+        base_agent = batch_driver.BatchCodex.__mro__[1]
+        for concise in (False, True):
+            for phase in ("refinement", "simplification"):
+                root = self.root / phase
+                runner.write_json(root / "settings.json", {
+                    "task": {"concise_test_output": True} if concise else {}})
+                for role in ("generate", "judge", "edit", "simplify"):
+                    output = root / "round-01" / role
+                    with patch.object(base_agent, "run", return_value={}) as call:
+                        batch_driver.BatchCodex().run(role, "original prompt", root, output, {})
+                    prompt = call.call_args.args[1]
+                    if concise:
+                        self.assertIn("last 40 lines", prompt)
+                        self.assertIn("exit status", prompt)
+                        self.assertIn("mktemp", prompt)
+                    else:
+                        self.assertEqual(prompt, "original prompt")
+
     def test_precheck_skips_active_work_and_recovers_stale_setup(self):
         state = self.root / "checkpoint.json"
         lock_path = self.root / "batch.lock"

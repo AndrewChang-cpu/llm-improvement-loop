@@ -40,6 +40,8 @@ python3 batch_driver.py --auto-retry
 
 Runs one PR at a time, with ten parallel implementation/evaluation lanes per batch. Saved work is reused. Usage-limit errors wait until the reported local reset time plus one minute, or retry hourly when no reset time is available. Temporary network errors retry after 1, 5, then 15 minutes (capped at 15). Authentication, configuration, and unexpected errors stop for inspection; permanent preparation failures are recorded separately. Ctrl+C pauses; rerun the same command to resume. Keep the terminal running and computer awake. No Orca automation or supervising LLM is required.
 
+For newly started PRs, agents save full test output to unique temporary logs and initially display the exit status and last 40 lines, reading more when needed. Already-started PRs retain their original prompts. Tests and evaluation criteria are unchanged.
+
 The driver updates `.experiments/batch-100/evaluation.html` after each completed PR. Generate one report including the batch and the earlier two features:
 
 ```sh
