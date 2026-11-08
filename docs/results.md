@@ -2,7 +2,7 @@
 
 ## Restarted refinement and simplification (2026-11-07)
 
-New refinement requires 10/10 in one batch, without confirmation. Sphinx restarted from the PR baseline and scored **0, 1, 8, 8, 8, 10** passes across revisions 0–5. Its passing specification contains 813 words. Seaborn scored **0, 5, 8, 7, 6, 8, 10** across revisions 0–6. Its passing specification contains 964 words. Simplification has retained two shorter specifications, 678 and then 558 words, each scoring 10/10. Round 3 is in progress; an account usage-limit interruption is recorded separately.
+New refinement requires 10/10 in one batch, without confirmation. Sphinx restarted from the PR baseline and scored **0, 1, 8, 8, 8, 10** passes across revisions 0–5. Its passing specification contains 813 words. Seaborn scored **0, 5, 8, 7, 6, 8, 10** across revisions 0–6. Its passing specification contains 964 words. Simplification completed with **420 words**, a **56.4% reduction** from 964. Each accepted version scored 10/10; no confirmation batch was added. Account usage-limit interruptions were archived separately and unfinished calls resumed without replacing completed judgments.
 
 Sphinx's first, single-proposal simplification reduced 813 words to 528 (35%) and scored 9/10. It was rejected. The revised search proposes three independent drafts per round, each 10–30% shorter, evaluates each eligible draft ten times, and retains the shortest 10/10 candidate. The first round without a qualifying candidate stops the search.
 
@@ -26,6 +26,24 @@ No reduction was accepted; the retained specification remains 813 words. All 30 
 Two original passes and four shortened-specification passes differ from the reference on at least one diagnostic case. These include minor label differences, such as a trailing dot, which alone do not establish architectural or core-behavior failures. The probes therefore do not invalidate the recorded passes. The scores also do not establish that shortening caused a regression or that 813 words are necessary. No rubric or verdict has been changed.
 
 Artifacts: [restarted refinement](../.experiments/restart-simplification-2026-11-07/), [three-candidate search](../.experiments/simplification-three-candidates-2026-11-07/), and [post-run validity audit](../.experiments/simplification-three-candidates-2026-11-07/sphinx-restart/index-validity-audit.json). Subscription-limit interruptions are logged separately and resumed from saved calls; they are not implementation failures. Access-log screening has found no forbidden generator reads; original snapshots match their pinned commits. The Sphinx original/reference hashes remained unchanged in the first completed run. Final access and snapshot checks accompany the completed results.
+
+### Seaborn simplification
+
+| Round | Candidate words and passes | Accepted words |
+| --- | --- | ---: |
+| 1 | 713: 10/10; 754: 8/10; 678: 10/10 | 678 |
+| 2 | 558: 10/10; 590: 8/10; 608: 8/10 | 558 |
+| 3 | 469: 8/10; 467: 10/10; 502: 9/10 | 467 |
+| 4 | 420: 10/10; 410: 9/10; 416: 6/10 | 420 |
+| 5 | 378: 9/10; 375: 6/10; 378: 9/10 | None; retain 420 |
+
+The search accepted four successive reductions, **964 → 678 → 558 → 467 → 420 words**, then stopped when all three round-5 proposals failed to qualify. The retained specification uses eleven approved headings. It still names the public API, explains orientation and grouping, specifies NumPy compatibility, and describes documentation and testing expectations. Shortening preserved concrete implementation guidance rather than removing every detailed contract.
+
+In the stopping round, failures included a missing link between the API documentation and example notebook, tests departing from the local class/fixture style, and computing percentiles on the wrong axis. Some rejections concern conventions rather than core algorithmic behavior; raw verdicts remain unchanged. These samples show that the procedure can find a much shorter judged-passing specification, not that 420 words is the minimum or that every failed proposal omitted essential information.
+
+Final audits: original/reference snapshots remained unchanged for both tasks. All 130 restarted-refinement patches and 180 simplification patches match their saved staged diffs, with no unstaged tracked changes. Command screening covered 292 refinement sessions and 394 simplification sessions, including archived interrupted calls. Flagged commands and their interpretations are retained. Some generators attempted off-workspace environment, filename, or missing-skill lookups; no reference implementation contents or other-run feedback reads were demonstrated. Full filesystem access means this screening does not prove isolation. No manual judge replacement or rubric change occurred.
+
+Artifacts: [retained Seaborn specification](../.experiments/simplification-three-candidates-2026-11-07/seaborn-restart/simplified-specification.md), [final search result](../.experiments/simplification-three-candidates-2026-11-07/seaborn-restart/result.json), [access audit review](../.experiments/simplification-three-candidates-2026-11-07/access-audit-review.json), and [patch integrity](../.experiments/simplification-three-candidates-2026-11-07/candidate-patch-integrity.json). No 100-PR run has been started.
 
 ## Simplification validation (2026-11-07)
 
