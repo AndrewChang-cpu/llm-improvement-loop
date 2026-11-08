@@ -22,6 +22,21 @@ def resolve_loop(name):
     raise ValueError('Loop not found or ambiguous; supply its directory path.')
 
 
+def load_counts(folder):
+    counts = dict.fromkeys(CRITERIA, 0)
+    judged = full_passes = 0
+    # Unfinished runs are not failures.
+    for verdict_path in sorted(folder.glob('run-*/verdict.json')):
+        verdict = json.loads(verdict_path.read_text())
+        outcomes = {item['criterion']: item['passed'] for item in verdict['criteria']}
+        judged += 1
+        for criterion in counts:
+            counts[criterion] += outcomes.get(criterion) is True
+        full_passes += all(outcomes.get(key) is True for key in CRITERIA)
+    return {'counts': counts, 'judged': judged, 'passes': full_passes,
+            'complete': (folder / 'batch.json').exists()}
+
+
 def load_task(path):
     revisions = []
     previous = ''
@@ -30,27 +45,47 @@ def load_task(path):
         if not spec_path.exists():
             continue
         spec = spec_path.read_text()
-        counts = dict.fromkeys(CRITERIA, 0)
-        judged = full_passes = 0
-        # Count only saved judgments; unfinished runs are not failures.
-        for verdict_path in sorted(folder.glob('run-*/verdict.json')):
-            verdict = json.loads(verdict_path.read_text())
-            outcomes = {item['criterion']: item['passed']
-                        for item in verdict['criteria']}
-            judged += 1
-            for criterion in counts:
-                counts[criterion] += outcomes.get(criterion) is True
-            full_passes += all(outcomes.get(key) is True for key in CRITERIA)
         revisions.append({
             'number': int(folder.name.split('-')[-1]), 'spec': spec,
-            'counts': counts, 'judged': judged, 'passes': full_passes,
-            'complete': (folder / 'batch.json').exists(),
+            **load_counts(folder),
             'changes': ''.join(difflib.unified_diff(
                 previous.splitlines(keepends=True), spec.splitlines(keepends=True),
                 fromfile='Previous specification', tofile=folder.name)) if revisions else '',
         })
         previous = spec
     return {'name': path.name, 'revisions': revisions}
+
+
+def load_simplification(path):
+    settings = json.loads((path / 'settings.json').read_text())
+    candidates = []
+    for folder in sorted(path.glob('round-*/candidate-*')):
+        spec_path = folder / 'candidate-specification.md'
+        if not spec_path.exists():
+            continue
+        spec = spec_path.read_text()
+        current = (folder / 'current-specification.md').read_text()
+        decision_path = folder / 'decision.json'
+        decision = json.loads(decision_path.read_text()) if decision_path.exists() else {}
+        status = ('Retained' if decision.get('accepted') else
+                  'Qualified; not selected' if decision.get('qualified') else
+                  'Rejected' if decision else 'Pending')
+        round_number = int(folder.parent.name.split('-')[-1])
+        candidate_number = int(folder.name.split('-')[-1])
+        candidates.append({
+            'number': len(candidates) + 1,
+            'label': f'R{round_number} C{candidate_number}',
+            'spec': spec, **load_counts(folder),
+            'status': status, 'words': len(spec.split()),
+            'input_words': len(current.split()),
+            'length_rejected': decision.get('length_passed') is False,
+            # Sibling proposals share an input; compare each against that input.
+            'changes': ''.join(difflib.unified_diff(
+                current.splitlines(keepends=True), spec.splitlines(keepends=True),
+                fromfile='Round input specification', tofile=folder.name)),
+        })
+    return {'name': settings['task']['id'] + ' — simplification',
+            'simplification': True, 'revisions': candidates}
 
 
 HTML = r'''<!doctype html>
@@ -72,14 +107,14 @@ details{margin-top:16px}summary{cursor:pointer;color:#315dcc}#status{margin:12px
 @media(max-width:600px){body{padding:0 12px}section{padding:16px}}
 </style>
 <h1>Specification loop evaluation</h1>
-<div class="controls"><label for="task">Task</label><select id="task"></select></div>
+<div class="controls"><label for="task">Task / phase</label><select id="task"></select></div>
 <section><h2>Passes by evaluation category</h2>
-<p>Counts use saved judge verdicts. Hover over a point for its count. Toggle categories below.</p>
+<p id="chart-note"></p>
 <div class="chart"><svg id="chart" viewBox="0 0 1100 360" role="img" aria-label="Category passes by revision"></svg></div>
 <div id="legend"></div><details><summary>Show exact counts</summary><div id="counts"></div></details></section>
 <section><h2>Input specifications</h2><div class="controls">
 <button id="previous">Previous</button><label for="revision">Revision</label><select id="revision"></select><button id="next">Next</button>
-<label><input id="diff" type="checkbox"> Show changes from previous revision</label></div>
+<label><input id="diff" type="checkbox"> <span id="diff-label">Show changes from previous revision</span></label></div>
 <p id="status"></p><pre id="spec"></pre></section>
 <script id="data" type="application/json">__DATA__</script>
 <script>
@@ -88,31 +123,34 @@ const $=id=>document.getElementById(id), keys=Object.keys(data.criteria);
 const colors=['#275dcc','#c43e45','#258044','#9b4eaf','#c07800','#147f91','#745337','#d04c93','#697820','#565cba','#53677b'];
 const visible=new Set(keys);let task;
 const label=key=>key.replaceAll('_',' ').replace(/^./,c=>c.toUpperCase());
+const entryLabel=r=>r.label||`Revision ${r.number}`;
 function svg(tag,attrs={},text){const el=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [k,v]of Object.entries(attrs))el.setAttribute(k,v);if(text!==undefined)el.textContent=text;return el;}
 function draw(){
  const chart=$('chart');chart.replaceChildren();const rows=task.revisions;
  const maxY=Math.max(10,...rows.map(r=>r.judged)),first=rows[0].number,last=rows.at(-1).number;
  const x=n=>75+(last===first?465:(n-first)/(last-first)*930),y=n=>300-n/maxY*260;
  for(let n=0;n<=maxY;n++){const yy=y(n);chart.append(svg('line',{x1:75,x2:1005,y1:yy,y2:yy,stroke:'#e2e9f1'}),svg('text',{x:60,y:yy+4,'text-anchor':'end'},n));}
- chart.append(svg('text',{x:75,y:20},'Number of passes'),svg('text',{x:540,y:353,'text-anchor':'middle'},'Revision'));
- for(const r of rows)chart.append(svg('text',{x:x(r.number),y:324,'text-anchor':'middle'},r.number));
+ chart.append(svg('text',{x:75,y:20},'Number of passes'),svg('text',{x:540,y:353,'text-anchor':'middle'},task.simplification?'Round / candidate (evaluation order)':'Revision'));
+ for(const r of rows)chart.append(svg('text',{x:x(r.number),y:324,'text-anchor':'middle'},r.label||r.number));
  keys.forEach((key,i)=>{if(!visible.has(key))return;
   // Partial batches are hollow points, so fewer judgments stay visible.
   chart.append(svg('polyline',{points:rows.filter(r=>r.judged).map(r=>`${x(r.number)},${y(r.counts[key])}`).join(' '),fill:'none',stroke:colors[i],'stroke-width':2}));
   for(const r of rows){if(!r.judged)continue;const dot=svg('circle',{cx:x(r.number),cy:y(r.counts[key]),r:4,stroke:colors[i],fill:r.complete?colors[i]:'white','stroke-width':2});
-   dot.append(svg('title',{},`${label(key)} — revision ${r.number}: ${r.counts[key]}/${r.judged} judged runs${r.complete?'':' (partial batch)'}`));chart.append(dot);}
+   dot.append(svg('title',{},`${label(key)} — ${entryLabel(r)}: ${r.counts[key]}/${r.judged} judged runs${r.complete?'':' (partial batch)'}`));chart.append(dot);}
  });
 }
 function showSpec(){const index=Number($('revision').value),r=task.revisions[index];
  $('spec').textContent=$('diff').checked?(r.changes|| (index===0?'Baseline: no previous specification.':'No changes.')):r.spec;
- $('status').textContent=`Revision ${r.number}: ${r.passes}/${r.judged} judged runs pass every category. ${r.complete?'Batch complete.':'Batch incomplete; counts include only saved judgments.'}`;
+ $('status').textContent=`${entryLabel(r)}: ${r.passes}/${r.judged} judged runs pass every category. `+(task.simplification?`${r.words} words (input: ${r.input_words}). ${r.status}. `:'')+(r.length_rejected?'Not evaluated: outside length bounds.':r.complete?'Batch complete.':'Batch incomplete; counts include only saved judgments.');
  $('previous').disabled=index===0;$('next').disabled=index===task.revisions.length-1;
 }
 function selectTask(){task=data.tasks[Number($('task').value)];
- $('revision').replaceChildren(...task.revisions.map((r,i)=>new Option(`Revision ${r.number}${r.complete?'':' (partial)'}`,i)));
+ $('revision').replaceChildren(...task.revisions.map((r,i)=>new Option(`${entryLabel(r)}${task.simplification?` — ${r.words} words; ${r.status}`:''}${r.complete?'':' (partial)'}`,i)));
+ $('chart-note').textContent=task.simplification?'Each point is an independent proposal; lines show evaluation order, not a sequence of accepted edits. R = round; C = candidate. Counts use saved verdicts.':'Counts use saved judge verdicts. Hover over a point for its count. Toggle categories below.';
+ $('diff-label').textContent=task.simplification?'Show changes from round input':'Show changes from previous revision';
  const table=document.createElement('table'),head=table.createTHead().insertRow();
- for(const text of ['Revision','Judged',...keys.map(label)]){const cell=document.createElement('th');cell.textContent=text;head.append(cell);}
- for(const r of task.revisions){const row=table.insertRow();for(const value of [r.number,r.judged,...keys.map(k=>r.counts[k])])row.insertCell().textContent=value;}
+ for(const text of ['Evaluation','Judged','All pass',...(task.simplification?['Words','Outcome']:[]),...keys.map(label)]){const cell=document.createElement('th');cell.textContent=text;head.append(cell);}
+ for(const r of task.revisions){const row=table.insertRow();for(const value of [entryLabel(r),r.judged,r.passes,...(task.simplification?[r.words,r.status]:[]),...keys.map(k=>r.counts[k])])row.insertCell().textContent=value;}
  $('counts').replaceChildren(table);draw();showSpec();
 }
 data.tasks.forEach((t,i)=>$('task').add(new Option(t.name,i)));
@@ -128,6 +166,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('loop', help='Loop name under .experiments, or a loop/task directory')
     parser.add_argument('--output', type=Path, help='HTML output (default: LOOP/evaluation.html)')
+    parser.add_argument('--simplification', type=Path, help='Include this task’s saved simplification rounds')
     args = parser.parse_args()
     try:
         directory = resolve_loop(args.loop)
@@ -137,6 +176,14 @@ def main():
         tasks = [task for task in tasks if task['revisions']]
         if not tasks:
             raise ValueError('No saved revision specifications found.')
+        if args.simplification:
+            simplified = load_simplification(args.simplification)
+            task_id = json.loads((args.simplification / 'settings.json').read_text())['task']['id']
+            if task_id not in {task['name'] for task in tasks}:
+                raise ValueError('Simplification task does not match the refinement results.')
+            if not simplified['revisions']:
+                raise ValueError('No saved simplification specifications found.')
+            tasks.append(simplified)
         # Escape HTML delimiters in embedded JSON; render specs using textContent.
         payload = json.dumps({'criteria': CRITERIA, 'tasks': tasks}).replace('<', '\\u003c')
         output = args.output or directory / 'evaluation.html'
