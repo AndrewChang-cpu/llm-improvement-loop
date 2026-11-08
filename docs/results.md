@@ -2,7 +2,7 @@
 
 ## Restarted refinement and simplification (2026-11-07)
 
-New refinement requires 10/10 in one batch, without confirmation. Sphinx restarted from the PR baseline and scored **0, 1, 8, 8, 8, 10** passes across revisions 0–5. Its passing specification contains 813 words. Seaborn scored 0/10 at baseline and 5/10 at revision 1; refinement resumed after the simplification protocol update.
+New refinement requires 10/10 in one batch, without confirmation. Sphinx restarted from the PR baseline and scored **0, 1, 8, 8, 8, 10** passes across revisions 0–5. Its passing specification contains 813 words. Seaborn scored **0, 5, 8, 7, 6, 8, 10** across revisions 0–6. Its passing specification contains 964 words. Simplification has retained two shorter specifications, 678 and then 558 words, each scoring 10/10. Round 3 is in progress; an account usage-limit interruption is recorded separately.
 
 Sphinx's first, single-proposal simplification reduced 813 words to 528 (35%) and scored 9/10. It was rejected. The revised search proposes three independent drafts per round, each 10–30% shorter, evaluates each eligible draft ten times, and retains the shortest 10/10 candidate. The first round without a qualifying candidate stops the search.
 
@@ -12,9 +12,9 @@ Sphinx's first, single-proposal simplification reduced 813 words to 528 (35%) an
 | 2 | 578 | 28.9% | 8/10 | Rejected |
 | 3 | 659 | 18.9% | 9/10 | Rejected |
 
-No reduction was accepted; the retained specification remains 813 words. All 30 candidates passed the configured executable checks. The five rejected implementations had index behavior that differed from the reference: module-prefix handling when module names are disabled, or qualified aliases declared outside a class directive. Post-run execution reproduced those failures; no judge verdict was replaced or fed corrected feedback.
+No reduction was accepted; the retained specification remains 813 words. All 30 candidates passed the configured executable checks. The five rejected implementations had index behavior that differed from the reference: module-prefix handling when module names are disabled, or qualified aliases declared outside a class directive. Post-run execution reproduced those output differences; no judge verdict was replaced or fed corrected feedback.
 
-**The judge also missed defects.** Applying the same three diagnostic cases to the original passing batch and all shortened batches found the following. These checks cover only those index cases, not the full rubric.
+**Diagnostic output differences do not automatically establish evaluation failures.** Applying the same three diagnostic cases to the original passing batch and all shortened batches produced the counts below. These checks cover only those index cases, not the full rubric.
 
 | Batch | Recorded passes | Implementations matching all three diagnostic cases |
 | --- | ---: | ---: |
@@ -23,7 +23,7 @@ No reduction was accepted; the retained specification remains 813 words. All 30 
 | Candidate 2 | 8/10 | 8/10 |
 | Candidate 3 | 9/10 | 8/10 |
 
-Two original passes and four shortened-specification passes contain defects the judge missed. The rejected patches' diagnoses are supported, but their scores do not establish that shortening caused a regression or that 813 words are necessary. The original specification also leaves qualified-alias indexing implicit. A recorded 10/10 batch is judged convergence, not proof of complete reference equivalence.
+Two original passes and four shortened-specification passes differ from the reference on at least one diagnostic case. These include minor label differences, such as a trailing dot, which alone do not establish architectural or core-behavior failures. The probes therefore do not invalidate the recorded passes. The scores also do not establish that shortening caused a regression or that 813 words are necessary. No rubric or verdict has been changed.
 
 Artifacts: [restarted refinement](../.experiments/restart-simplification-2026-11-07/), [three-candidate search](../.experiments/simplification-three-candidates-2026-11-07/), and [post-run validity audit](../.experiments/simplification-three-candidates-2026-11-07/sphinx-restart/index-validity-audit.json). Subscription-limit interruptions are logged separately and resumed from saved calls; they are not implementation failures. Access-log screening has found no forbidden generator reads; original snapshots match their pinned commits. The Sphinx original/reference hashes remained unchanged in the first completed run. Final access and snapshot checks accompany the completed results.
 
