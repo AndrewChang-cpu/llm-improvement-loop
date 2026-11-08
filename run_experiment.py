@@ -170,6 +170,24 @@ def codex_command(executable, model, cwd, output, writable, readable):
             "--output-last-message", str(output / "response.json"), "-"]
 
 
+def archive_incomplete_call(output):
+    if (output / "complete.json").exists():
+        return
+    names = ("events.jsonl", "stderr.log", "response.json", "input-integrity.json")
+    existing = [output / name for name in names if (output / name).is_file()]
+    if not existing:
+        return
+    attempts = output / "incomplete-attempts"
+    attempts.mkdir(exist_ok=True)
+    number = 1
+    while (attempts / f"attempt-{number:03d}").exists():
+        number += 1
+    destination = attempts / f"attempt-{number:03d}"
+    destination.mkdir()
+    for path in existing:
+        shutil.move(str(path), destination / path.name)
+
+
 class Codex:
     def __init__(self, model="gpt-6-luna", executable="codex"):
         self.model = model
@@ -203,6 +221,7 @@ class Codex:
             for number, path in enumerate(protected):
                 shutil.copy2(path, snapshots / f"{number:02d}-{Path(path).name}")
         print(f"  {role}: {output}", flush=True)
+        archive_incomplete_call(output)
         with (output / "events.jsonl").open("w") as stdout, (output / "stderr.log").open("w") as stderr:
             result = subprocess.run(args, input=prompt, text=True, stdout=stdout, stderr=stderr,
                                     env=env)
@@ -234,7 +253,26 @@ def check_candidate(task, generated, output):
     env.update(PYTHONPATH=str(evaluation), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", MPLBACKEND="Agg",
                PYTHONDONTWRITEBYTECODE="1")
     # Validate candidate-owned tests before reference files can replace them.
-    if task.get("generator_python") and task["checks"] and task["checks"][0][1:3] == ["-m", "pytest"]:
+    if task.get("generator_python") and task.get("candidate_check_prefix"):
+        f2p = task.get("feabench_tests", {}).get("FAIL_TO_PASS", [])
+        p2p = task.get("feabench_tests", {}).get("PASS_TO_PASS", [])
+        tests = sorted({path for path in f2p + p2p
+                        if (evaluation / path.split("::")[0]).exists()})
+        changed_tests = [path for path in checks["candidate_test_changes"]
+                         if path.endswith(".py") and (Path(path).name.startswith("test_")
+                         or path.startswith("tests/")) and (evaluation / path).exists()]
+        prefix = list(task["candidate_check_prefix"])
+        if prefix[1:3] == ["-m", "pytest"]:
+            args = [prefix[0], "-m", "pytest", "-q", "--basetemp",
+                    str(output / "candidate-test-tmp")] + tests + changed_tests
+        else:
+            args = prefix + tests + changed_tests
+        if tests or changed_tests:
+            result = subprocess.run(args, cwd=evaluation, env=env, text=True, capture_output=True)
+            checks["commands"].append({"phase": "candidate_tests", "command": args,
+                                       "returncode": result.returncode,
+                                       "output": result.stdout + result.stderr})
+    elif task.get("generator_python") and task["checks"] and task["checks"][0][1:3] == ["-m", "pytest"]:
         paths = task["checks"][0][4:] + [path for path in checks["candidate_test_changes"]
                 if Path(path).name.startswith("test_") and path.endswith(".py")]
         tests = sorted({path for path in paths if (evaluation / path.split("::")[0]).exists()})
@@ -314,6 +352,18 @@ def evaluate_batch(task, output, agent, specification, runs=10):
         if (run / "verdict.json").exists():
             return read_json(run / "verdict.json")
         if not (run / "generation/complete.json").exists():
+            if generated.exists():
+                try:
+                    partial = command(["git", "diff", "HEAD", "--binary"], generated, clean_env())
+                except RuntimeError:
+                    partial = ""
+                if partial:
+                    archive = run / "incomplete-generation-attempts"
+                    archive.mkdir(exist_ok=True)
+                    number = 1
+                    while (archive / f"attempt-{number:03d}.patch.diff").exists():
+                        number += 1
+                    (archive / f"attempt-{number:03d}.patch.diff").write_text(partial)
             fresh_workspace(Path(task["base"]), generated)
         # The generator sees only the specification and its original-code workspace.
         agent.run("generate", "Implement this feature in the repository. Inspect and edit repository files. "
@@ -518,6 +568,8 @@ def prepare_task(task, storage):
     for packages in task["install"]:
         command([python, "-m", "pip", "install"] + packages, reference, clean_env())
     checks = [[python if word == "{python}" else word for word in args] for args in task["checks"]]
+    candidate_check_prefix = [python if word == "{python}" else word
+                              for word in task.get("candidate_check_prefix", [])]
     inspection = [[python if word == "{python}" else word for word in args]
                   for args in task.get("inspection", [])]
     env = clean_env()
@@ -530,6 +582,7 @@ def prepare_task(task, storage):
     prepared = {"id": task["id"], "base": str(base), "reference": str(reference),
                 "description": (pull["title"] + "\n\n" + (pull.get("body") or "")),
                 "test_files": test_files, "checks": checks, "inspection": inspection,
+                "candidate_check_prefix": candidate_check_prefix,
                 "generator_python": prepare_generator_environment(task, directory, base),
                 "requires_test_changes": task.get("requires_test_changes", False),
                 "requirements": {key: task.get("requirements", {}).get(key, description)

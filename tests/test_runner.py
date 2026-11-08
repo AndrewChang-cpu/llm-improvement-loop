@@ -166,6 +166,18 @@ class RunnerTests(unittest.TestCase):
         executable.unlink()
         self.assertEqual(agent.run("baseline", "Behavior", cwd, output, runner.SPEC_SCHEMA), result)
 
+    def test_incomplete_codex_call_evidence_is_archived_before_retry(self):
+        output = self.root / "incomplete-call"
+        output.mkdir()
+        (output / "events.jsonl").write_text('{"type":"turn.failed"}\n')
+        (output / "stderr.log").write_text("quota reached\n")
+        (output / "response.json").write_text('{"partial":true}\n')
+        runner.archive_incomplete_call(output)
+        archived = output / "incomplete-attempts/attempt-001"
+        self.assertEqual((archived / "events.jsonl").read_text(), '{"type":"turn.failed"}\n')
+        self.assertEqual((archived / "stderr.log").read_text(), "quota reached\n")
+        self.assertFalse((output / "events.jsonl").exists())
+
     def test_judge_cannot_pass_a_patch_missing_required_test_changes(self):
         base, reference = self.root / "base", self.root / "reference"
         base.mkdir()
@@ -202,6 +214,30 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual([c["phase"] for c in checks["commands"]], ["candidate_tests", "reference_tests"])
         self.assertNotEqual(checks["commands"][0]["returncode"], 0)
         self.assertEqual(checks["commands"][1]["returncode"], 0)
+
+    def test_candidate_owned_tests_run_with_non_pytest_reference_command(self):
+        base = self.root / "base"
+        (base / "tests").mkdir(parents=True)
+        (base / "feature.py").write_text("value = 0\n")
+        (base / "tests/test_feature.py").write_text("def test_value():\n    pass\n")
+        reference = self.root / "reference"
+        runner.fresh_workspace(base, reference)
+        generated = self.root / "generated"
+        runner.fresh_workspace(base, generated)
+        (generated / "feature.py").write_text("value = 1\n")
+        (generated / "tests/test_new.py").write_text("def test_new():\n    pass\n")
+        runner.command(["git", "add", "-A"], generated, runner.clean_env())
+        script = ("import sys; assert 'tests/test_feature.py' in sys.argv; "
+                  "assert 'tests/test_new.py' in sys.argv")
+        task = {"base": str(base), "reference": str(reference),
+                "test_files": ["tests/test_feature.py"], "generator_python": sys.executable,
+                "checks": [[sys.executable, "-c", "pass"]],
+                "candidate_check_prefix": [sys.executable, "-c", script, "--"],
+                "feabench_tests": {"FAIL_TO_PASS": ["tests/test_feature.py"],
+                                   "PASS_TO_PASS": []}}
+        checks = runner.check_candidate(task, generated, self.root)
+        self.assertEqual([c["phase"] for c in checks["commands"]], ["candidate_tests", "reference_tests"])
+        self.assertEqual(checks["commands"][0]["returncode"], 0)
 
     def test_reference_overlay_does_not_orphan_candidate_only_fixtures(self):
         base = self.root / "base"
