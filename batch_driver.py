@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resume the frozen FEA-Bench batch one PR at a time."""
+"""Resume the frozen FEA-Bench batch with concurrent PR workers."""
 from __future__ import annotations
 
 import argparse
@@ -8,10 +8,12 @@ from datetime import datetime, timedelta
 import fcntl
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -23,6 +25,7 @@ import simplify_specifications
 
 ROOT = Path(__file__).resolve().parent
 BATCH = ROOT / ".experiments/batch-100"
+WORKER_TASK = None
 TERMINAL = {"converged", "non_convergent", "prep_failed_permanent", "experiment_error_terminal"}
 TRANSIENT = ("connection reset", "connectionerror", "temporary failure", "name resolution",
              "timed out", "timeout", "network is unreachable", "bad gateway", "service unavailable",
@@ -49,8 +52,13 @@ def save(path, value):
     runner.write_json(path, value)
 
 
+def checkpoint_path():
+    # Workers never overwrite the parent's shared checkpoint.
+    return (BATCH / "task-state" / WORKER_TASK if WORKER_TASK else BATCH) / "checkpoint.json"
+
+
 def write_checkpoint(status, active_task=None, next_action=None):
-    path = BATCH / "checkpoint.json"
+    path = checkpoint_path()
     state = runner.read_json(path) if path.exists() else {}
     state.update(status=status, automation_enabled=False, heartbeat_epoch=time.time())
     state["active_task"] = active_task
@@ -111,7 +119,8 @@ def install_read_only_github_auth():
 def finish_batch():
     state_path = BATCH / "checkpoint.json"
     state = runner.read_json(state_path)
-    state.update(status="complete", automation_enabled=False, heartbeat_epoch=time.time(), active_task=None)
+    state.update(status="complete", automation_enabled=False, heartbeat_epoch=time.time(),
+                 active_task=None, active_tasks=[])
     save(state_path, state)
 
 
@@ -135,9 +144,9 @@ def wait_for_retry(state, network_retries):
     else:
         delay = (60, 300, 900)[min(network_retries, 2)]
     deadline = time.time() + delay
-    checkpoint = runner.read_json(BATCH / "checkpoint.json")
+    checkpoint = runner.read_json(checkpoint_path())
     checkpoint["retry_at_epoch"] = deadline
-    save(BATCH / "checkpoint.json", checkpoint)
+    save(checkpoint_path(), checkpoint)
     print(f"{state['id']}: {state['status']}; retry at {time.ctime(deadline)}. "
           "Ctrl+C pauses safely.", flush=True)
     # Keep the batch lock while sleeping; no supervisor or extra model call is needed.
@@ -268,14 +277,110 @@ def validate_manifest(tasks):
         raise ValueError("The pilot tasks must not be rerun")
 
 
+def run_worker(task, batch, model, codex, auto_retry):
+    global BATCH, WORKER_TASK
+    # Separate processes isolate stdout redirection and allow stopping descendant commands.
+    os.setsid()
+    BATCH, WORKER_TASK = batch, task["id"]
+    runner.Codex = BatchCodex
+    agent = runner.Codex(model, codex)
+    categories = runner.categories_from_docs()
+    network_retries = 0
+    while True:
+        state = run_task(task, agent, categories)
+        if state["status"] in TERMINAL:
+            return
+        if auto_retry and state["status"] in {"waiting_quota", "waiting_retry"}:
+            wait_for_retry(state, network_retries)
+            network_retries += state["status"] == "waiting_retry"
+            continue
+        print(f"Paused at {task['id']} ({state['status']}); see "
+              f"{BATCH / 'task-state' / task['id'] / 'state.json'}", flush=True)
+        raise SystemExit(1)
+
+
+def stop_workers(active):
+    def send(process, sig):
+        try:
+            try:
+                os.killpg(process.pid, sig)
+            except ProcessLookupError:
+                os.kill(process.pid, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            if process.is_alive():
+                raise
+
+    for process in active.values():
+        send(process, signal.SIGTERM)
+    deadline = time.monotonic() + 5
+    for process in active.values():
+        process.join(max(0, deadline - time.monotonic()))
+    for process in active.values():
+        # Also stop descendants left behind after their worker has exited.
+        send(process, signal.SIGKILL)
+        process.join()
+
+
+def run_parallel(tasks, args):
+    context = multiprocessing.get_context("spawn")
+    results = summary(tasks)
+    pending = [(position, task) for position, task in enumerate(tasks, 1)
+               if results[task["id"]] not in TERMINAL]
+    active = {}
+    write_checkpoint("running", next_action="Wait for PR workers")
+    try:
+        while pending or active:
+            while pending and len(active) < args.parallel_prs:
+                position, task = pending.pop(0)
+                print(f"[{position}/{len(tasks)}] Starting {task['id']}", flush=True)
+                process = context.Process(target=run_worker, args=(
+                    task, BATCH, args.model, args.codex, args.auto_retry))
+                process.start()
+                active[task["id"]] = process
+            write_checkpoint("running", next_action="Wait for PR workers")
+            checkpoint = runner.read_json(checkpoint_path())
+            checkpoint["active_tasks"] = list(active)
+            save(checkpoint_path(), checkpoint)
+            for task_id, process in list(active.items()):
+                if process.is_alive():
+                    continue
+                process.join()
+                results = summary(tasks)
+                print(f"Finished {task_id}: {results[task_id]}", flush=True)
+                if process.exitcode != 0 or results[task_id] not in TERMINAL:
+                    write_checkpoint("paused", task_id, "Inspect task state, then rerun to resume")
+                    return 1
+                update_html()
+                del active[task_id]
+            if active:
+                time.sleep(1)
+    except KeyboardInterrupt:
+        write_checkpoint("paused", next_action="Rerun the same command to resume")
+        print("Paused. Completed calls are saved; rerun the same command to resume.", flush=True)
+        return 130
+    finally:
+        stop_workers(active)
+        checkpoint = runner.read_json(checkpoint_path())
+        checkpoint["active_tasks"] = []
+        save(checkpoint_path(), checkpoint)
+        summary(tasks)
+    finish_batch()
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=BATCH / "runner-manifest.json")
     parser.add_argument("--one-task", action="store_true", help="Stop after one selected task")
     parser.add_argument("--auto-retry", action="store_true", help="Wait and resume on quota or temporary network errors")
+    parser.add_argument("--parallel-prs", type=int, default=10, help="Concurrent PRs (default: 10)")
     parser.add_argument("--model", default="gpt-6-luna")
     parser.add_argument("--codex", default="codex")
     args = parser.parse_args()
+    if args.parallel_prs < 1:
+        parser.error("--parallel-prs must be at least 1")
     tasks = runner.read_json(args.manifest)
     validate_manifest(tasks)
     install_read_only_github_auth()
@@ -287,6 +392,9 @@ def main():
         except BlockingIOError:
             print("Another batch driver owns the lock; no work started.", file=sys.stderr)
             return 2
+        if args.parallel_prs > 1 and not args.one_task:
+            update_html()
+            return run_parallel(tasks, args)
         # Share the adapter with simplification without changing the pinned runner source.
         runner.Codex = BatchCodex
         agent = runner.Codex(args.model, args.codex)

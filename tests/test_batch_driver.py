@@ -2,11 +2,16 @@ import fcntl
 from datetime import datetime
 import importlib.util
 import json
+import multiprocessing
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import batch_driver
 import run_experiment as runner
@@ -16,6 +21,28 @@ PRECHECK = Path(__file__).resolve().parents[1] / ".experiments/batch-100/automat
 spec = importlib.util.spec_from_file_location("automation_precheck", PRECHECK)
 automation_precheck = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(automation_precheck)
+
+
+def concurrent_fixture(task, batch, model, codex, auto_retry):
+    os.setsid()
+    batch_driver.BATCH = batch
+    batch_driver.WORKER_TASK = task["id"]
+    started = time.time()
+    batch_driver.write_checkpoint("running", task["id"])
+    time.sleep(0.3)
+    runner.write_json(batch / "task-state" / task["id"] / "state.json", {
+        "status": task.get("status", "converged"), "started": started, "finished": time.time()})
+
+
+def command_fixture(folder):
+    os.setsid()
+    marker = str(folder / "terminated")
+    ready = str(folder / "ready")
+    script = ("import signal,time,pathlib,sys; "
+              f"signal.signal(signal.SIGTERM, lambda *args: (pathlib.Path({marker!r}).touch(), sys.exit(0))); "
+              f"pathlib.Path({ready!r}).touch(); time.sleep(60)")
+    child = subprocess.Popen([sys.executable, "-c", script])
+    child.wait()
 
 
 class BatchDriverTests(unittest.TestCase):
@@ -149,7 +176,7 @@ class BatchDriverTests(unittest.TestCase):
                  patch.object(batch_driver, "update_html"), \
                  patch.object(batch_driver, "wait_for_retry") as wait, \
                  patch.object(batch_driver, "run_task", return_value={"status": status}), \
-                 patch("sys.argv", ["batch_driver.py", "--auto-retry"]):
+                 patch("sys.argv", ["batch_driver.py", "--auto-retry", "--parallel-prs", "1"]):
                 self.assertEqual(batch_driver.main(), 1)
                 wait.assert_not_called()
 
@@ -159,11 +186,84 @@ class BatchDriverTests(unittest.TestCase):
              patch.object(batch_driver, "install_read_only_github_auth"), \
              patch.object(batch_driver, "update_html"), \
              patch.object(batch_driver, "run_task", side_effect=KeyboardInterrupt), \
-             patch("sys.argv", ["batch_driver.py", "--auto-retry"]):
+             patch("sys.argv", ["batch_driver.py", "--auto-retry", "--parallel-prs", "1"]):
             self.assertEqual(batch_driver.main(), 130)
         checkpoint = runner.read_json(self.root / "checkpoint.json")
         self.assertEqual(checkpoint["status"], "paused")
         self.assertFalse(checkpoint["automation_enabled"])
+
+    def test_parallel_scheduler_limits_concurrency_and_skips_saved_tasks(self):
+        tasks = [{"id": f"fixture-{i}"} for i in range(5)]
+        runner.write_json(self.root / "task-state/fixture-0/state.json", {"status": "converged"})
+        args = SimpleNamespace(parallel_prs=2, model="unused", codex="unused", auto_retry=True)
+        with patch.object(batch_driver, "BATCH", self.root), \
+             patch.object(batch_driver, "run_worker", concurrent_fixture), \
+             patch.object(batch_driver, "update_html"):
+            self.assertEqual(batch_driver.run_parallel(tasks, args), 0)
+        self.assertFalse((self.root / "task-state/fixture-0/checkpoint.json").exists())
+        events = []
+        for task in tasks[1:]:
+            state = runner.read_json(self.root / "task-state" / task["id"] / "state.json")
+            events += [(state["started"], 1), (state["finished"], -1)]
+            checkpoint = runner.read_json(self.root / "task-state" / task["id"] / "checkpoint.json")
+            self.assertEqual(checkpoint["active_task"], task["id"])
+        count = maximum = 0
+        for _, change in sorted(events):
+            count += change
+            maximum = max(maximum, count)
+        self.assertEqual(maximum, 2)
+        self.assertEqual(runner.read_json(self.root / "checkpoint.json")["status"], "complete")
+
+    def test_worker_retries_without_writing_global_checkpoint(self):
+        runner.write_json(self.root / "checkpoint.json", {"status": "parent-owned"})
+        paused = {"status": "waiting_retry", "id": "fixture"}
+        with patch.object(batch_driver, "BATCH", self.root), \
+             patch.object(batch_driver, "WORKER_TASK", None), \
+             patch.object(batch_driver.os, "setsid"), \
+             patch.object(batch_driver, "run_task", side_effect=[paused, {"status": "converged"}]), \
+             patch.object(batch_driver, "wait_for_retry") as wait:
+            batch_driver.run_worker({"id": "fixture"}, self.root, "unused", "unused", True)
+            wait.assert_called_once_with(paused, 0)
+            batch_driver.write_checkpoint("running", "fixture")
+        self.assertEqual(runner.read_json(self.root / "checkpoint.json")["status"], "parent-owned")
+        self.assertEqual(runner.read_json(self.root / "task-state/fixture/checkpoint.json")["status"], "running")
+
+    def test_parallel_scheduler_pauses_on_error_without_starting_more_tasks(self):
+        tasks = [{"id": f"fixture-{i}", "status": "experiment_error"} for i in range(4)]
+        args = SimpleNamespace(parallel_prs=2, model="unused", codex="unused", auto_retry=True)
+        with patch.object(batch_driver, "BATCH", self.root), \
+             patch.object(batch_driver, "run_worker", concurrent_fixture), \
+             patch.object(batch_driver, "update_html"):
+            self.assertEqual(batch_driver.run_parallel(tasks, args), 1)
+        self.assertFalse((self.root / "task-state/fixture-2").exists())
+        self.assertEqual(runner.read_json(self.root / "checkpoint.json")["status"], "paused")
+
+    def test_stop_workers_stops_descendant_commands(self):
+        process = multiprocessing.get_context("spawn").Process(target=command_fixture, args=(self.root,))
+        process.start()
+        try:
+            deadline = time.monotonic() + 10
+            while not (self.root / "ready").exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue((self.root / "ready").exists())
+            batch_driver.stop_workers({"fixture": process})
+            self.assertFalse(process.is_alive())
+            self.assertTrue((self.root / "terminated").exists())
+        finally:
+            batch_driver.stop_workers({"fixture": process})
+
+    def test_parallel_ctrl_c_stops_workers_and_saves_pause(self):
+        tasks = [{"id": f"fixture-{i}"} for i in range(3)]
+        args = SimpleNamespace(parallel_prs=2, model="unused", codex="unused", auto_retry=True)
+        original_children = {child.pid for child in multiprocessing.active_children()}
+        with patch.object(batch_driver, "BATCH", self.root), \
+             patch.object(batch_driver, "run_worker", concurrent_fixture), \
+             patch.object(batch_driver.time, "sleep", side_effect=KeyboardInterrupt):
+            self.assertEqual(batch_driver.run_parallel(tasks, args), 130)
+        checkpoint = runner.read_json(self.root / "checkpoint.json")
+        self.assertEqual(checkpoint["status"], "paused")
+        self.assertEqual(checkpoint["active_tasks"], [])
+        self.assertEqual({child.pid for child in multiprocessing.active_children()}, original_children)
 
     def test_partial_generated_code_is_archived_before_retry(self):
         lane = self.root / "results/fixture/revision-01/run-00"

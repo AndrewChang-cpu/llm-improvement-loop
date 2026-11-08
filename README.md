@@ -35,10 +35,10 @@ Runner validation, when needed: `python3 -m unittest discover -s tests -v`.
 From this checkout:
 
 ```sh
-python3 batch_driver.py --auto-retry
+python3 batch_driver.py --auto-retry --parallel-prs 10
 ```
 
-Runs one PR at a time, with ten parallel implementation/evaluation lanes per batch. Saved work is reused. Usage-limit errors wait until the reported local reset time plus one minute, or retry hourly when no reset time is available. Temporary network errors retry after 1, 5, then 15 minutes (capped at 15). Authentication, configuration, and unexpected errors stop for inspection; permanent preparation failures are recorded separately. Ctrl+C pauses; rerun the same command to resume. Keep the terminal running and computer awake. No Orca automation or supervising LLM is required.
+Runs up to ten PRs concurrently (the default), with ten parallel implementation/evaluation lanes per PR. This can mean roughly 100 simultaneous model calls. Use `--parallel-prs 1` for sequential execution; `--one-task` also runs only one PR. Each PR keeps separate logs, checkpoints, and retry state. Saved work is reused. Usage-limit errors wait until the reported local reset time plus one minute, or retry hourly when no reset time is available. Temporary network errors retry after 1, 5, then 15 minutes (capped at 15). Authentication, configuration, and unexpected errors pause the batch for inspection; permanent preparation failures are recorded separately. Ctrl+C stops workers and their commands; rerun the same command to resume. Keep the terminal running and computer awake. No Orca automation or supervising LLM is required.
 
 For newly started PRs, agents save full test output to unique temporary logs and initially display the exit status and last 40 lines, reading more when needed. Already-started PRs retain their original prompts. Tests and evaluation criteria are unchanged.
 
