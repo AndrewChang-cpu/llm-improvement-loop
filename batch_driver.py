@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -36,28 +38,44 @@ def save(path, value):
 def write_checkpoint(status, active_task=None, next_action=None):
     path = BATCH / "checkpoint.json"
     state = runner.read_json(path) if path.exists() else {}
-    state.update(status=status, automation_enabled=status != "complete", heartbeat_epoch=time.time())
+    state.update(status=status, automation_enabled=False, heartbeat_epoch=time.time())
     state["active_task"] = active_task
     if next_action:
         state["next_action"] = next_action
     save(path, state)
 
 
-def latest_call_logs(task_dir):
-    candidates = list(task_dir.rglob("stderr.log")) + list(task_dir.rglob("events.jsonl"))
-    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    return "\n".join(path.read_text(errors="replace")[-12000:]
-                     for path in candidates[:4] if path.is_file())
+def failure_details(error):
+    details = str(error)
+    if "Logs:" not in details:
+        return details
+    # Inspect the failed call itself, including failures during simplification.
+    folder = Path(details.split("Logs:", 1)[1].splitlines()[0].strip())
+    events = folder / "events.jsonl"
+    errors = []
+    if events.exists():
+        for line in events.read_text(errors="replace").splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") in {"error", "turn.failed"}:
+                errors.append(json.dumps(event))
+    stderr = folder / "stderr.log"
+    return details + "\n" + ("\n".join(errors) if errors else
+                              stderr.read_text(errors="replace")[-12000:] if stderr.exists() else "")
 
 
-def failure_kind(error, phase, task_dir):
-    details = f"{type(error).__name__}: {error}\n{latest_call_logs(task_dir)}".lower()
-    if any(term in details for term in QUOTA):
-        return "waiting_quota"
+def failure_kind(error, phase, task_dir=None):
+    details = failure_details(error).lower()
     if any(term in details for term in TRANSIENT):
         return "waiting_retry"
     if any(term in details for term in AUTH):
         return "waiting_auth"
+    if any(term in details for term in QUOTA):
+        return "waiting_quota"
+    if isinstance(error, (ValueError, FileNotFoundError)):
+        return "experiment_error"
     if phase == "prepare":
         return "prep_failed_permanent"
     return "experiment_error"
@@ -76,15 +94,74 @@ def install_read_only_github_auth():
         os.environ["GH_TOKEN"] = result.stdout.strip()
 
 
-def finish_automation():
+def finish_batch():
     state_path = BATCH / "checkpoint.json"
     state = runner.read_json(state_path)
     state.update(status="complete", automation_enabled=False, heartbeat_epoch=time.time(), active_task=None)
     save(state_path, state)
-    automation = state.get("automation", {}).get("id")
-    if automation and shutil.which("orca"):
-        subprocess.run(["orca", "automations", "edit", automation, "--disabled", "--json"],
-                       capture_output=True, text=True)
+
+
+def quota_delay(details, now=None):
+    now = time.time() if now is None else now
+    match = re.search(r"try again at (\d{1,2}:\d{2})\s*(AM|PM)", details, re.IGNORECASE)
+    if not match:
+        return 3600
+    clock = datetime.strptime(" ".join(match.groups()).upper(), "%I:%M %p")
+    current = datetime.fromtimestamp(now)
+    reset = current.replace(hour=clock.hour, minute=clock.minute, second=0, microsecond=0)
+    reset += timedelta(minutes=1)
+    if reset <= current:
+        reset += timedelta(days=1)
+    return reset.timestamp() - now
+
+
+def wait_for_retry(state, network_retries):
+    if state["status"] == "waiting_quota":
+        delay = quota_delay(state["failures"][-1]["details"])
+    else:
+        delay = (60, 300, 900)[min(network_retries, 2)]
+    deadline = time.time() + delay
+    checkpoint = runner.read_json(BATCH / "checkpoint.json")
+    checkpoint["retry_at_epoch"] = deadline
+    save(BATCH / "checkpoint.json", checkpoint)
+    print(f"{state['id']}: {state['status']}; retry at {time.ctime(deadline)}. "
+          "Ctrl+C pauses safely.", flush=True)
+    # Keep the batch lock while sleeping; no supervisor or extra model call is needed.
+    while time.time() < deadline:
+        time.sleep(min(60, max(0, deadline - time.time())))
+
+
+def archive_partial_generations(task_id):
+    folders = list((BATCH / "results" / task_id).glob("revision-*/run-*/generation"))
+    folders += list((BATCH / "simplification" / task_id).glob("round-*/candidate-*/run-*/generation"))
+    for folder in folders:
+        if (folder / "complete.json").exists() or not (folder / "events.jsonl").exists():
+            continue
+        generated = folder.parent / "generated"
+        runner.archive_incomplete_call(folder)
+        archive = sorted((folder / "incomplete-attempts").iterdir())[-1]
+        if not (generated / ".git").exists():
+            continue
+        diff = subprocess.run(["git", "diff", "HEAD", "--binary"], cwd=generated,
+                              capture_output=True, check=True).stdout
+        (archive / "partial-patch.diff").write_bytes(diff)
+        untracked = subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "-z"],
+                                   cwd=generated, capture_output=True, check=True).stdout
+        for name in untracked.decode().split("\0"):
+            if name:
+                target = archive / "untracked" / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(generated / name, target, follow_symlinks=False)
+
+
+def update_html():
+    if not list((BATCH / "results").glob("*/revision-*/specification.md")):
+        return
+    args = [sys.executable, str(ROOT / "view_experiment.py"), str(BATCH),
+            "--output", str(BATCH / "evaluation.html")]
+    if list((BATCH / "simplification").glob("*/settings.json")):
+        args += ["--simplification", str(BATCH / "simplification")]
+    subprocess.run(args, check=True)
 
 
 def run_task(task, agent, categories):
@@ -104,6 +181,7 @@ def run_task(task, agent, categories):
     try:
         with log_path.open("a") as log, redirect_stdout(log), redirect_stderr(log):
             print(f"\n=== attempt {state['attempts']} {task_id} {time.ctime()} ===", flush=True)
+            archive_partial_generations(task_id)
             prepared = runner.prepare_task(task, BATCH)
             phase = "experiment"
             state.update(status="running", updated_at=time.time(), phase=phase)
@@ -120,21 +198,20 @@ def run_task(task, agent, categories):
             save(state_path, state)
             return state
     except Exception as error:
-        kind = failure_kind(error, phase, BATCH / "results" / task_id)
+        kind = failure_kind(error, phase)
         fingerprint = error_fingerprint(error)
         history = state.get("failures", [])
         repeats = sum(item.get("fingerprint") == fingerprint for item in history) + 1
         history.append({"at": time.time(), "phase": phase, "kind": kind,
                         "fingerprint": fingerprint, "error": str(error),
+                        "details": failure_details(error),
                         "traceback": traceback.format_exc()[-12000:]})
         if kind == "prep_failed_permanent":
             status = kind
         elif kind in {"waiting_quota", "waiting_retry", "waiting_auth"}:
             status = kind
-        elif repeats >= 3:
-            status = "experiment_error_terminal"
         else:
-            status = "waiting_retry"
+            status = "experiment_error"
         state.update(status=status, phase=phase, failures=history,
                      updated_at=time.time(), repeated_failure_count=repeats)
         save(state_path, state)
@@ -169,6 +246,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=BATCH / "runner-manifest.json")
     parser.add_argument("--one-task", action="store_true", help="Stop after one selected task")
+    parser.add_argument("--auto-retry", action="store_true", help="Wait and resume on quota or temporary network errors")
     parser.add_argument("--model", default="gpt-6-luna")
     parser.add_argument("--codex", default="codex")
     args = parser.parse_args()
@@ -185,30 +263,47 @@ def main():
             return 2
         agent = runner.Codex(args.model, args.codex)
         categories = runner.categories_from_docs()
-        for task in tasks:
-            task_state_path = BATCH / "task-state" / task["id"] / "state.json"
-            if task_state_path.exists() and runner.read_json(task_state_path).get("status") in TERMINAL:
-                continue
-            state = run_task(task, agent, categories)
-            results = summary(tasks)
-            if state["status"] in {"waiting_quota", "waiting_retry", "waiting_auth"}:
-                print(f"Paused at {task['id']} ({state['status']}); completed calls remain saved.", flush=True)
-                return 0
-            if args.one_task:
-                return 0
-            if all(value in TERMINAL for value in results.values()):
-                finish_automation()
-                break
+        active_task = None
+        try:
+            update_html()
+            for task in tasks:
+                active_task = task["id"]
+                task_state_path = BATCH / "task-state" / task["id"] / "state.json"
+                if task_state_path.exists() and runner.read_json(task_state_path).get("status") in TERMINAL:
+                    continue
+                network_retries = 0
+                while True:
+                    state = run_task(task, agent, categories)
+                    summary(tasks)
+                    if state["status"] in TERMINAL:
+                        update_html()
+                        print(f"Finished {task['id']}: {state['status']}", flush=True)
+                        break
+                    retryable = state["status"] in {"waiting_quota", "waiting_retry"}
+                    if args.auto_retry and retryable:
+                        wait_for_retry(state, network_retries)
+                        network_retries += state["status"] == "waiting_retry"
+                        continue
+                    print(f"Paused at {task['id']} ({state['status']}); "
+                          f"see {task_state_path}. Completed calls remain saved.", flush=True)
+                    return 0 if retryable else 1
+                if args.one_task:
+                    return 0
+        except KeyboardInterrupt:
+            write_checkpoint("paused", active_task, "Rerun batch_driver.py --auto-retry to resume")
+            summary(tasks)
+            print("Paused. Completed calls are saved; rerun the same command to resume.", flush=True)
+            return 130
         results = summary(tasks)
         if all(value in TERMINAL for value in results.values()):
-            finish_automation()
+            finish_batch()
         else:
             write_checkpoint("running", None, "resume next nonterminal task")
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main())
     except (RuntimeError, ValueError, OSError) as error:
         print(str(error), file=sys.stderr)
         raise SystemExit(1)

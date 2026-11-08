@@ -30,6 +30,25 @@ Exact prompts: [run_experiment.py](run_experiment.py) and saved `request.json` f
 
 Runner validation, when needed: `python3 -m unittest discover -s tests -v`.
 
+## Resume the 100-PR batch
+
+From this checkout:
+
+```sh
+python3 batch_driver.py --auto-retry
+```
+
+Runs one PR at a time, with ten parallel implementation/evaluation lanes per batch. Saved work is reused. Usage-limit errors wait until the reported local reset time plus one minute, or retry hourly when no reset time is available. Temporary network errors retry after 1, 5, then 15 minutes (capped at 15). Authentication, configuration, and unexpected errors stop for inspection; permanent preparation failures are recorded separately. Ctrl+C pauses; rerun the same command to resume. Keep the terminal running and computer awake. No Orca automation or supervising LLM is required.
+
+The driver updates `.experiments/batch-100/evaluation.html` after each completed PR. Generate one report including the batch and the earlier two features:
+
+```sh
+python3 view_experiment.py .experiments/batch-100 .experiments/restart-simplification-2026-11-07 \
+  --simplification .experiments/batch-100/simplification \
+  --simplification .experiments/simplification-three-candidates-2026-11-07 \
+  --output /Users/andrew/orca/workspaces/llm-improvement-loop/humpback/.experiments/evaluation.html
+```
+
 ## Section-removal analysis
 
 The section-removal analysis below records the earlier protocol. New simplification validation uses:
