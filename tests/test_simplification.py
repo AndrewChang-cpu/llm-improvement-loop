@@ -71,7 +71,7 @@ class SimplificationTests(unittest.TestCase):
         runner.write_json(self.source / "revision-02/batch.json", {"runs": verdicts(10)})
         with patch.object(runner, "Codex") as factory, patch.object(runner, "evaluate_batch") as evaluate:
             factory.return_value.run.return_value = {
-                "specification": "word " * 95, "changes": "Removed repetition"}
+                "status": "revised", "specification": "word " * 95, "changes": "Removed repetition"}
             result = simplification.simplify("example", self.output)
             self.assertEqual(result["stop_reason"], "no_qualifying_candidate")
             self.assertEqual(result["starting_results"]["full_passes"], 10)
@@ -106,7 +106,7 @@ class SimplificationTests(unittest.TestCase):
         with patch.object(runner, "Codex") as factory, patch.object(
                 runner, "evaluate_batch", side_effect=[verdicts(n) for n in [10, 10, 9, 10, 9, 9, 9]]) as evaluate:
             factory.return_value.run.side_effect = [
-                {"specification": "word " * n, "changes": "Removed repetition"}
+                {"status": "revised", "specification": "word " * n, "changes": "Removed repetition"}
                 for n in [90, 70, 80, 72, 56, 60]]
             result = simplification.simplify("example", self.output)
             self.assertEqual(result["stop_reason"], "no_qualifying_candidate")
@@ -117,8 +117,10 @@ class SimplificationTests(unittest.TestCase):
             self.assertEqual(simplification.word_count((self.output / "simplified-specification.md").read_text()), 80)
             self.assertFalse((self.output / "confirmation").exists())
             calls = factory.return_value.run.call_args_list
-            self.assertEqual([call.args[1] for call in calls[:3]], [calls[0].args[1]] * 3)
+            self.assertEqual([call.args[1].split(" first. ", 1)[1] for call in calls[:3]],
+                             [calls[0].args[1].split(" first. ", 1)[1]] * 3)
             for i, call in enumerate(calls):
+                self.assertIn(str((call.args[2] / "feedback.json").resolve()), call.args[1])
                 feedback = runner.read_json(call.args[2] / "feedback.json")
                 self.assertEqual(simplification.word_count(feedback["current_specification"]), 100 if i < 3 else 80)
             evaluate.reset_mock()
@@ -135,7 +137,7 @@ class SimplificationTests(unittest.TestCase):
         with patch.object(runner, "Codex") as factory, patch.object(
                 runner, "evaluate_batch", return_value=verdicts(10)) as evaluate:
             factory.return_value.run.side_effect = [
-                {"specification": "word " * n, "changes": "A reduction"} for n in [91, 69, 65]]
+                {"status": "revised", "specification": "word " * n, "changes": "A reduction"} for n in [91, 69, 65]]
             result = simplification.simplify("example", self.output)
             self.assertEqual(result["stop_reason"], "no_qualifying_candidate")
             self.assertEqual(result["final_words"], 100)
@@ -148,10 +150,21 @@ class SimplificationTests(unittest.TestCase):
                 runner, "Codex") as factory, patch.object(
                 runner, "evaluate_batch", side_effect=[verdicts(10), verdicts(9)]) as evaluate:
             factory.return_value.run.side_effect = [
-                {"specification": "word " * n, "changes": "A reduction"} for n in [70, 91, 71]]
+                {"status": "revised", "specification": "word " * n, "changes": "A reduction"} for n in [70, 91, 71]]
             result = simplification.simplify("example", self.output)
             self.assertEqual([c["length_passed"] for c in result["last_round"]["candidates"]], [False, False, True])
             self.assertEqual(evaluate.call_count, 2)
+
+    def test_blocked_editor_is_an_error_not_a_completed_simplification(self):
+        with patch.object(runner, "Codex") as factory, patch.object(
+                runner, "evaluate_batch", return_value=verdicts(10)) as evaluate:
+            factory.return_value.run.return_value = {
+                "status": "blocked", "specification": "Cannot read inputs", "changes": "Shell unavailable"}
+            with self.assertRaisesRegex(RuntimeError, "editor blocked: Shell unavailable"):
+                simplification.simplify("example", self.output)
+            self.assertEqual(evaluate.call_count, 1)
+            self.assertFalse((self.output / "result.json").exists())
+            self.assertFalse((self.output / "round-01/candidate-01/decision.json").exists())
 
     def test_nine_pass_starting_batch_does_not_qualify_or_call_editor(self):
         with patch.object(runner, "Codex") as factory, patch.object(

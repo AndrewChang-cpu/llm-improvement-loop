@@ -13,7 +13,10 @@ from analyze_specifications import counts, load_experiment
 import run_experiment as runner
 
 
-EDIT_SCHEMA = runner.object_schema({"specification": runner.TEXT, "changes": runner.TEXT})
+EDIT_SCHEMA = runner.object_schema({
+    "status": {"type": "string", "enum": ["revised", "blocked"]},
+    "specification": runner.TEXT, "changes": runner.TEXT,
+})
 
 
 def word_count(specification):
@@ -113,7 +116,9 @@ def simplify(value, output, executable=None, effort=None):
                 "requirements": task["requirements"], "runs": verdicts,
             })
             prompt = (
-                "Read feedback.json, the current specification, and relevant original, reference, and generated code. "
+                f"Use your shell tool to read {feedback_file.resolve()} first. "
+                "It contains the current specification and paths to the relevant original, reference, and generated code. "
+                "Read-only shell commands are allowed; the restriction on modifying files does not prohibit reading them. "
                 "Independently revise this passing specification to make it between 10% and 30% shorter "
                 "without reducing its ability to guide a correct implementation. Do not inspect other "
                 "proposals, sibling candidate directories, or results from other simplification candidates. "
@@ -134,11 +139,15 @@ def simplify(value, output, executable=None, effort=None):
                 "the remaining instructions are sufficient. A reduction outside 10–30% is unsuccessful, "
                 "even if the resulting code would pass. Do not modify any files, run another agent, or "
                 "access the network. Return only the revised specification and change explanation in "
-                "the requested JSON response."
+                "the requested JSON response, with status revised. If an actual tool or file-access failure "
+                "prevents revision, return status blocked and explain the failure in changes. "
+                "Do not put a refusal in the specification field and label it revised."
             )
             response = agent.run("simplify", prompt, context, destination / "editing", EDIT_SCHEMA,
                                  readable=[task["base"], task["reference"]] + [v["generated"] for v in verdicts],
                                  protected=[current_file, feedback_file])
+            if response["status"] != "revised":
+                raise RuntimeError(f"Simplification editor blocked: {response['changes']}. Logs: {destination / 'editing'}")
             candidate = response["specification"].strip()
             if not candidate or not response["changes"].strip():
                 raise ValueError("Simplification response needs a specification and change explanation")
