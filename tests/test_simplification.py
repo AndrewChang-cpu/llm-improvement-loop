@@ -78,6 +78,16 @@ class SimplificationTests(unittest.TestCase):
             evaluate.assert_not_called()
             self.assertTrue((self.output / "starting-batch-source.json").exists())
 
+    def test_effort_override_requires_fresh_qualifying_batch(self):
+        self.settings.update(required_passes=10, confirmation=False, effort="low")
+        with patch.object(runner, "Codex") as factory, patch.object(
+                runner, "evaluate_batch", return_value=verdicts(9)) as evaluate:
+            result = simplification.simplify("example", self.output, effort="medium")
+            factory.assert_called_once_with("fake", None, "codex", "medium")
+            evaluate.assert_called_once()
+            self.assertEqual(result["stop_reason"], "starting_batch_below_10_of_10")
+            self.assertEqual(runner.read_json(self.output / "settings.json")["effort"], "medium")
+
     def test_selects_shortest_passing_candidate_then_stops_and_resumes(self):
         with patch.object(runner, "Codex") as factory, patch.object(
                 runner, "evaluate_batch", side_effect=[verdicts(n) for n in [10, 10, 9, 10, 9, 9, 9]]) as evaluate:

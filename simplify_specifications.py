@@ -24,7 +24,7 @@ def file_hash(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def simplify(value, output, executable=None):
+def simplify(value, output, executable=None, effort=None):
     directory, source, original_settings, specification, historical = load_experiment(value)
     specification = specification.strip()
     categories = runner.categories_from_docs()
@@ -32,7 +32,7 @@ def simplify(value, output, executable=None):
         "source": str(source), "source_settings_sha256": file_hash(source / "settings.json"),
         "source_specification_sha256": hashlib.sha256(specification.encode()).hexdigest(),
         "model": original_settings["model"], "codex": executable,
-        "backend": original_settings.get("backend", "codex"), "effort": original_settings.get("effort", "low"),
+        "backend": original_settings.get("backend", "codex"), "effort": effort or original_settings.get("effort", "low"),
         "task": original_settings["task"], "categories": categories,
         "runs": 10, "required_passes": 10, "confirmation": False,
         "minimum_reduction_percent": 10, "maximum_reduction_percent": 30,
@@ -187,6 +187,7 @@ def main():
     parser.add_argument("experiments", nargs="+", help="Existing completed experiment names or directories")
     parser.add_argument("--output", type=Path, required=True, help="New validation output directory")
     parser.add_argument("--codex")
+    parser.add_argument("--effort", choices=["low", "medium", "high"], help="Defaults to the source experiment effort")
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -196,7 +197,7 @@ def main():
         summary = runner.read_json(summary_file) if summary_file.exists() else {}
         for experiment in args.experiments:
             name = Path(experiment).name
-            summary[name] = simplify(experiment, output / name, args.codex)
+            summary[name] = simplify(experiment, output / name, args.codex, args.effort)
             runner.write_json(summary_file, summary)
         print(json.dumps(summary, indent=2))
 
