@@ -157,7 +157,7 @@ def validate_revision(revision, categories):
             raise ValueError("Edits need exact changes and hypotheses")
 
 
-def codex_command(executable, model, cwd, output, writable, readable, backend="codex"):
+def codex_command(executable, model, cwd, output, writable, readable, backend="codex", effort="low"):
     # Full filesystem access permits system tools; task-code boundaries are prompt instructions.
     policy = '{ filesystem = { ":root" = "write" }, network = { enabled = false }}'
     provider = (["--oss", "--local-provider", "ollama",
@@ -167,7 +167,7 @@ def codex_command(executable, model, cwd, output, writable, readable, backend="c
                 else ["-c", 'forced_login_method="chatgpt"'])
     return [executable, "--no-daemon", "-a", "never", "exec", "--ignore-user-config",
             "--ignore-rules", "--ephemeral", "--json", "-m", model, "-C", str(cwd),
-            "-c", 'model_reasoning_effort="low"',
+            "-c", f'model_reasoning_effort="{effort}"',
             *provider, "-c", 'default_permissions="experiment"',
             "-c", "permissions.experiment=" + policy,
             "-c", 'web_search="disabled"', "-c", "mcp_servers={}",
@@ -178,12 +178,12 @@ def codex_command(executable, model, cwd, output, writable, readable, backend="c
             "--output-last-message", str(output / "response.json"), "-"]
 
 
-def claude_command(executable, model, schema):
+def claude_command(executable, model, schema, effort="low"):
     # Keep subscription auth, but disable personal context and command network access.
     settings = {"sandbox": {"enabled": True, "failIfUnavailable": True,
                 "allowUnsandboxedCommands": False, "filesystem": {"disabled": True},
                 "network": {"allowedDomains": [], "deniedDomains": ["*"]}}}
-    return [executable, "-p", "--model", model, "--effort", "low",
+    return [executable, "-p", "--model", model, "--effort", effort,
             "--output-format", "stream-json", "--verbose", "--json-schema", json.dumps(schema),
             "--safe-mode", "--disable-slash-commands", "--setting-sources", "", "--settings", json.dumps(settings),
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
@@ -210,6 +210,7 @@ def resume_settings(output, settings):
         current.pop("effort", None)
         # Explicitly migrate known runners; unknown source changes still require a new run.
         compatible = {
+            "c6556bcea70cc15cf11525b1190ec89135ed660532ca3b25667d25606f5fb4fa",
             "a07ce2bd4ff7a15c5d8a43b4fe970ebe974da597afcffdcbdff268acc2175b71",
             "9d66cb870c1d524cedba66900e96f0baf7cbbab753d10030692c04e6ceb21983",
             "52e95c642ae871f23a4d6881793bfe7dba29f3c328cdb77cafca552ab57bf73d",
@@ -252,10 +253,11 @@ def archive_incomplete_call(output):
 
 
 class Codex:
-    def __init__(self, model="gpt-6-luna", executable=None, backend="codex"):
+    def __init__(self, model="gpt-6-luna", executable=None, backend="codex", effort="low"):
         if backend not in ("codex", "ollama", "claude"):
             raise ValueError(f"Unknown backend: {backend}")
         self.backend = backend
+        self.effort = effort
         # One local inference lane avoids competing for the laptop GPU and memory.
         self.parallel_runs = 1 if backend == "ollama" else 10
         self.model = model
@@ -265,8 +267,8 @@ class Codex:
     def run(self, role, prompt, cwd, output, schema, writable=False, readable=(), python=None, protected=()):
         output.mkdir(parents=True, exist_ok=True)
         cwd.mkdir(parents=True, exist_ok=True)
-        args = (claude_command(self.executable, self.model, schema) if self.backend == "claude"
-                else codex_command(self.executable, self.model, cwd, output, writable, readable, self.backend))
+        args = (claude_command(self.executable, self.model, schema, self.effort) if self.backend == "claude"
+                else codex_command(self.executable, self.model, cwd, output, writable, readable, self.backend, self.effort))
         if self.backend == "ollama":
             # Ollama's constrained output suppresses tool calls; request final JSON in the prompt.
             prompt += ("\nUse tools as needed before answering. Your final answer must be only a JSON "
@@ -506,7 +508,7 @@ def run_task(task, output, agent, categories):
         task = dict(task, concise_test_output=True)
     # Refuse to mix cached results with a changed model, task, rubric, or runner.
     settings = {"task": task, "model": agent.model, "categories": categories,
-                "backend": getattr(agent, "backend", "codex"), "effort": "low",
+                "backend": getattr(agent, "backend", "codex"), "effort": getattr(agent, "effort", "low"),
                 "runs": 10, "parallel_runs": getattr(agent, "parallel_runs", 10), "max_revisions": 10,
                 "required_passes": 10, "confirmation": False,
                 "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
@@ -760,6 +762,7 @@ def main():
     parser.add_argument("--manifest", type=Path, default=ROOT / "experiments/pilot.json")
     parser.add_argument("--task", help="Run only this task ID")
     parser.add_argument("--backend", choices=["codex", "ollama", "claude"], default="codex")
+    parser.add_argument("--effort", choices=["low", "medium", "high"], default="low")
     parser.add_argument("--model", help="Defaults to gpt-6-luna, haiku with --backend claude, or qwen3-experiment:4b with --backend ollama")
     parser.add_argument("--codex", help="Override the backend CLI executable")
     args = parser.parse_args()
@@ -767,7 +770,7 @@ def main():
     args.codex = args.codex or Codex(args.model, backend=args.backend).executable
     storage = args.output.resolve()
     storage.mkdir(parents=True, exist_ok=True)
-    agent = Codex(args.model, args.codex, args.backend)
+    agent = Codex(args.model, args.codex, args.backend, args.effort)
     if args.action == "audit":
         print(json.dumps(audit_agreement(storage), indent=2))
         return

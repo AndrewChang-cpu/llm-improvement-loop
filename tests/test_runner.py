@@ -28,6 +28,17 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "settings changed"):
                 runner.resume_settings(self.root, dict(settings, **change))
 
+    def test_medium_effort_reaches_every_role(self):
+        agent = runner.Codex(effort="medium")
+        for role in ("generate", "judge", "edit"):
+            output = self.root / role
+            def fake_run(args, **kwargs):
+                self.assertIn('model_reasoning_effort="medium"', args)
+                runner.write_json(output / "response.json", {})
+                return subprocess.CompletedProcess(args, 0)
+            with patch.object(runner.subprocess, "run", side_effect=fake_run):
+                agent.run(role, "prompt", self.root, output, {})
+
     def test_request_comparison_ignores_only_codex_effort(self):
         high = {"prompt": "feature", "command": ["codex", "-m", "gpt-6-luna",
                                                      'model_reasoning_effort="high"']}

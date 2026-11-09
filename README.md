@@ -20,11 +20,11 @@ python3 run_experiment.py run --backend claude --task sphinx-doc__sphinx-11989 -
 python3 run_experiment.py run --backend claude --task mwaskom__seaborn-3063 --output .experiments/claude-seaborn-low
 ```
 
-The simplifier inherits the source experiment's backend. A historical high-effort specification needs a fresh low-effort qualifying batch before simplification. Existing results are preserved.
+The simplifier inherits the source experiment's backend and recorded effort. Historical experiments without a recorded effort default to low and require a fresh qualifying batch. Existing results are preserved.
 
 `run` prepares missing original/reference snapshots and reusable per-task virtual environments, verifies reference tests, then executes refinement. `prepare` performs setup without model calls. Omitting `--task` runs both pilot tasks.
 
-The loop tests ten fresh generations per revision, allows ten editor revisions after baseline, and requires 10/10 in one batch without confirmation. Repeating the command resumes saved calls. Codex effort changes are allowed: completed calls retain their original requests, new calls use low effort, and settings/request histories record the switch. Model, task, rubric, or unknown runner changes require a new output folder. A resumed experiment can therefore contain both high- and low-effort results. Authentication or quota failures stop execution rather than count as feature failures.
+The loop tests ten fresh generations per revision, allows ten editor revisions after baseline, and requires 10/10 in one batch without confirmation. Repeating the command resumes saved calls. Codex effort changes are allowed: completed calls retain their original requests, new calls use the selected `--effort low|medium|high` (default low), and settings/request histories record the switch. Model, task, rubric, or unknown runner changes require a new output folder. A resumed experiment can therefore contain results from different effort levels. Authentication or quota failures stop execution rather than count as feature failures.
 
 ## Inspect and audit
 
