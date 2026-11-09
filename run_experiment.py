@@ -154,19 +154,24 @@ def validate_revision(revision, categories):
             raise ValueError("Edits need exact changes and hypotheses")
 
 
-def codex_command(executable, model, cwd, output, writable, readable):
+def codex_command(executable, model, cwd, output, writable, readable, backend="codex"):
     # Full filesystem access permits system tools; task-code boundaries are prompt instructions.
     policy = '{ filesystem = { ":root" = "write" }, network = { enabled = false }}'
+    provider = (["--oss", "--local-provider", "ollama",
+                 "-c", 'model_provider="ollama"',
+                 "-c", "model_context_window=8192",
+                 "-c", "model_auto_compact_token_limit=6144"] if backend == "ollama"
+                else ["-c", 'forced_login_method="chatgpt"'])
     return [executable, "--no-daemon", "-a", "never", "exec", "--ignore-user-config",
             "--ignore-rules", "--ephemeral", "--json", "-m", model, "-C", str(cwd),
             "-c", 'model_reasoning_effort="high"',
-            "-c", 'forced_login_method="chatgpt"', "-c", 'default_permissions="experiment"',
+            *provider, "-c", 'default_permissions="experiment"',
             "-c", "permissions.experiment=" + policy,
             "-c", 'web_search="disabled"', "-c", "mcp_servers={}",
             "-c", "project_doc_max_bytes=0", "-c", "features.skip_host_skill_discovery=true",
             "--disable", "apps", "--disable", "memories", "--disable", "multi_agent",
             "--disable", "hooks", "--disable", "browser_use", "--disable", "computer_use",
-            "--output-schema", str(output / "schema.json"),
+            *([] if backend == "ollama" else ["--output-schema", str(output / "schema.json")]),
             "--output-last-message", str(output / "response.json"), "-"]
 
 
@@ -189,14 +194,23 @@ def archive_incomplete_call(output):
 
 
 class Codex:
-    def __init__(self, model="gpt-6-luna", executable="codex"):
+    def __init__(self, model="gpt-6-luna", executable="codex", backend="codex"):
+        if backend not in ("codex", "ollama"):
+            raise ValueError(f"Unknown backend: {backend}")
+        self.backend = backend
+        # One local inference lane avoids competing for the laptop GPU and memory.
+        self.parallel_runs = 1 if backend == "ollama" else 10
         self.model = model
         self.executable = executable
 
     def run(self, role, prompt, cwd, output, schema, writable=False, readable=(), python=None, protected=()):
         output.mkdir(parents=True, exist_ok=True)
         cwd.mkdir(parents=True, exist_ok=True)
-        args = codex_command(self.executable, self.model, cwd, output, writable, readable)
+        args = codex_command(self.executable, self.model, cwd, output, writable, readable, self.backend)
+        if self.backend == "ollama":
+            # Ollama's constrained output suppresses tool calls; request final JSON in the prompt.
+            prompt += ("\nUse tools as needed before answering. Your final answer must be only a JSON "
+                       "object matching this schema, without Markdown fences:\n" + json.dumps(schema))
         request = {"role": role, "prompt": prompt, "command": args, "schema": schema}
         if protected:
             request["protected_inputs"] = [str(path) for path in protected]
@@ -403,7 +417,7 @@ def evaluate_batch(task, output, agent, specification, runs=10):
         return verdict
 
     # Each lane has its own repository and logs; only the frozen reference is shared read-only.
-    with ThreadPoolExecutor(max_workers=min(10, runs)) as pool:
+    with ThreadPoolExecutor(max_workers=min(getattr(agent, "parallel_runs", 10), runs)) as pool:
         results = list(pool.map(evaluate_run, range(runs)))
     write_json(output / "batch.json", {"passes": sum(r["passed"] for r in results), "runs": results})
     return results
@@ -413,7 +427,8 @@ def run_task(task, output, agent, categories):
     output.mkdir(parents=True, exist_ok=True)
     # Refuse to mix cached results with a changed model, task, rubric, or runner.
     settings = {"task": task, "model": agent.model, "categories": categories,
-                "runs": 10, "parallel_runs": 10, "max_revisions": 10,
+                "backend": getattr(agent, "backend", "codex"),
+                "runs": 10, "parallel_runs": getattr(agent, "parallel_runs", 10), "max_revisions": 10,
                 "required_passes": 10, "confirmation": False,
                 "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
     if (output / "settings.json").exists() and read_json(output / "settings.json") != settings:
@@ -654,12 +669,14 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / ".experiments")
     parser.add_argument("--manifest", type=Path, default=ROOT / "experiments/pilot.json")
     parser.add_argument("--task", help="Run only this task ID")
-    parser.add_argument("--model", default="gpt-6-luna")
+    parser.add_argument("--backend", choices=["codex", "ollama"], default="codex")
+    parser.add_argument("--model", help="Defaults to gpt-6-luna, or qwen3-experiment:4b with --backend ollama")
     parser.add_argument("--codex", default="codex")
     args = parser.parse_args()
+    args.model = args.model or ("qwen3-experiment:4b" if args.backend == "ollama" else "gpt-6-luna")
     storage = args.output.resolve()
     storage.mkdir(parents=True, exist_ok=True)
-    agent = Codex(args.model, args.codex)
+    agent = Codex(args.model, args.codex, args.backend)
     if args.action == "audit":
         print(json.dumps(audit_agreement(storage), indent=2))
         return
@@ -670,7 +687,7 @@ def main():
         outside = storage / "smoke/outside-probe.txt"
         outside.write_text("outside filesystem access works\n")
         # Test actual filesystem access directly, independently of model testimony.
-        configured = codex_command(args.codex, args.model, cwd, storage / "smoke/session", False, [])
+        configured = codex_command(args.codex, args.model, cwd, storage / "smoke/session", False, [], args.backend)
         sandbox_args = [args.codex, "sandbox", "-P", "experiment", "-C", str(cwd)]
         for index, value in enumerate(configured):
             if value == "-c" and configured[index + 1].startswith(("default_permissions=", "permissions.experiment=")):

@@ -69,6 +69,17 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(runner.command(["git", "rev-list", "--count", "HEAD"], generated).strip(), "1")
         self.assertEqual(runner.command(["git", "remote"], generated).strip(), "")
 
+    def test_local_backend_uses_ollama_without_subscription_and_serializes_runs(self):
+        agent = runner.Codex("qwen3:8b", backend="ollama")
+        args = runner.codex_command("codex", agent.model, self.root,
+                                    self.root / "result", True, [], agent.backend)
+        self.assertIn("--oss", args)
+        self.assertEqual(args[args.index("--local-provider") + 1], "ollama")
+        self.assertNotIn('forced_login_method="chatgpt"', args)
+        self.assertNotIn("--output-schema", args)
+        self.assertEqual(agent.parallel_runs, 1)
+        self.assertEqual(runner.Codex().parallel_runs, 10)
+
     def test_codex_command_allows_filesystem_access_and_uses_subscription(self):
         cwd = self.root / "generated"
         cwd.mkdir()

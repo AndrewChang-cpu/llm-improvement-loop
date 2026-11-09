@@ -32,6 +32,7 @@ def simplify(value, output, executable="codex"):
         "source": str(source), "source_settings_sha256": file_hash(source / "settings.json"),
         "source_specification_sha256": hashlib.sha256(specification.encode()).hexdigest(),
         "model": original_settings["model"], "codex": executable,
+        "backend": original_settings.get("backend", "codex"),
         "task": original_settings["task"], "categories": categories,
         "runs": 10, "required_passes": 10, "confirmation": False,
         "minimum_reduction_percent": 10, "maximum_reduction_percent": 30,
@@ -49,7 +50,7 @@ def simplify(value, output, executable="codex"):
         return runner.read_json(output / "result.json")
 
     task = settings["task"]
-    agent = runner.Codex(settings["model"], executable)
+    agent = runner.Codex(settings["model"], executable, settings["backend"])
     initial_words = word_count(specification)
     (output / "starting-specification.md").write_text(specification + "\n")
     if original_settings.get("required_passes") == 10 and original_settings.get("confirmation") is False:
