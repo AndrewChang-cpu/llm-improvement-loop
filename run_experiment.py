@@ -210,6 +210,7 @@ def resume_settings(output, settings):
         current.pop("effort", None)
         # Explicitly migrate known runners; unknown source changes still require a new run.
         compatible = {
+            "a07ce2bd4ff7a15c5d8a43b4fe970ebe974da597afcffdcbdff268acc2175b71",
             "9d66cb870c1d524cedba66900e96f0baf7cbbab753d10030692c04e6ceb21983",
             "52e95c642ae871f23a4d6881793bfe7dba29f3c328cdb77cafca552ab57bf73d",
             "f30cffca7d49db1d806a3f3744429f735806713fb6422a5cca7637d4af350b1d",
@@ -270,6 +271,15 @@ class Codex:
             # Ollama's constrained output suppresses tool calls; request final JSON in the prompt.
             prompt += ("\nUse tools as needed before answering. Your final answer must be only a JSON "
                        "object matching this schema, without Markdown fences:\n" + json.dumps(schema))
+        settings_path = next((parent / "settings.json" for parent in output.parents
+                              if (parent / "settings.json").exists()), None)
+        settings = read_json(settings_path) if settings_path else {}
+        if settings.get("task", {}).get("concise_test_output"):
+            prompt += ("\n\nFor test commands, redirect full stdout/stderr to a unique temporary log "
+                       "outside the repository (use mktemp). Initially display only the command's "
+                       "exit status, log path, and last 40 lines. Preserve the test command's exit "
+                       "status when displaying the tail. Read more of your own log when needed to "
+                       "diagnose failures. Do not skip tests or change evaluation requirements.")
         request = {"role": role, "prompt": prompt, "command": args, "schema": schema}
         if protected:
             request["protected_inputs"] = [str(path) for path in protected]
@@ -490,6 +500,10 @@ def evaluate_batch(task, output, agent, specification, runs=10):
 
 def run_task(task, output, agent, categories):
     output.mkdir(parents=True, exist_ok=True)
+    # Preserve the batch driver's saved prompt policy when resuming through this CLI.
+    saved = output / "settings.json"
+    if saved.exists() and read_json(saved)["task"].get("concise_test_output"):
+        task = dict(task, concise_test_output=True)
     # Refuse to mix cached results with a changed model, task, rubric, or runner.
     settings = {"task": task, "model": agent.model, "categories": categories,
                 "backend": getattr(agent, "backend", "codex"), "effort": "low",

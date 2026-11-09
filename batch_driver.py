@@ -36,15 +36,6 @@ AUTH = ("unauthorized", "authentication failed", "not authenticated", "login exp
 
 class BatchCodex(runner.Codex):
     def run(self, role, prompt, cwd, output, *args, **kwargs):
-        settings_path = next((parent / "settings.json" for parent in output.parents
-                              if (parent / "settings.json").exists()), None)
-        settings = runner.read_json(settings_path) if settings_path else {}
-        if settings.get("task", {}).get("concise_test_output"):
-            prompt += ("\n\nFor test commands, redirect full stdout/stderr to a unique temporary log "
-                       "outside the repository (use mktemp). Initially display only the command's "
-                       "exit status, log path, and last 40 lines. Preserve the test command's exit "
-                       "status when displaying the tail. Read more of your own log when needed to "
-                       "diagnose failures. Do not skip tests or change evaluation requirements.")
         return super().run(role, prompt, cwd, output, *args, **kwargs)
 
 

@@ -60,17 +60,19 @@ class BatchDriverTests(unittest.TestCase):
             batch_driver.validate_manifest(tasks[:-1] + [{"id": "mwaskom__seaborn-3063"}])
 
     def test_test_output_instruction_preserves_legacy_prompts(self):
-        base_agent = batch_driver.BatchCodex.__mro__[1]
         for concise in (False, True):
             for phase in ("refinement", "simplification"):
-                root = self.root / phase
+                root = self.root / str(concise) / phase
                 runner.write_json(root / "settings.json", {
                     "task": {"concise_test_output": True} if concise else {}})
                 for role in ("generate", "judge", "edit", "simplify"):
                     output = root / "round-01" / role
-                    with patch.object(base_agent, "run", return_value={}) as call:
+                    def fake_run(*args, **kwargs):
+                        runner.write_json(output / "response.json", {})
+                        return SimpleNamespace(returncode=0)
+                    with patch.object(runner.subprocess, "run", side_effect=fake_run):
                         batch_driver.BatchCodex().run(role, "original prompt", root, output, {})
-                    prompt = call.call_args.args[1]
+                    prompt = runner.read_json(output / "request.json")["prompt"]
                     if concise:
                         self.assertIn("last 40 lines", prompt)
                         self.assertIn("exit status", prompt)
