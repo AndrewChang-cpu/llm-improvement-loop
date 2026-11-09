@@ -76,6 +76,14 @@ class RunnerTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     runner.validate_verdict(verdict)
 
+    def test_failed_verdict_with_evidence_can_have_empty_deficiency(self):
+        verdict = self.verdict("requirement_intent")
+        row = next(c for c in verdict["criteria"] if c["criterion"] == "requirement_intent")
+        row["deficiency"] = ""
+        original = json.dumps(verdict)
+        self.assertFalse(runner.validate_verdict(verdict))
+        self.assertEqual(json.dumps(verdict), original)
+
     def test_only_ten_complete_run_passes_converge(self):
         self.assertTrue(runner.converged([True] * 10))
         self.assertFalse(runner.converged([True] * 9 + [False]))

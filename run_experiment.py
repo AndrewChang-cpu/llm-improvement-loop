@@ -124,8 +124,6 @@ def validate_verdict(verdict):
         evidence = row.get("evidence")
         if not isinstance(evidence, list) or not evidence or not all(isinstance(x, str) and x.strip() for x in evidence):
             raise ValueError("Each judgment needs evidence")
-        if not row["passed"] and not str(row.get("deficiency", "")).strip():
-            raise ValueError("Failed judgments need a deficiency")
     return all(row["passed"] for row in rows)
 
 
@@ -210,6 +208,7 @@ def resume_settings(output, settings):
         current.pop("effort", None)
         # Explicitly migrate known runners; unknown source changes still require a new run.
         compatible = {
+            "63b25eb70e6ca785a73d89525a1afd3a9d5d51264006cef980f754ff58ec8b21",
             "c6556bcea70cc15cf11525b1190ec89135ed660532ca3b25667d25606f5fb4fa",
             "a07ce2bd4ff7a15c5d8a43b4fe970ebe974da597afcffdcbdff268acc2175b71",
             "9d66cb870c1d524cedba66900e96f0baf7cbbab753d10030692c04e6ceb21983",
