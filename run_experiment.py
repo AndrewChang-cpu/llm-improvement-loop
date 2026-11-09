@@ -220,6 +220,7 @@ def resume_settings(output, settings):
             "f30cffca7d49db1d806a3f3744429f735806713fb6422a5cca7637d4af350b1d",
             "e45cc86dbb6cb2b2897cd72540cba2bcd53c2129d6bbc4b3f02e1411a760d856",
             "888f04b454ec063b2c473de6bc745e6eb4710eead121cfd8820bf2009ba04740",
+            "372559f2a8aafe07cb44fb232065e1bf0a2cdeb61940e3f4dbeb2ce96ca86e0c",
         }
         if old.get("runner_sha256") in compatible:
             if "judge_effort" in current:
@@ -339,6 +340,11 @@ class Codex:
         return response
 
 
+def is_test_path(path):
+    # Repositories keep tests in a top-level tests/ or a nested package such as lib/matplotlib/tests/.
+    return "tests" in Path(path).parts[:-1] or Path(path).name.startswith("test_")
+
+
 def check_candidate(task, generated, output):
     # Evaluate the candidate with the reference PR's tests, preserving the candidate for judging.
     patch = command(["git", "diff", "--cached", "--binary"], generated, clean_env())
@@ -349,7 +355,7 @@ def check_candidate(task, generated, output):
                            text=True, capture_output=True, env=clean_env())
     checks = {"patch_applies": bool(patch) and apply.returncode == 0, "commands": []}
     changed = command(["git", "diff", "--cached", "--name-only"], generated, clean_env()).splitlines()
-    checks["candidate_test_changes"] = [path for path in changed if path.startswith("tests/")]
+    checks["candidate_test_changes"] = [path for path in changed if is_test_path(path)]
     env = clean_env()
     env.update(PYTHONPATH=str(evaluation), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", MPLBACKEND="Agg",
                PYTHONDONTWRITEBYTECODE="1")
@@ -364,8 +370,16 @@ def check_candidate(task, generated, output):
                          or path.startswith("tests/")) and (evaluation / path).exists()]
         prefix = list(task["candidate_check_prefix"])
         if prefix[1:3] == ["-m", "pytest"]:
+            # Platform-specific failures excluded from the reference checks are excluded here too.
+            deselect = [arg for test in task.get("platform_deselect", []) for arg in ("--deselect", test)]
             args = [prefix[0], "-m", "pytest", "-q", "--basetemp",
-                    str(output / "candidate-test-tmp")] + tests + changed_tests
+                    str(output / "candidate-test-tmp")] + deselect + tests + changed_tests
+        elif any(word.endswith("runtests.py") for word in prefix):
+            # Django's runner accepts dotted module labels relative to tests/, not file paths.
+            changed_tests = [path[len("tests/"):-len(".py")].replace("/", ".") for path in changed_tests
+                             if path.startswith("tests/") and (Path(path).name.startswith("test_")
+                             or Path(path).name == "tests.py")]
+            args = prefix + tests + changed_tests
         else:
             args = prefix + tests + changed_tests
         if tests or changed_tests:
@@ -683,11 +697,12 @@ def prepare_task(task, storage):
     for args in checks:
         logs.append({"command": args, "output": command(args, reference, env)})
     write_json(directory / "reference-validation.json", logs)
-    test_files = [f["filename"] for f in read_json(file_list) if f["filename"].startswith("tests/")]
+    test_files = [f["filename"] for f in read_json(file_list) if is_test_path(f["filename"])]
     prepared = {"id": task["id"], "base": str(base), "reference": str(reference),
                 "description": (pull["title"] + "\n\n" + (pull.get("body") or "")),
                 "test_files": test_files, "checks": checks, "inspection": inspection,
                 "candidate_check_prefix": candidate_check_prefix,
+                "platform_deselect": task.get("platform_deselect", []),
                 "generator_python": prepare_generator_environment(task, directory, base),
                 "requires_test_changes": task.get("requires_test_changes", False),
                 "requirements": {key: task.get("requirements", {}).get(key, description)

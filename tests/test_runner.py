@@ -334,6 +334,30 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual([c["phase"] for c in checks["commands"]], ["candidate_tests", "reference_tests"])
         self.assertEqual(checks["commands"][0]["returncode"], 0)
 
+    def test_django_candidate_tests_use_dotted_labels(self):
+        base = self.root / "base"
+        (base / "tests/app").mkdir(parents=True)
+        (base / "feature.py").write_text("value = 0\n")
+        reference = self.root / "reference"
+        runner.fresh_workspace(base, reference)
+        generated = self.root / "generated"
+        runner.fresh_workspace(base, generated)
+        (generated / "tests/app/test_new.py").write_text("def test_new():\n    pass\n")
+        runner.command(["git", "add", "-A"], generated, runner.clean_env())
+        (generated / "runtests.py").write_text("")
+        script = "import sys; assert sys.argv[-1] == 'app.test_new', sys.argv"
+        task = {"base": str(base), "reference": str(reference), "test_files": [],
+                "generator_python": sys.executable, "checks": [],
+                "candidate_check_prefix": [sys.executable, "-c", script, "./tests/runtests.py"]}
+        checks = runner.check_candidate(task, generated, self.root)
+        self.assertEqual(checks["commands"][0]["returncode"], 0, checks["commands"][0]["output"])
+
+    def test_nested_test_packages_are_test_paths(self):
+        self.assertTrue(runner.is_test_path("lib/matplotlib/tests/test_figure.py"))
+        self.assertTrue(runner.is_test_path("lib/matplotlib/tests/baseline_images/a.png"))
+        self.assertTrue(runner.is_test_path("tests/app/models.py"))
+        self.assertFalse(runner.is_test_path("lib/matplotlib/figure.py"))
+
     def test_reference_overlay_does_not_orphan_candidate_only_fixtures(self):
         base = self.root / "base"
         (base / "tests").mkdir(parents=True)
