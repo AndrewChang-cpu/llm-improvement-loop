@@ -33,7 +33,7 @@ def simplify(value, output, executable=None, effort=None):
         "source_specification_sha256": hashlib.sha256(specification.encode()).hexdigest(),
         "model": original_settings["model"], "codex": executable,
         "backend": original_settings.get("backend", "codex"), "effort": effort or original_settings.get("effort", "low"),
-        "task": original_settings["task"], "categories": categories,
+        "task": original_settings["task"], "categories": categories, "judge_effort": "high",
         "runs": 10, "required_passes": 10, "confirmation": False,
         "minimum_reduction_percent": 10, "maximum_reduction_percent": 30,
         "candidates_per_round": 3, "word_count": "whitespace-separated, including headings",
@@ -53,7 +53,9 @@ def simplify(value, output, executable=None, effort=None):
     agent = runner.Codex(settings["model"], executable, settings["backend"], settings["effort"])
     initial_words = word_count(specification)
     (output / "starting-specification.md").write_text(specification + "\n")
-    if original_settings.get("required_passes") == 10 and original_settings.get("confirmation") is False and original_settings.get("effort") == settings["effort"]:
+    if (original_settings.get("required_passes") == 10 and original_settings.get("confirmation") is False
+            and original_settings.get("effort") == settings["effort"]
+            and original_settings.get("judge_effort", original_settings.get("effort", "high")) == "high"):
         # Reuse the qualifying batch instead of reintroducing a confirmation requirement.
         revision = runner.read_json(source / "result.json")["revision"]
         batch = source / f"revision-{revision:02d}" / "batch.json"
@@ -187,7 +189,7 @@ def main():
     parser.add_argument("experiments", nargs="+", help="Existing completed experiment names or directories")
     parser.add_argument("--output", type=Path, required=True, help="New validation output directory")
     parser.add_argument("--codex")
-    parser.add_argument("--effort", choices=["low", "medium", "high"], help="Defaults to the source experiment effort")
+    parser.add_argument("--effort", choices=["low", "medium", "high"], help="Generator/simplifier effort; defaults to source effort. Judges always use high")
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)

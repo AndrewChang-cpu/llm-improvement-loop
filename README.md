@@ -4,7 +4,7 @@
 
 ## Run
 
-Use Python 3.9–3.11 and a Codex CLI logged in through ChatGPT. All roles default to GPT-6 Luna at low effort; no API key is required. Claude Code is also supported through its subscription login, using Haiku at low effort. Personal skills, hooks, and MCP servers are disabled for both backends.
+Use Python 3.9–3.11 and a Codex CLI logged in through ChatGPT. All roles default to GPT-6 Luna; no API key is required. Claude Code is also supported through its subscription login, using Haiku. Judges always use high effort; `--effort low|medium|high` controls generation, editing, and simplification (default low). Personal skills, hooks, and MCP servers are disabled for both backends.
 
 ```sh
 python3 run_experiment.py smoke
@@ -20,11 +20,11 @@ python3 run_experiment.py run --backend claude --task sphinx-doc__sphinx-11989 -
 python3 run_experiment.py run --backend claude --task mwaskom__seaborn-3063 --output .experiments/claude-seaborn-low
 ```
 
-The simplifier inherits the source experiment's backend and recorded effort. Historical experiments without a recorded effort default to low and require a fresh qualifying batch. Existing results are preserved.
+The simplifier inherits the source experiment's backend and recorded generation effort unless overridden with `--effort`; its judges always use high effort. Historical experiments without a recorded effort default to low and require a fresh qualifying batch. Existing results are preserved. A qualifying batch judged at low or medium effort is not reused for the simplifier's initial validation.
 
 `run` prepares missing original/reference snapshots and reusable per-task virtual environments, verifies reference tests, then executes refinement. `prepare` performs setup without model calls. Omitting `--task` runs both pilot tasks.
 
-The loop tests ten fresh generations per revision, allows ten editor revisions after baseline, and requires 10/10 in one batch without confirmation. Repeating the command resumes saved calls. Codex effort changes are allowed: completed calls retain their original requests, new calls use the selected `--effort low|medium|high` (default low), and settings/request histories record the switch. Model, task, rubric, or unknown runner changes require a new output folder. A resumed experiment can therefore contain results from different effort levels. Authentication or quota failures stop execution rather than count as feature failures.
+The loop tests ten fresh generations per revision, allows ten editor revisions after baseline, and requires 10/10 in one batch without confirmation. Repeating the command resumes saved calls. Codex effort changes are allowed: completed calls retain their original requests, new generation/editor calls use the selected `--effort low|medium|high` (default low), new judge calls use high effort, and settings/request histories record the switch. Model, task, rubric, or unknown runner changes require a new output folder. A resumed experiment can therefore contain results from different effort levels; completed judgments are not rerun or relabeled. Authentication or quota failures stop execution rather than count as feature failures.
 
 ## Inspect and audit
 

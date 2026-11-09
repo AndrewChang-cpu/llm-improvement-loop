@@ -66,7 +66,7 @@ class SimplificationTests(unittest.TestCase):
         self.assertEqual(historical["full_passes"], 10)
 
     def test_current_protocol_reuses_qualifying_batch_without_confirmation(self):
-        self.settings.update(required_passes=10, confirmation=False, effort="low")
+        self.settings.update(required_passes=10, confirmation=False, effort="low", judge_effort="high")
         runner.write_json(self.source / "result.json", {"revision": 2})
         runner.write_json(self.source / "revision-02/batch.json", {"runs": verdicts(10)})
         with patch.object(runner, "Codex") as factory, patch.object(runner, "evaluate_batch") as evaluate:
@@ -78,8 +78,22 @@ class SimplificationTests(unittest.TestCase):
             evaluate.assert_not_called()
             self.assertTrue((self.output / "starting-batch-source.json").exists())
 
+    def test_lower_effort_judgments_require_fresh_starting_batch(self):
+        for previous_judge_effort in (None, "low", "medium"):
+            self.settings.update(required_passes=10, confirmation=False, effort="low")
+            self.settings.pop("judge_effort", None)
+            if previous_judge_effort is not None:
+                self.settings["judge_effort"] = previous_judge_effort
+            output = self.root / str(previous_judge_effort)
+            with patch.object(runner, "Codex"), patch.object(
+                    runner, "evaluate_batch", return_value=verdicts(9)) as evaluate:
+                result = simplification.simplify("example", output)
+                evaluate.assert_called_once()
+                self.assertEqual(result["stop_reason"], "starting_batch_below_10_of_10")
+                self.assertEqual(runner.read_json(output / "settings.json")["judge_effort"], "high")
+
     def test_effort_override_requires_fresh_qualifying_batch(self):
-        self.settings.update(required_passes=10, confirmation=False, effort="low")
+        self.settings.update(required_passes=10, confirmation=False, effort="low", judge_effort="high")
         with patch.object(runner, "Codex") as factory, patch.object(
                 runner, "evaluate_batch", return_value=verdicts(9)) as evaluate:
             result = simplification.simplify("example", self.output, effort="medium")

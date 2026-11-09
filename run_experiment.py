@@ -208,6 +208,7 @@ def resume_settings(output, settings):
         current.pop("effort", None)
         # Explicitly migrate known runners; unknown source changes still require a new run.
         compatible = {
+            "8498de65e6d74c59b21cb8ee7ea4aa71e62609c56cd03821492dfe4caa1198bb",
             "63b25eb70e6ca785a73d89525a1afd3a9d5d51264006cef980f754ff58ec8b21",
             "c6556bcea70cc15cf11525b1190ec89135ed660532ca3b25667d25606f5fb4fa",
             "a07ce2bd4ff7a15c5d8a43b4fe970ebe974da597afcffdcbdff268acc2175b71",
@@ -216,6 +217,8 @@ def resume_settings(output, settings):
             "f30cffca7d49db1d806a3f3744429f735806713fb6422a5cca7637d4af350b1d",
         }
         if old.get("runner_sha256") in compatible:
+            if "judge_effort" in current:
+                old.setdefault("judge_effort", current["judge_effort"])
             old["runner_sha256"] = current.get("runner_sha256")
         if old != current:
             raise ValueError("Experiment settings changed. Use a new output directory.")
@@ -229,7 +232,8 @@ def request_without_effort(request):
     request = dict(request)
     request["command"] = [re.sub(r'model_reasoning_effort="[^"]+"',
                                  'model_reasoning_effort="*"', arg)
-                          for arg in request["command"]]
+                          if index == 0 or request["command"][index - 1] != "--effort" else "*"
+                          for index, arg in enumerate(request["command"])]
     return request
 
 
@@ -266,8 +270,10 @@ class Codex:
     def run(self, role, prompt, cwd, output, schema, writable=False, readable=(), python=None, protected=()):
         output.mkdir(parents=True, exist_ok=True)
         cwd.mkdir(parents=True, exist_ok=True)
-        args = (claude_command(self.executable, self.model, schema, self.effort) if self.backend == "claude"
-                else codex_command(self.executable, self.model, cwd, output, writable, readable, self.backend, self.effort))
+        # Evaluation uses high effort even when generation and editing use less.
+        effort = "high" if role == "judge" else self.effort
+        args = (claude_command(self.executable, self.model, schema, effort) if self.backend == "claude"
+                else codex_command(self.executable, self.model, cwd, output, writable, readable, self.backend, effort))
         if self.backend == "ollama":
             # Ollama's constrained output suppresses tool calls; request final JSON in the prompt.
             prompt += ("\nUse tools as needed before answering. Your final answer must be only a JSON "
@@ -508,6 +514,7 @@ def run_task(task, output, agent, categories):
     # Refuse to mix cached results with a changed model, task, rubric, or runner.
     settings = {"task": task, "model": agent.model, "categories": categories,
                 "backend": getattr(agent, "backend", "codex"), "effort": getattr(agent, "effort", "low"),
+                "judge_effort": "high",
                 "runs": 10, "parallel_runs": getattr(agent, "parallel_runs", 10), "max_revisions": 10,
                 "required_passes": 10, "confirmation": False,
                 "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
@@ -761,7 +768,8 @@ def main():
     parser.add_argument("--manifest", type=Path, default=ROOT / "experiments/pilot.json")
     parser.add_argument("--task", help="Run only this task ID")
     parser.add_argument("--backend", choices=["codex", "ollama", "claude"], default="codex")
-    parser.add_argument("--effort", choices=["low", "medium", "high"], default="low")
+    parser.add_argument("--effort", choices=["low", "medium", "high"], default="low",
+                        help="Generator/editor effort (default low); judges always use high")
     parser.add_argument("--model", help="Defaults to gpt-6-luna, haiku with --backend claude, or qwen3-experiment:4b with --backend ollama")
     parser.add_argument("--codex", help="Override the backend CLI executable")
     args = parser.parse_args()
