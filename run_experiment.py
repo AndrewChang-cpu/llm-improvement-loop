@@ -43,7 +43,10 @@ def command(args, cwd=None, env=None):
 
 def clean_env():
     env = os.environ.copy()
-    for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "GH_TOKEN", "GITHUB_TOKEN"):
+    for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "GH_TOKEN", "GITHUB_TOKEN",
+                "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+                "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+                "CLAUDECODE"):
         env.pop(key, None)
     env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
     return env
@@ -164,7 +167,7 @@ def codex_command(executable, model, cwd, output, writable, readable, backend="c
                 else ["-c", 'forced_login_method="chatgpt"'])
     return [executable, "--no-daemon", "-a", "never", "exec", "--ignore-user-config",
             "--ignore-rules", "--ephemeral", "--json", "-m", model, "-C", str(cwd),
-            "-c", 'model_reasoning_effort="high"',
+            "-c", 'model_reasoning_effort="low"',
             *provider, "-c", 'default_permissions="experiment"',
             "-c", "permissions.experiment=" + policy,
             "-c", 'web_search="disabled"', "-c", "mcp_servers={}",
@@ -173,6 +176,27 @@ def codex_command(executable, model, cwd, output, writable, readable, backend="c
             "--disable", "hooks", "--disable", "browser_use", "--disable", "computer_use",
             *([] if backend == "ollama" else ["--output-schema", str(output / "schema.json")]),
             "--output-last-message", str(output / "response.json"), "-"]
+
+
+def claude_command(executable, model, schema):
+    # Keep subscription auth, but disable personal context and command network access.
+    settings = {"sandbox": {"enabled": True, "failIfUnavailable": True,
+                "allowUnsandboxedCommands": False, "filesystem": {"disabled": True},
+                "network": {"allowedDomains": [], "deniedDomains": ["*"]}}}
+    return [executable, "-p", "--model", model, "--effort", "low",
+            "--output-format", "stream-json", "--verbose", "--json-schema", json.dumps(schema),
+            "--safe-mode", "--disable-slash-commands", "--setting-sources", "", "--settings", json.dumps(settings),
+            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+            "--tools", "Bash,Read,Edit,Write,Glob,Grep", "--dangerously-skip-permissions",
+            "--no-session-persistence"]
+
+
+def claude_response(events):
+    results = [event for line in events.read_text().splitlines()
+               for event in [json.loads(line)] if event.get("type") == "result"]
+    if not results or results[-1].get("is_error") or not isinstance(results[-1].get("structured_output"), dict):
+        raise RuntimeError(f"Claude did not return successful structured output. Logs: {events.parent}")
+    return results[-1]["structured_output"]
 
 
 def archive_incomplete_call(output):
@@ -194,19 +218,21 @@ def archive_incomplete_call(output):
 
 
 class Codex:
-    def __init__(self, model="gpt-6-luna", executable="codex", backend="codex"):
-        if backend not in ("codex", "ollama"):
+    def __init__(self, model="gpt-6-luna", executable=None, backend="codex"):
+        if backend not in ("codex", "ollama", "claude"):
             raise ValueError(f"Unknown backend: {backend}")
         self.backend = backend
         # One local inference lane avoids competing for the laptop GPU and memory.
         self.parallel_runs = 1 if backend == "ollama" else 10
         self.model = model
-        self.executable = executable
+        self.executable = executable or (shutil.which("claude") or str(Path.home() / ".local/bin/claude")
+                                         if backend == "claude" else "codex")
 
     def run(self, role, prompt, cwd, output, schema, writable=False, readable=(), python=None, protected=()):
         output.mkdir(parents=True, exist_ok=True)
         cwd.mkdir(parents=True, exist_ok=True)
-        args = codex_command(self.executable, self.model, cwd, output, writable, readable, self.backend)
+        args = (claude_command(self.executable, self.model, schema) if self.backend == "claude"
+                else codex_command(self.executable, self.model, cwd, output, writable, readable, self.backend))
         if self.backend == "ollama":
             # Ollama's constrained output suppresses tool calls; request final JSON in the prompt.
             prompt += ("\nUse tools as needed before answering. Your final answer must be only a JSON "
@@ -238,7 +264,7 @@ class Codex:
         archive_incomplete_call(output)
         with (output / "events.jsonl").open("w") as stdout, (output / "stderr.log").open("w") as stderr:
             result = subprocess.run(args, input=prompt, text=True, stdout=stdout, stderr=stderr,
-                                    env=env)
+                                    env=env, cwd=cwd)
         after = {path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
                  if Path(path).is_file() else None for path in before}
         if before:
@@ -246,7 +272,9 @@ class Codex:
         if before != after:
             raise RuntimeError(f"{role} modified a protected experiment input. Logs: {output}")
         if result.returncode:
-            raise RuntimeError(f"Codex failed ({result.returncode}); resume after resolving the error. Logs: {output}")
+            raise RuntimeError(f"{self.backend} failed ({result.returncode}); resume after resolving the error. Logs: {output}")
+        if self.backend == "claude":
+            write_json(output / "response.json", claude_response(output / "events.jsonl"))
         response = read_json(output / "response.json")
         write_json(output / "complete.json", response)
         return response
@@ -427,7 +455,7 @@ def run_task(task, output, agent, categories):
     output.mkdir(parents=True, exist_ok=True)
     # Refuse to mix cached results with a changed model, task, rubric, or runner.
     settings = {"task": task, "model": agent.model, "categories": categories,
-                "backend": getattr(agent, "backend", "codex"),
+                "backend": getattr(agent, "backend", "codex"), "effort": "low",
                 "runs": 10, "parallel_runs": getattr(agent, "parallel_runs", 10), "max_revisions": 10,
                 "required_passes": 10, "confirmation": False,
                 "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
@@ -626,7 +654,20 @@ def make_audit(storage):
     write_json(destination / "judge-key.json", key)
 
 
-def validate_smoke_events(events):
+def validate_smoke_events(events, backend="codex"):
+    if backend == "claude":
+        transcript = [json.loads(line) for line in events.read_text().splitlines()]
+        calls = {block["id"] for event in transcript
+                 for block in event.get("message", {}).get("content", []) if isinstance(block, dict)
+                 and block.get("type") == "tool_use" and block.get("name") == "Bash"
+                 and "probe.txt" in block.get("input", {}).get("command", "")}
+        if not any(block.get("tool_use_id") in calls and not block.get("is_error")
+                   and "repository access works" in str(block.get("content", ""))
+                   and "outside filesystem access works" in str(block.get("content", ""))
+                   for event in transcript for block in event.get("message", {}).get("content", [])
+                   if isinstance(block, dict)):
+            raise RuntimeError("Claude smoke transcript does not demonstrate filesystem access")
+        return
     # Require a recorded tool result rather than accepting the model's access claim.
     commands = [event["item"] for line in events.read_text().splitlines()
                 for event in [json.loads(line)] if event.get("type") == "item.completed"
@@ -669,11 +710,12 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / ".experiments")
     parser.add_argument("--manifest", type=Path, default=ROOT / "experiments/pilot.json")
     parser.add_argument("--task", help="Run only this task ID")
-    parser.add_argument("--backend", choices=["codex", "ollama"], default="codex")
-    parser.add_argument("--model", help="Defaults to gpt-6-luna, or qwen3-experiment:4b with --backend ollama")
-    parser.add_argument("--codex", default="codex")
+    parser.add_argument("--backend", choices=["codex", "ollama", "claude"], default="codex")
+    parser.add_argument("--model", help="Defaults to gpt-6-luna, haiku with --backend claude, or qwen3-experiment:4b with --backend ollama")
+    parser.add_argument("--codex", help="Override the backend CLI executable")
     args = parser.parse_args()
-    args.model = args.model or ("qwen3-experiment:4b" if args.backend == "ollama" else "gpt-6-luna")
+    args.model = args.model or {"codex": "gpt-6-luna", "claude": "haiku", "ollama": "qwen3-experiment:4b"}[args.backend]
+    args.codex = args.codex or Codex(args.model, backend=args.backend).executable
     storage = args.output.resolve()
     storage.mkdir(parents=True, exist_ok=True)
     agent = Codex(args.model, args.codex, args.backend)
@@ -686,25 +728,26 @@ def main():
         (cwd / "probe.txt").write_text("repository access works\n")
         outside = storage / "smoke/outside-probe.txt"
         outside.write_text("outside filesystem access works\n")
-        # Test actual filesystem access directly, independently of model testimony.
-        configured = codex_command(args.codex, args.model, cwd, storage / "smoke/session", False, [], args.backend)
-        sandbox_args = [args.codex, "sandbox", "-P", "experiment", "-C", str(cwd)]
-        for index, value in enumerate(configured):
-            if value == "-c" and configured[index + 1].startswith(("default_permissions=", "permissions.experiment=")):
-                sandbox_args += ["-c", configured[index + 1]]
-        sandbox_args += ["--", "/bin/cat", "probe.txt", str(outside)]
-        probe = subprocess.run(sandbox_args, text=True, capture_output=True, env=clean_env())
-        check = {"command": sandbox_args, "returncode": probe.returncode,
-                 "stdout": probe.stdout, "stderr": probe.stderr}
-        write_json(storage / "smoke/sandbox-check.json", check)
-        validate_sandbox_check(check)
+        if args.backend != "claude":
+            # Test actual filesystem access directly, independently of model testimony.
+            configured = codex_command(args.codex, args.model, cwd, storage / "smoke/session", False, [], args.backend)
+            sandbox_args = [args.codex, "sandbox", "-P", "experiment", "-C", str(cwd)]
+            for index, value in enumerate(configured):
+                if value == "-c" and configured[index + 1].startswith(("default_permissions=", "permissions.experiment=")):
+                    sandbox_args += ["-c", configured[index + 1]]
+            sandbox_args += ["--", "/bin/cat", "probe.txt", str(outside)]
+            probe = subprocess.run(sandbox_args, text=True, capture_output=True, env=clean_env())
+            check = {"command": sandbox_args, "returncode": probe.returncode,
+                     "stdout": probe.stdout, "stderr": probe.stderr}
+            write_json(storage / "smoke/sandbox-check.json", check)
+            validate_sandbox_check(check)
         schema = object_schema({"message": {"type": "string"}, "workspace_access": {"type": "boolean"}})
-        prompt = ("Read probe.txt using the shell tool. Do not change files. Return message OK "
+        prompt = (f"Read probe.txt and {outside} together using one shell tool command. Do not change files. Return message OK "
                   "and workspace_access true only if the tool actually read the file.")
         response = agent.run("smoke", prompt, cwd, storage / "smoke/session", schema)
         if response != {"message": "OK", "workspace_access": True}:
             raise RuntimeError(f"Model or filesystem isolation smoke test failed: {response}")
-        validate_smoke_events(storage / "smoke/session/events.jsonl")
+        validate_smoke_events(storage / "smoke/session/events.jsonl", args.backend)
         print("Model and filesystem-access smoke test passed.")
         return
     tasks = read_json(args.manifest)

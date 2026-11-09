@@ -81,7 +81,7 @@ def failure_details(error):
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if event.get("type") in {"error", "turn.failed"}:
+            if event.get("type") in {"error", "turn.failed"} or event.get("is_error"):
                 errors.append(json.dumps(event))
     stderr = folder / "stderr.log"
     return details + "\n" + ("\n".join(errors) if errors else
@@ -277,13 +277,13 @@ def validate_manifest(tasks):
         raise ValueError("The pilot tasks must not be rerun")
 
 
-def run_worker(task, batch, model, codex, auto_retry):
+def run_worker(task, batch, model, codex, auto_retry, backend="codex"):
     global BATCH, WORKER_TASK
     # Separate processes isolate stdout redirection and allow stopping descendant commands.
     os.setsid()
     BATCH, WORKER_TASK = batch, task["id"]
     runner.Codex = BatchCodex
-    agent = runner.Codex(model, codex)
+    agent = runner.Codex(model, codex, backend)
     categories = runner.categories_from_docs()
     network_retries = 0
     while True:
@@ -336,7 +336,7 @@ def run_parallel(tasks, args):
                 position, task = pending.pop(0)
                 print(f"[{position}/{len(tasks)}] Starting {task['id']}", flush=True)
                 process = context.Process(target=run_worker, args=(
-                    task, BATCH, args.model, args.codex, args.auto_retry))
+                    task, BATCH, args.model, args.codex, args.auto_retry, args.backend))
                 process.start()
                 active[task["id"]] = process
             write_checkpoint("running", next_action="Wait for PR workers")
@@ -371,14 +371,19 @@ def run_parallel(tasks, args):
 
 
 def main():
+    global BATCH
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=BATCH / "runner-manifest.json")
     parser.add_argument("--one-task", action="store_true", help="Stop after one selected task")
     parser.add_argument("--auto-retry", action="store_true", help="Wait and resume on quota or temporary network errors")
     parser.add_argument("--parallel-prs", type=int, default=10, help="Concurrent PRs (default: 10)")
-    parser.add_argument("--model", default="gpt-6-luna")
-    parser.add_argument("--codex", default="codex")
+    parser.add_argument("--backend", choices=["codex", "claude"], default="codex")
+    parser.add_argument("--output", type=Path, default=BATCH)
+    parser.add_argument("--model")
+    parser.add_argument("--codex")
     args = parser.parse_args()
+    BATCH = args.output.resolve()
+    args.model = args.model or ("haiku" if args.backend == "claude" else "gpt-6-luna")
     if args.parallel_prs < 1:
         parser.error("--parallel-prs must be at least 1")
     tasks = runner.read_json(args.manifest)
@@ -397,7 +402,7 @@ def main():
             return run_parallel(tasks, args)
         # Share the adapter with simplification without changing the pinned runner source.
         runner.Codex = BatchCodex
-        agent = runner.Codex(args.model, args.codex)
+        agent = runner.Codex(args.model, args.codex, args.backend)
         categories = runner.categories_from_docs()
         active_task = None
         try:

@@ -152,7 +152,7 @@ def analyze(value, database, shared_file, artifacts, repetitions, executable):
         (output / "specification.md").write_text(variants[section])
         print(f"{name}: removing {section}", flush=True)
         verdicts = runner.evaluate_batch(original_settings["task"], output,
-                                        runner.Codex(settings["model"], executable), variants[section],
+                                        runner.Codex(settings["model"], executable, original_settings.get("backend", "codex")), variants[section],
                                         runs=repetitions)
         summary = counts(verdicts)
         return {"runs": [{"index": i, "artifact_directory": str(output / f"run-{i:02d}"),
@@ -180,7 +180,7 @@ def main():
     parser.add_argument("--runs", type=int, default=1, help="Fresh generations per removed section (default: 1)")
     parser.add_argument("--output", type=Path, default=runner.ROOT / ".experiments/ablation-analysis.json")
     parser.add_argument("--artifacts", type=Path, default=runner.ROOT / ".experiments/ablations")
-    parser.add_argument("--codex", default="codex")
+    parser.add_argument("--codex")
     args = parser.parse_args()
     if args.runs < 1:
         parser.error("--runs must be positive")

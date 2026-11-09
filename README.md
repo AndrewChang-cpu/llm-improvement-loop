@@ -4,13 +4,23 @@
 
 ## Run
 
-Use Python 3.9–3.11 and a Codex CLI logged in through ChatGPT. All roles default to GPT-6 Luna; no API key is required.
+Use Python 3.9–3.11 and a Codex CLI logged in through ChatGPT. All roles default to GPT-6 Luna at low effort; no API key is required. Claude Code is also supported through its subscription login, using Haiku at low effort. Personal skills, hooks, and MCP servers are disabled for both backends.
 
 ```sh
 python3 run_experiment.py smoke
 python3 run_experiment.py run --task sphinx-doc__sphinx-11989 --output .experiments/new-sphinx-run
 python3 run_experiment.py run --task mwaskom__seaborn-3063 --output .experiments/new-seaborn-run
 ```
+
+For Claude, install Claude Code and sign in with `claude auth login`, then use a separate output folder:
+
+```sh
+python3 run_experiment.py smoke --backend claude --output .experiments/claude-smoke
+python3 run_experiment.py run --backend claude --task sphinx-doc__sphinx-11989 --output .experiments/claude-sphinx-low
+python3 run_experiment.py run --backend claude --task mwaskom__seaborn-3063 --output .experiments/claude-seaborn-low
+```
+
+The simplifier inherits the source experiment's backend. A historical high-effort specification needs a fresh low-effort qualifying batch before simplification. Existing results are preserved.
 
 `run` prepares missing original/reference snapshots and reusable per-task virtual environments, verifies reference tests, then executes refinement. `prepare` performs setup without model calls. Omitting `--task` runs both pilot tasks.
 
@@ -37,6 +47,8 @@ From this checkout:
 ```sh
 python3 batch_driver.py --auto-retry --parallel-prs 10
 ```
+
+For a fresh Claude batch using the same selection, pass `--backend claude --manifest .experiments/batch-100/runner-manifest.json --output .experiments/batch-100-claude-low`. Use `--output .experiments/batch-100-codex-low` for a fresh Codex batch with the existing manifest. Changed effort settings cannot resume historical high-effort results.
 
 Runs up to ten PRs concurrently (the default), with ten parallel implementation/evaluation lanes per PR. This can mean roughly 100 simultaneous model calls. Use `--parallel-prs 1` for sequential execution; `--one-task` also runs only one PR. Each PR keeps separate logs, checkpoints, and retry state. Saved work is reused. Usage-limit errors wait until the reported local reset time plus one minute, or retry hourly when no reset time is available. Temporary network errors retry after 1, 5, then 15 minutes (capped at 15). Authentication, configuration, and unexpected errors pause the batch for inspection; permanent preparation failures are recorded separately. Ctrl+C stops workers and their commands; rerun the same command to resume. Keep the terminal running and computer awake. No Orca automation or supervising LLM is required.
 

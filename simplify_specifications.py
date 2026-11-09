@@ -24,7 +24,7 @@ def file_hash(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def simplify(value, output, executable="codex"):
+def simplify(value, output, executable=None):
     directory, source, original_settings, specification, historical = load_experiment(value)
     specification = specification.strip()
     categories = runner.categories_from_docs()
@@ -32,7 +32,7 @@ def simplify(value, output, executable="codex"):
         "source": str(source), "source_settings_sha256": file_hash(source / "settings.json"),
         "source_specification_sha256": hashlib.sha256(specification.encode()).hexdigest(),
         "model": original_settings["model"], "codex": executable,
-        "backend": original_settings.get("backend", "codex"),
+        "backend": original_settings.get("backend", "codex"), "effort": "low",
         "task": original_settings["task"], "categories": categories,
         "runs": 10, "required_passes": 10, "confirmation": False,
         "minimum_reduction_percent": 10, "maximum_reduction_percent": 30,
@@ -53,7 +53,7 @@ def simplify(value, output, executable="codex"):
     agent = runner.Codex(settings["model"], executable, settings["backend"])
     initial_words = word_count(specification)
     (output / "starting-specification.md").write_text(specification + "\n")
-    if original_settings.get("required_passes") == 10 and original_settings.get("confirmation") is False:
+    if original_settings.get("required_passes") == 10 and original_settings.get("confirmation") is False and original_settings.get("effort") == "low":
         # Reuse the qualifying batch instead of reintroducing a confirmation requirement.
         revision = runner.read_json(source / "result.json")["revision"]
         batch = source / f"revision-{revision:02d}" / "batch.json"
@@ -186,7 +186,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("experiments", nargs="+", help="Existing completed experiment names or directories")
     parser.add_argument("--output", type=Path, required=True, help="New validation output directory")
-    parser.add_argument("--codex", default="codex")
+    parser.add_argument("--codex")
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)

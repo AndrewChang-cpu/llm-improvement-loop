@@ -23,7 +23,7 @@ automation_precheck = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(automation_precheck)
 
 
-def concurrent_fixture(task, batch, model, codex, auto_retry):
+def concurrent_fixture(task, batch, model, codex, auto_retry, backend="codex"):
     os.setsid()
     batch_driver.BATCH = batch
     batch_driver.WORKER_TASK = task["id"]
@@ -195,7 +195,7 @@ class BatchDriverTests(unittest.TestCase):
     def test_parallel_scheduler_limits_concurrency_and_skips_saved_tasks(self):
         tasks = [{"id": f"fixture-{i}"} for i in range(5)]
         runner.write_json(self.root / "task-state/fixture-0/state.json", {"status": "converged"})
-        args = SimpleNamespace(parallel_prs=2, model="unused", codex="unused", auto_retry=True)
+        args = SimpleNamespace(parallel_prs=2, model="unused", codex="unused", auto_retry=True, backend="codex")
         with patch.object(batch_driver, "BATCH", self.root), \
              patch.object(batch_driver, "run_worker", concurrent_fixture), \
              patch.object(batch_driver, "update_html"):
@@ -230,7 +230,7 @@ class BatchDriverTests(unittest.TestCase):
 
     def test_parallel_scheduler_pauses_on_error_without_starting_more_tasks(self):
         tasks = [{"id": f"fixture-{i}", "status": "experiment_error"} for i in range(4)]
-        args = SimpleNamespace(parallel_prs=2, model="unused", codex="unused", auto_retry=True)
+        args = SimpleNamespace(parallel_prs=2, model="unused", codex="unused", auto_retry=True, backend="codex")
         with patch.object(batch_driver, "BATCH", self.root), \
              patch.object(batch_driver, "run_worker", concurrent_fixture), \
              patch.object(batch_driver, "update_html"):
@@ -254,7 +254,7 @@ class BatchDriverTests(unittest.TestCase):
 
     def test_parallel_ctrl_c_stops_workers_and_saves_pause(self):
         tasks = [{"id": f"fixture-{i}"} for i in range(3)]
-        args = SimpleNamespace(parallel_prs=2, model="unused", codex="unused", auto_retry=True)
+        args = SimpleNamespace(parallel_prs=2, model="unused", codex="unused", auto_retry=True, backend="codex")
         original_children = {child.pid for child in multiprocessing.active_children()}
         with patch.object(batch_driver, "BATCH", self.root), \
              patch.object(batch_driver, "run_worker", concurrent_fixture), \

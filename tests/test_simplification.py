@@ -66,7 +66,7 @@ class SimplificationTests(unittest.TestCase):
         self.assertEqual(historical["full_passes"], 10)
 
     def test_current_protocol_reuses_qualifying_batch_without_confirmation(self):
-        self.settings.update(required_passes=10, confirmation=False)
+        self.settings.update(required_passes=10, confirmation=False, effort="low")
         runner.write_json(self.source / "result.json", {"revision": 2})
         runner.write_json(self.source / "revision-02/batch.json", {"runs": verdicts(10)})
         with patch.object(runner, "Codex") as factory, patch.object(runner, "evaluate_batch") as evaluate:

@@ -69,6 +69,26 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(runner.command(["git", "rev-list", "--count", "HEAD"], generated).strip(), "1")
         self.assertEqual(runner.command(["git", "remote"], generated).strip(), "")
 
+    def test_claude_subscription_command_and_structured_response(self):
+        schema = runner.object_schema({"message": {"type": "string"}})
+        agent = runner.Codex("haiku", backend="claude")
+        args = runner.claude_command(agent.executable, agent.model, schema)
+        self.assertEqual(args[args.index("--effort") + 1], "low")
+        self.assertIn("--safe-mode", args)
+        self.assertIn("--disable-slash-commands", args)
+        self.assertNotIn("--bare", args)
+        settings = json.loads(args[args.index("--settings") + 1])
+        self.assertFalse(settings["sandbox"]["allowUnsandboxedCommands"])
+        self.assertTrue(settings["sandbox"]["filesystem"]["disabled"])
+        self.assertEqual(settings["sandbox"]["network"]["deniedDomains"], ["*"])
+        events = self.root / "events.jsonl"
+        events.write_text(json.dumps({"type": "result", "is_error": False,
+                                     "structured_output": {"message": "OK"}}) + "\n")
+        self.assertEqual(runner.claude_response(events), {"message": "OK"})
+        events.write_text(json.dumps({"type": "result", "is_error": True}) + "\n")
+        with self.assertRaises(RuntimeError):
+            runner.claude_response(events)
+
     def test_local_backend_uses_ollama_without_subscription_and_serializes_runs(self):
         agent = runner.Codex("qwen3:8b", backend="ollama")
         args = runner.codex_command("codex", agent.model, self.root,
@@ -91,6 +111,7 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn('":minimal"', joined)
         self.assertIn('enabled = false', joined)
         self.assertNotIn("dangerously-bypass", joined)
+        self.assertIn('model_reasoning_effort="low"', args)
         self.assertIn("--ephemeral", args)
         self.assertIn("--ignore-user-config", args)
 
