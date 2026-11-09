@@ -199,6 +199,39 @@ def claude_response(events):
     return results[-1]["structured_output"]
 
 
+def resume_settings(output, settings):
+    path = output / "settings.json"
+    if path.exists():
+        previous = read_json(path)
+        old = dict(previous, backend=previous.get("backend", "codex"),
+                   effort=previous.get("effort", "high"))
+        current = dict(settings)
+        old.pop("effort", None)
+        current.pop("effort", None)
+        # Explicitly migrate known runners; unknown source changes still require a new run.
+        compatible = {
+            "9d66cb870c1d524cedba66900e96f0baf7cbbab753d10030692c04e6ceb21983",
+            "52e95c642ae871f23a4d6881793bfe7dba29f3c328cdb77cafca552ab57bf73d",
+            "f30cffca7d49db1d806a3f3744429f735806713fb6422a5cca7637d4af350b1d",
+        }
+        if old.get("runner_sha256") in compatible:
+            old["runner_sha256"] = current.get("runner_sha256")
+        if old != current:
+            raise ValueError("Experiment settings changed. Use a new output directory.")
+        if previous != settings:
+            history = output / "settings-history.json"
+            write_json(history, (read_json(history) if history.exists() else []) + [previous])
+    write_json(path, settings)
+
+
+def request_without_effort(request):
+    request = dict(request)
+    request["command"] = [re.sub(r'model_reasoning_effort="[^"]+"',
+                                 'model_reasoning_effort="*"', arg)
+                          for arg in request["command"]]
+    return request
+
+
 def archive_incomplete_call(output):
     if (output / "complete.json").exists():
         return
@@ -247,11 +280,15 @@ class Codex:
                        VIRTUAL_ENV=str(Path(python).parent.parent), PYTHONPATH=str(cwd),
                        PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", MPLBACKEND="Agg")
             request["python"] = python
-        if (output / "request.json").exists() and read_json(output / "request.json") != request:
+        previous = read_json(output / "request.json") if (output / "request.json").exists() else None
+        if previous is not None and request_without_effort(previous) != request_without_effort(request):
             raise ValueError(f"Cached request differs: {output}. Use a new output directory.")
-        write_json(output / "request.json", request)
         if (output / "complete.json").exists():
             return read_json(output / "complete.json")
+        if previous is not None and previous != request:
+            history = output / "request-history.json"
+            write_json(history, (read_json(history) if history.exists() else []) + [previous])
+        write_json(output / "request.json", request)
         write_json(output / "schema.json", schema)
         # Preserve input evidence even when a role has full filesystem access.
         before = {str(path): hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in protected}
@@ -459,9 +496,7 @@ def run_task(task, output, agent, categories):
                 "runs": 10, "parallel_runs": getattr(agent, "parallel_runs", 10), "max_revisions": 10,
                 "required_passes": 10, "confirmation": False,
                 "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
-    if (output / "settings.json").exists() and read_json(output / "settings.json") != settings:
-        raise ValueError("Experiment settings changed. Use a new output directory.")
-    write_json(output / "settings.json", settings)
+    resume_settings(output, settings)
     if (output / "result.json").exists():
         return read_json(output / "result.json")
     # Preserve the historical request verbatim; only editor-produced revisions prohibit code.

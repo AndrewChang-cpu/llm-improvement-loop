@@ -24,7 +24,7 @@ The simplifier inherits the source experiment's backend. A historical high-effor
 
 `run` prepares missing original/reference snapshots and reusable per-task virtual environments, verifies reference tests, then executes refinement. `prepare` performs setup without model calls. Omitting `--task` runs both pilot tasks.
 
-The loop tests ten fresh generations per revision, allows ten editor revisions after baseline, and requires 10/10 in one batch without confirmation. Repeating the command resumes saved calls; changed settings or runner code require a new output folder. Authentication or quota failures stop execution rather than count as feature failures.
+The loop tests ten fresh generations per revision, allows ten editor revisions after baseline, and requires 10/10 in one batch without confirmation. Repeating the command resumes saved calls. Codex effort changes are allowed: completed calls retain their original requests, new calls use low effort, and settings/request histories record the switch. Model, task, rubric, or unknown runner changes require a new output folder. A resumed experiment can therefore contain both high- and low-effort results. Authentication or quota failures stop execution rather than count as feature failures.
 
 ## Inspect and audit
 
@@ -48,7 +48,7 @@ From this checkout:
 python3 batch_driver.py --auto-retry --parallel-prs 10
 ```
 
-For a fresh Claude batch using the same selection, pass `--backend claude --manifest .experiments/batch-100/runner-manifest.json --output .experiments/batch-100-claude-low`. Use `--output .experiments/batch-100-codex-low` for a fresh Codex batch with the existing manifest. Changed effort settings cannot resume historical high-effort results.
+For a fresh Claude batch using the same selection, pass `--backend claude --manifest .experiments/batch-100/runner-manifest.json --output .experiments/batch-100-claude-low`. Use `--output .experiments/batch-100-codex-low` for a fresh Codex batch with the existing manifest. Historical Codex runs can resume in place at low effort; switching backends still requires a new output folder.
 
 Runs up to ten PRs concurrently (the default), with ten parallel implementation/evaluation lanes per PR. This can mean roughly 100 simultaneous model calls. Use `--parallel-prs 1` for sequential execution; `--one-task` also runs only one PR. Each PR keeps separate logs, checkpoints, and retry state. Saved work is reused. Usage-limit errors wait until the reported local reset time plus one minute, or retry hourly when no reset time is available. Temporary network errors retry after 1, 5, then 15 minutes (capped at 15). Authentication, configuration, and unexpected errors pause the batch for inspection; permanent preparation failures are recorded separately. Ctrl+C stops workers and their commands; rerun the same command to resume. Keep the terminal running and computer awake. No Orca automation or supervising LLM is required.
 

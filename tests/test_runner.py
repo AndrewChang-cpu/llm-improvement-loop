@@ -16,6 +16,26 @@ if MODULE.exists():
 
 
 class RunnerTests(unittest.TestCase):
+    def test_resume_allows_effort_change_but_rejects_model_and_unknown_runner(self):
+        settings = {"model": "gpt-6-luna", "backend": "codex", "effort": "low",
+                    "runner_sha256": "current"}
+        previous = {"model": "gpt-6-luna",
+                    "runner_sha256": "9d66cb870c1d524cedba66900e96f0baf7cbbab753d10030692c04e6ceb21983"}
+        runner.write_json(self.root / "settings.json", previous)
+        runner.resume_settings(self.root, settings)
+        self.assertEqual(runner.read_json(self.root / "settings-history.json"), [previous])
+        for change in ({"model": "different"}, {"runner_sha256": "unknown"}):
+            with self.assertRaisesRegex(ValueError, "settings changed"):
+                runner.resume_settings(self.root, dict(settings, **change))
+
+    def test_request_comparison_ignores_only_codex_effort(self):
+        high = {"prompt": "feature", "command": ["codex", "-m", "gpt-6-luna",
+                                                     'model_reasoning_effort="high"']}
+        low = dict(high, command=high["command"][:-1] + ['model_reasoning_effort="low"'])
+        self.assertEqual(runner.request_without_effort(high), runner.request_without_effort(low))
+        self.assertNotEqual(runner.request_without_effort(high),
+                            runner.request_without_effort(dict(low, prompt="different")))
+
     def setUp(self):
         self.assertTrue(MODULE.exists(), "experiment runner has not been implemented")
         self.temp = tempfile.TemporaryDirectory()
@@ -195,8 +215,13 @@ class RunnerTests(unittest.TestCase):
         result = agent.run("baseline", "Behavior", cwd, output, runner.SPEC_SCHEMA)
         self.assertEqual(result, {"specification": "Behavior"})
         self.assertIn("turn.completed", (output / "events.jsonl").read_text())
+        request = runner.read_json(output / "request.json")
+        request["command"] = [arg.replace('model_reasoning_effort="low"',
+                                          'model_reasoning_effort="high"') for arg in request["command"]]
+        runner.write_json(output / "request.json", request)
         executable.unlink()
         self.assertEqual(agent.run("baseline", "Behavior", cwd, output, runner.SPEC_SCHEMA), result)
+        self.assertEqual(runner.read_json(output / "request.json"), request)
 
     def test_incomplete_codex_call_evidence_is_archived_before_retry(self):
         output = self.root / "incomplete-call"
