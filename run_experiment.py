@@ -218,6 +218,8 @@ def resume_settings(output, settings):
             "9d66cb870c1d524cedba66900e96f0baf7cbbab753d10030692c04e6ceb21983",
             "52e95c642ae871f23a4d6881793bfe7dba29f3c328cdb77cafca552ab57bf73d",
             "f30cffca7d49db1d806a3f3744429f735806713fb6422a5cca7637d4af350b1d",
+            "e45cc86dbb6cb2b2897cd72540cba2bcd53c2129d6bbc4b3f02e1411a760d856",
+            "888f04b454ec063b2c473de6bc745e6eb4710eead121cfd8820bf2009ba04740",
         }
         if old.get("runner_sha256") in compatible:
             if "judge_effort" in current:
