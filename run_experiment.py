@@ -192,9 +192,12 @@ def claude_command(executable, model, schema, effort="low"):
 def claude_response(events):
     results = [event for line in events.read_text().splitlines()
                for event in [json.loads(line)] if event.get("type") == "result"]
-    if not results or results[-1].get("is_error") or not isinstance(results[-1].get("structured_output"), dict):
+    # A background task finishing after StructuredOutput can start a later turn whose result has no output.
+    outputs = [r["structured_output"] for r in results
+               if not r.get("is_error") and isinstance(r.get("structured_output"), dict)]
+    if not outputs:
         raise RuntimeError(f"Claude did not return successful structured output. Logs: {events.parent}")
-    return results[-1]["structured_output"]
+    return outputs[-1]
 
 
 def resume_settings(output, settings):

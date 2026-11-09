@@ -139,6 +139,10 @@ class RunnerTests(unittest.TestCase):
         events.write_text(json.dumps({"type": "result", "is_error": False,
                                      "structured_output": {"message": "OK"}}) + "\n")
         self.assertEqual(runner.claude_response(events), {"message": "OK"})
+        events.write_text(json.dumps({"type": "result", "is_error": False,
+                                     "structured_output": {"message": "OK"}}) + "\n"
+                          + json.dumps({"type": "result", "is_error": False, "result": "Already submitted."}) + "\n")
+        self.assertEqual(runner.claude_response(events), {"message": "OK"})
         events.write_text(json.dumps({"type": "result", "is_error": True}) + "\n")
         with self.assertRaises(RuntimeError):
             runner.claude_response(events)
