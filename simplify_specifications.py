@@ -202,15 +202,19 @@ def main():
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    with (output / "simplification.lock").open("w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        summary_file = output / "summary.json"
-        summary = runner.read_json(summary_file) if summary_file.exists() else {}
-        for experiment in args.experiments:
-            name = Path(experiment).name
-            summary[name] = simplify(experiment, output / name, args.codex, args.effort)
+    # Lock each experiment for its whole simplification, and the shared summary only while updating it.
+    for experiment in args.experiments:
+        name = Path(experiment).name
+        with (output / f"{name}.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = simplify(experiment, output / name, args.codex, args.effort)
+        with (output / "simplification.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            summary_file = output / "summary.json"
+            summary = runner.read_json(summary_file) if summary_file.exists() else {}
+            summary[name] = result
             runner.write_json(summary_file, summary)
-        print(json.dumps(summary, indent=2))
+        print(json.dumps({name: result}, indent=2))
 
 
 if __name__ == "__main__":
