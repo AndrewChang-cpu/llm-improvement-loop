@@ -2,6 +2,7 @@
 """Render saved experiment results as a standalone HTML page (no model calls)."""
 import argparse
 import difflib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 
@@ -55,7 +56,9 @@ def load_task(path):
                 fromfile='Previous specification', tofile=folder.name)) if revisions else '',
         })
         previous = spec
-    return {'name': path.name, 'revisions': revisions}
+    # The first saved specification marks when the loop started.
+    started = min((f.stat().st_mtime for f in path.glob('revision-*/specification.md')), default=0)
+    return {'name': path.name, 'revisions': revisions, 'started': started}
 
 
 def load_simplification(path):
@@ -168,12 +171,18 @@ function selectTask(){task=data.tasks[Number($('task').value)];
  for(const r of task.revisions){const row=table.insertRow();for(const value of [entryLabel(r),r.words,r.judged,r.passes,...keys.map(k=>r.counts[k])])row.insertCell().textContent=value;}
  $('counts').replaceChildren(table);draw();showSpec();
 }
-data.tasks.forEach((t,i)=>$('task').add(new Option(t.name,i)));
+const day=t=>new Date(t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+data.tasks.forEach((t,i)=>$('task').add(new Option(`${t.name} — started ${day(t.started)}`,i)));
+// The URL hash keeps the selected feature and step across refreshes.
+function remember(){location.replace('#'+new URLSearchParams({task:task.name,step:$('revision').value}));}
+const saved=new URLSearchParams(location.hash.slice(1)),savedTask=data.tasks.findIndex(t=>t.name===saved.get('task'));
+if(savedTask>=0)$('task').value=savedTask;
 keys.forEach((key,i)=>{const row=document.createElement('label'),check=document.createElement('input');check.type='checkbox';check.checked=true;
  const swatch=document.createElement('span');swatch.className='swatch';swatch.style.background=colors[i];row.append(check,swatch,document.createTextNode(label(key)));row.title=data.criteria[key];
  check.onchange=()=>{check.checked?visible.add(key):visible.delete(key);draw();};$('legend').append(row);});
-$('task').onchange=selectTask;$('revision').onchange=showSpec;$('diff').onchange=showSpec;
-$('previous').onclick=()=>{$('revision').selectedIndex--;showSpec();};$('next').onclick=()=>{$('revision').selectedIndex++;showSpec();};selectTask();
+$('task').onchange=()=>{selectTask();remember();};$('revision').onchange=()=>{showSpec();remember();};$('diff').onchange=showSpec;
+$('previous').onclick=()=>{$('revision').selectedIndex--;showSpec();remember();};$('next').onclick=()=>{$('revision').selectedIndex++;showSpec();remember();};selectTask();
+if(savedTask>=0&&Number(saved.get('step'))<task.revisions.length){$('revision').value=saved.get('step');showSpec();}
 </script></html>'''
 
 
@@ -183,37 +192,70 @@ def main():
     parser.add_argument('--output', type=Path, help='HTML output (default: first LOOP/evaluation.html)')
     parser.add_argument('--simplification', type=Path, action='append', default=[],
                         help='Simplification task or batch directory; may be repeated')
+    parser.add_argument('--serve', type=int, metavar='PORT',
+                        help='Serve the page on localhost, rereading results on every refresh')
     args = parser.parse_args()
     try:
-        directories = [resolve_loop(name) for name in args.loop]
-        tasks = [task for directory in directories for task in load_tasks(directory)]
-        if not tasks:
-            raise ValueError('No saved revision specifications found.')
-        by_name = {task['name']: task for task in tasks}
-        if len(by_name) != len(tasks):
-            raise ValueError('Multiple refinement runs for the same feature; select one per feature.')
-        for directory in args.simplification:
-            paths = ([directory] if (directory / 'settings.json').exists() else
-                     sorted(path for path in directory.iterdir() if (path / 'settings.json').exists()))
-            if not paths:
-                raise ValueError(f'No simplification tasks found in {directory}.')
-            for path in paths:
-                simplified = load_simplification(path)
-                if simplified['name'] not in by_name:
-                    raise ValueError('Simplification task does not match the refinement results.')
-                by_name[simplified['name']]['revisions'].extend(simplified['revisions'])
-        # Graph positions follow the combined sequence, not the original revision numbers.
-        for task in tasks:
-            for number, row in enumerate(task['revisions']):
-                row['number'] = number
-        # Escape HTML delimiters in embedded JSON; render specs using textContent.
-        payload = json.dumps({'criteria': CRITERIA, 'tasks': tasks}).replace('<', '\\u003c')
-        output = args.output or directories[0] / 'evaluation.html'
+        if args.serve:
+            build(args)  # Fail fast on bad arguments.
+            serve(args)
+            return
+        output = args.output or resolve_loop(args.loop[0]) / 'evaluation.html'
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(HTML.replace('__DATA__', payload), encoding='utf-8')
+        output.write_text(build(args), encoding='utf-8')
         print(output.resolve())
     except (ValueError, OSError) as error:
         parser.error(str(error))
+
+
+def serve(args):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                body, status = build(args).encode(), 200
+            except (ValueError, OSError) as error:
+                body, status = str(error).encode(), 500
+            self.send_response(status)
+            self.send_header('Content-Type', 'text/html; charset=utf-8' if status == 200 else 'text/plain')
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    print(f'Serving http://localhost:{args.serve}/ (Ctrl+C to stop)', flush=True)
+    ThreadingHTTPServer(('127.0.0.1', args.serve), Handler).serve_forever()
+
+
+def build(args):
+    directories = [resolve_loop(name) for name in args.loop]
+    tasks = [task for directory in directories for task in load_tasks(directory)]
+    if not tasks:
+        raise ValueError('No saved revision specifications found.')
+    by_name = {task['name']: task for task in tasks}
+    if len(by_name) != len(tasks):
+        raise ValueError('Multiple refinement runs for the same feature; select one per feature.')
+    for directory in args.simplification:
+        if not directory.is_dir():
+            continue  # Simplification folders appear once a feature converges.
+        paths = ([directory] if (directory / 'settings.json').exists() else
+                 sorted(path for path in directory.iterdir() if (path / 'settings.json').exists()))
+        if not paths:
+            raise ValueError(f'No simplification tasks found in {directory}.')
+        for path in paths:
+            simplified = load_simplification(path)
+            if simplified['name'] not in by_name:
+                raise ValueError('Simplification task does not match the refinement results.')
+            by_name[simplified['name']]['revisions'].extend(simplified['revisions'])
+    # Graph positions follow the combined sequence, not the original revision numbers.
+    for task in tasks:
+        for number, row in enumerate(task['revisions']):
+            row['number'] = number
+    tasks.sort(key=lambda task: task['started'])
+    # Escape HTML delimiters in embedded JSON; render specs using textContent.
+    payload = json.dumps({'criteria': CRITERIA, 'tasks': tasks}).replace('<', '\\u003c')
+    return HTML.replace('__DATA__', payload)
 
 
 if __name__ == '__main__':
