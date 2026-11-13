@@ -50,7 +50,9 @@ def clean_env():
                 "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
                 "CLAUDECODE"):
         env.pop(key, None)
-    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    # Background auto-gc repacks objects while finished workspaces are being deleted.
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+               GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="gc.auto", GIT_CONFIG_VALUE_0="0")
     return env
 
 
@@ -315,6 +317,7 @@ def resume_settings(output, settings):
             "888f04b454ec063b2c473de6bc745e6eb4710eead121cfd8820bf2009ba04740",
             "372559f2a8aafe07cb44fb232065e1bf0a2cdeb61940e3f4dbeb2ce96ca86e0c",
             "6df0fd0d512307adff72d59a1abbf16181d12eeafc164aa4dc471dbaf7364c40",
+            "35a0e92f2c4437fa4f742de72b5be40d2c9bfab938e8ad1ee1b8a9a6c6a2dba6",
         }
         if old.get("runner_sha256") in compatible:
             if "judge_effort" in current:
