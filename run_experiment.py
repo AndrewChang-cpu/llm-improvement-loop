@@ -50,7 +50,9 @@ def clean_env():
                 "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
                 "CLAUDECODE"):
         env.pop(key, None)
-    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    # Background auto-gc repacks objects while finished workspaces are being deleted.
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+               GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="gc.auto", GIT_CONFIG_VALUE_0="0")
     return env
 
 
@@ -85,7 +87,8 @@ def export_commit(repository, commit, destination):
                 raise ValueError("Git archive contains an unsafe path")
             if member.issym() or member.islnk():
                 target = (destination / member.name).parent / member.linkname
-                if not target.resolve().is_relative_to(destination.resolve()):
+                # Path.is_relative_to needs Python 3.9; some benchmarks run on 3.8.
+                if destination.resolve() not in (target.resolve(), *target.resolve().parents):
                     raise ValueError("Git archive links outside the snapshot")
         archive.extractall(destination)
 
@@ -315,6 +318,9 @@ def resume_settings(output, settings):
             "888f04b454ec063b2c473de6bc745e6eb4710eead121cfd8820bf2009ba04740",
             "372559f2a8aafe07cb44fb232065e1bf0a2cdeb61940e3f4dbeb2ce96ca86e0c",
             "6df0fd0d512307adff72d59a1abbf16181d12eeafc164aa4dc471dbaf7364c40",
+            "35a0e92f2c4437fa4f742de72b5be40d2c9bfab938e8ad1ee1b8a9a6c6a2dba6",
+            "b492afa421aa2bfe07706d2f2276c1fe00921d35881b398e22d5985d328b883d",
+            "490f2f919039754e23723dcb747bc6481c774b21d9f528537084b4eb9c777b8f",
         }
         if old.get("runner_sha256") in compatible:
             if "judge_effort" in current:
@@ -466,8 +472,10 @@ def check_candidate(task, generated, output):
         if prefix[1:3] == ["-m", "pytest"]:
             # Platform-specific failures excluded from the reference checks are excluded here too.
             deselect = [arg for test in task.get("platform_deselect", []) for arg in ("--deselect", test)]
+            # Warning filters the reference checks need (old upstream source bugs) apply here too.
+            filters = [arg for i, arg in enumerate(prefix) if "-W" in prefix[i - 1:i + 1]]
             args = [prefix[0], "-m", "pytest", "-q", "--basetemp",
-                    str(output / "candidate-test-tmp")] + deselect + tests + changed_tests
+                    str(output / "candidate-test-tmp")] + filters + deselect + tests + changed_tests
         elif any(word.endswith("runtests.py") for word in prefix):
             # Django's runner accepts dotted module labels relative to tests/, not file paths.
             changed_tests = [path[len("tests/"):-len(".py")].replace("/", ".") for path in changed_tests
@@ -782,9 +790,10 @@ def prepare_task(task, storage):
     fresh_workspace(base, reference)
     command(["git", "apply", "--binary", str(patch_file)], reference, clean_env())
     venv = directory / "venv"
-    if not venv.exists():
-        command([sys.executable, "-m", "venv", str(venv)])
     python = str(venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
+    # A venv left by an interpreter that crashed mid-creation has no pip; rebuild it.
+    if not venv.exists() or subprocess.run([python, "-m", "pip", "--version"], capture_output=True).returncode:
+        command([sys.executable, "-m", "venv", "--clear", str(venv)])
     for packages in task["install"]:
         command([python, "-m", "pip", "install"] + packages, reference, clean_env())
     checks = [[python if word == "{python}" else word for word in args] for args in task["checks"]]
