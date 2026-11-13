@@ -49,7 +49,8 @@ def simplify(value, output, executable=None, effort=None):
     # The per-experiment locking change did not alter simplification behavior.
     if saved and saved.get("simplifier_sha256") in {"3a279283849a3c0cc8766e10f4ee11db8f693bd4f91d3039abcebe97f2031667",
                                                    "6baee10bc354aa65fb1ec6a87e50be15aa04443036621ae9592cbb1135224566",
-                                                   "2e5404831f465f87cd21cb8bb59bfb00e196b0a74dadd0974e04bef8cb4e9fca"}:
+                                                   "2e5404831f465f87cd21cb8bb59bfb00e196b0a74dadd0974e04bef8cb4e9fca",
+                                                   "029af23d6cf6c5ad0e3d76f728427eb322f0182bd200098f740f223134f1528d"}:
         saved["simplifier_sha256"] = settings["simplifier_sha256"]
     # Deleting judged repository copies did not alter results. Resuming the source experiment
     # rewrites its settings with only the new runner hash, so accept that source change too.
