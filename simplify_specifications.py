@@ -52,7 +52,9 @@ def simplify(value, output, executable=None, effort=None):
                                                    "2e5404831f465f87cd21cb8bb59bfb00e196b0a74dadd0974e04bef8cb4e9fca",
                                                    "029af23d6cf6c5ad0e3d76f728427eb322f0182bd200098f740f223134f1528d",
                                                    "6696991c7b33b11ddb99e66bfeb9b72c63c67f537ecc74c9d1373c5add5d0e4b",
-                                                   "a1a9a79016d3ed487419e01a5240083f62589d65b87c971be1bbf29855d7357f"}:
+                                                   "a1a9a79016d3ed487419e01a5240083f62589d65b87c971be1bbf29855d7357f",
+                                                   "864ad5d02ed06cc426250d4284ba15ebc358322f69f2cd8ceba7abbb9f292530",
+                                                   "867e5afa69c46e05d41664be09495cf213485f0d4c2fb55e5bdb92668579f416"}:
         saved["simplifier_sha256"] = settings["simplifier_sha256"]
     # Deleting judged repository copies did not alter results. Resuming the source experiment
     # rewrites its settings with only the new runner hash, so accept that source change too.
