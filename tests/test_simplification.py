@@ -1,3 +1,6 @@
+import contextlib
+import hashlib
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -35,6 +38,10 @@ class SimplificationTests(unittest.TestCase):
         categories = patch.object(runner, "categories_from_docs", return_value={"Purpose": ["Goals"]})
         categories.start()
         self.addCleanup(categories.stop)
+        # Fixture verdicts name no real candidate trees to rebuild.
+        trees = patch.object(runner, "materialized", side_effect=lambda task, verdicts: contextlib.nullcontext())
+        self.materialized = trees.start()
+        self.addCleanup(trees.stop)
         self.output = self.root / "output"
 
     def test_load_experiment_accepts_a_single_task_directory(self):
@@ -115,6 +122,7 @@ class SimplificationTests(unittest.TestCase):
             self.assertEqual(result["accepted_rounds"][0]["selected_candidate"], 3)
             self.assertEqual(evaluate.call_count, 7)
             self.assertEqual(simplification.word_count((self.output / "simplified-specification.md").read_text()), 80)
+            self.assertEqual([len(call.args[1]) for call in self.materialized.call_args_list], [10] * 6)
             self.assertFalse((self.output / "confirmation").exists())
             calls = factory.return_value.run.call_args_list
             self.assertEqual([call.args[1].split(" first. ", 1)[1] for call in calls[:3]],
@@ -125,13 +133,33 @@ class SimplificationTests(unittest.TestCase):
                 self.assertEqual(simplification.word_count(feedback["current_specification"]), 100 if i < 3 else 80)
             evaluate.reset_mock()
             factory.return_value.run.reset_mock()
+            self.materialized.reset_mock()
             self.assertEqual(simplification.simplify("example", self.output), result)
+            self.materialized.assert_not_called()
             evaluate.assert_not_called()
             factory.return_value.run.assert_not_called()
             self.settings["model"] = "changed"
             with self.assertRaisesRegex(ValueError, "inputs changed"):
                 simplification.simplify("example", self.output)
             self.assertEqual(runner.read_json(self.output / "result.json"), result)
+
+    def test_resume_accepts_previous_runner_and_its_rewritten_source_settings(self):
+        old = "6df0fd0d512307adff72d59a1abbf16181d12eeafc164aa4dc471dbaf7364c40"
+        source_settings = {"task": {"id": "fixture"}, "runner_sha256": old}
+        runner.write_json(self.source / "settings.json", source_settings)
+        with patch.object(runner, "Codex"), patch.object(runner, "evaluate_batch", return_value=verdicts(9)):
+            result = simplification.simplify("example", self.output)
+        saved = runner.read_json(self.output / "settings.json")
+        saved["runner_sha256"] = old
+        runner.write_json(self.output / "settings.json", saved)
+        # Resuming the source experiment records the new runner hash in its settings.
+        runner.write_json(self.source / "settings.json", dict(source_settings, runner_sha256="new"))
+        self.assertEqual(simplification.simplify("example", self.output), result)
+        current = hashlib.sha256((self.source / "settings.json").read_bytes()).hexdigest()
+        self.assertEqual(runner.read_json(self.output / "settings.json")["source_settings_sha256"], current)
+        runner.write_json(self.source / "settings.json", dict(source_settings, model="changed"))
+        with self.assertRaisesRegex(ValueError, "inputs changed"):
+            simplification.simplify("example", self.output)
 
     def test_both_out_of_range_bounds_skip_evaluation(self):
         with patch.object(runner, "Codex") as factory, patch.object(

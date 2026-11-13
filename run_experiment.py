@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
+import filecmp
 import hashlib
 import io
 import json
@@ -63,6 +65,9 @@ def read_json(path):
     return json.loads(path.read_text())
 
 
+COPY_IGNORES = (".git", ".codex", "__pycache__", ".pytest_cache")
+
+
 def initialize_git(directory):
     command(["git", "init", "-q", str(directory)], env=clean_env())
     command(["git", "add", "-A"], directory, clean_env())
@@ -89,9 +94,97 @@ def fresh_workspace(base, destination):
     # Fresh Git history prevents the generator from finding the reference PR in old commits.
     if destination.exists():
         shutil.rmtree(destination)
-    shutil.copytree(base, destination, symlinks=True,
-                    ignore=shutil.ignore_patterns(".git", ".codex", "__pycache__", ".pytest_cache"))
+    shutil.copytree(base, destination, symlinks=True, ignore=shutil.ignore_patterns(*COPY_IGNORES))
     initialize_git(destination)
+
+
+def rebuild_workspace(task, run, destination):
+    # A judged candidate is the original snapshot plus its recorded patch.
+    fresh_workspace(Path(task["base"]), destination)
+    patch = (run / "patch.diff").resolve()
+    if patch.read_text():
+        command(["git", "apply", "--binary", str(patch)], destination, clean_env())
+    command(["git", "add", "-A"], destination, clean_env())
+
+
+def tree_entries(root):
+    entries = {}
+    for directory, dirs, files in os.walk(root):
+        dirs[:] = [name for name in dirs if name not in COPY_IGNORES]
+        for name in dirs + [name for name in files if name not in COPY_IGNORES]:
+            path = Path(directory) / name
+            if path.is_symlink():
+                entries[path.relative_to(root)] = os.readlink(path)
+            elif name in files:
+                entries[path.relative_to(root)] = None
+    return entries
+
+
+def same_tree(left, right):
+    entries = tree_entries(left)
+    return entries == tree_entries(right) and all(
+        filecmp.cmp(left / path, right / path, shallow=False) for path, link in entries.items() if link is None)
+
+
+def archive_workspace(tree, archive):
+    temporary = archive.with_name(archive.name + ".partial")
+    with tarfile.open(temporary, "w:gz", compresslevel=1) as output:
+        output.add(tree, arcname=tree.name)
+    # Read the whole archive back before its expanded copy can be deleted.
+    expected = 1 + sum(len(dirs) + len(files) for _, dirs, files in os.walk(tree))
+    with tarfile.open(temporary) as written:
+        if sum(1 for _ in written) != expected:
+            raise RuntimeError(f"Incomplete workspace archive: {temporary}")
+    temporary.replace(archive)
+
+
+def retire_workspace(task, run):
+    # After judging, keep a candidate as patch.diff, or as a tarball when the patch cannot rebuild it.
+    generated = run / "generated"
+    if not generated.is_dir() or not (run / "patch.diff").exists():
+        return None
+    check = run / "rebuild-check"
+    shutil.rmtree(check, ignore_errors=True)
+    try:
+        rebuild_workspace(task, run, check)
+        rebuilt = same_tree(generated, check)
+    except RuntimeError:
+        rebuilt = False
+    finally:
+        shutil.rmtree(check, ignore_errors=True)
+    if not rebuilt:
+        archive_workspace(generated, run / "generated.tar.gz")
+    shutil.rmtree(generated)
+    return "rebuilt" if rebuilt else "archived"
+
+
+def materialize(task, run):
+    # Build in a temporary directory so an interrupted rebuild never looks like a judged tree.
+    temporary = run / "materializing"
+    shutil.rmtree(temporary, ignore_errors=True)
+    archive = run / "generated.tar.gz"
+    if archive.exists():
+        temporary.mkdir()
+        with tarfile.open(archive) as source:
+            source.extractall(temporary, **({"filter": "tar"} if hasattr(tarfile, "tar_filter") else {}))
+        (temporary / "generated").rename(run / "generated")
+        temporary.rmdir()
+    else:
+        rebuild_workspace(task, run, temporary)
+        temporary.rename(run / "generated")
+
+
+@contextlib.contextmanager
+def materialized(task, verdicts):
+    # Editors read judged candidate trees, which are kept only as patches between uses.
+    runs = [Path(v["generated"]).parent for v in verdicts if not Path(v["generated"]).exists()]
+    try:
+        for run in runs:
+            materialize(task, run)
+        yield
+    finally:
+        for run in runs:
+            shutil.rmtree(run / "generated", ignore_errors=True)
 
 
 def object_schema(properties):
@@ -221,6 +314,7 @@ def resume_settings(output, settings):
             "e45cc86dbb6cb2b2897cd72540cba2bcd53c2129d6bbc4b3f02e1411a760d856",
             "888f04b454ec063b2c473de6bc745e6eb4710eead121cfd8820bf2009ba04740",
             "372559f2a8aafe07cb44fb232065e1bf0a2cdeb61940e3f4dbeb2ce96ca86e0c",
+            "6df0fd0d512307adff72d59a1abbf16181d12eeafc164aa4dc471dbaf7364c40",
         }
         if old.get("runner_sha256") in compatible:
             if "judge_effort" in current:
@@ -465,6 +559,7 @@ def evaluate_batch(task, output, agent, specification, runs=10):
         run = output / f"run-{number:02d}"
         generated = run / "generated"
         if (run / "verdict.json").exists():
+            retire_workspace(task, run)
             return read_json(run / "verdict.json")
         if not (run / "generation/complete.json").exists():
             if generated.exists():
@@ -490,6 +585,9 @@ def evaluate_batch(task, output, agent, specification, runs=10):
                   writable=True, python=task.get("generator_python"))
         command(["git", "add", "-A"], generated, clean_env())
         checks = check_candidate(task, generated, run)
+        # checks.json records the evaluation; nothing reads its repository copy afterwards.
+        shutil.rmtree(run / "evaluation")
+        shutil.rmtree(run / "candidate-test-tmp", ignore_errors=True)
         context = run / "judge-context"
         context.mkdir(exist_ok=True)
         shutil.copy2(run / "checks.json", context / "checks.json")
@@ -515,6 +613,7 @@ def evaluate_batch(task, output, agent, specification, runs=10):
         # The editor needs actual failures and API facts, not only the judge's paraphrase.
         verdict["checks"] = checks
         write_json(run / "verdict.json", verdict)
+        retire_workspace(task, run)
         return verdict
 
     # Each lane has its own repository and logs; only the frozen reference is shared read-only.
@@ -605,9 +704,11 @@ def run_task(task, output, agent, categories):
                   "only in the requested JSON response. Do not write, edit, or delete any files, "
                   "including specifications, feedback, and experiment artifacts.\n"
                   + json.dumps({"original": task["base"], "reference": task["reference"]}))
-        response = agent.run("edit", prompt, editor_context, directory / "editing", edit_schema,
-                             readable=readable, protected=[directory / "specification.md",
-                                                          editor_context / "feedback.json"])
+        rebuild = [] if (directory / "editing/complete.json").exists() else results
+        with materialized(task, rebuild):
+            response = agent.run("edit", prompt, editor_context, directory / "editing", edit_schema,
+                                 readable=readable, protected=[directory / "specification.md",
+                                                              editor_context / "feedback.json"])
         validate_revision(response, categories)
         write_json(directory / "revision-edit.json", response)
         specification = response["specification"]

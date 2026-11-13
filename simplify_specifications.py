@@ -48,8 +48,17 @@ def simplify(value, output, executable=None, effort=None):
     saved = runner.read_json(output / "settings.json") if (output / "settings.json").exists() else None
     # The per-experiment locking change did not alter simplification behavior.
     if saved and saved.get("simplifier_sha256") in {"3a279283849a3c0cc8766e10f4ee11db8f693bd4f91d3039abcebe97f2031667",
-                                                   "6baee10bc354aa65fb1ec6a87e50be15aa04443036621ae9592cbb1135224566"}:
+                                                   "6baee10bc354aa65fb1ec6a87e50be15aa04443036621ae9592cbb1135224566",
+                                                   "2e5404831f465f87cd21cb8bb59bfb00e196b0a74dadd0974e04bef8cb4e9fca"}:
         saved["simplifier_sha256"] = settings["simplifier_sha256"]
+    # Deleting judged repository copies did not alter results. Resuming the source experiment
+    # rewrites its settings with only the new runner hash, so accept that source change too.
+    if saved and saved.get("runner_sha256") in {"6df0fd0d512307adff72d59a1abbf16181d12eeafc164aa4dc471dbaf7364c40"}:
+        previous_source = dict(runner.read_json(source / "settings.json"), runner_sha256=saved["runner_sha256"])
+        if (hashlib.sha256((json.dumps(previous_source, indent=2) + "\n").encode()).hexdigest()
+                == saved["source_settings_sha256"]):
+            saved["source_settings_sha256"] = settings["source_settings_sha256"]
+        saved["runner_sha256"] = settings["runner_sha256"]
     if saved is not None and saved != settings:
         raise ValueError(f"Simplification inputs changed: use a new output directory for {directory.name}")
     runner.write_json(output / "settings.json", settings)
@@ -148,9 +157,11 @@ def simplify(value, output, executable=None, effort=None):
                 "prevents revision, return status blocked and explain the failure in changes. "
                 "Do not put a refusal in the specification field and label it revised."
             )
-            response = agent.run("simplify", prompt, context, destination / "editing", EDIT_SCHEMA,
-                                 readable=[task["base"], task["reference"]] + [v["generated"] for v in verdicts],
-                                 protected=[current_file, feedback_file])
+            rebuild = [] if (destination / "editing/complete.json").exists() else verdicts
+            with runner.materialized(task, rebuild):
+                response = agent.run("simplify", prompt, context, destination / "editing", EDIT_SCHEMA,
+                                     readable=[task["base"], task["reference"]] + [v["generated"] for v in verdicts],
+                                     protected=[current_file, feedback_file])
             if response["status"] != "revised":
                 raise RuntimeError(f"Simplification editor blocked: {response['changes']}. Logs: {destination / 'editing'}")
             candidate = response["specification"].strip()

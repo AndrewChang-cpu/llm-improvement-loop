@@ -429,6 +429,11 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("confirmation_passes", result)
         self.assertFalse((output / "revision-01/confirmation").exists())
         self.assertEqual(sum(role == "generate" for role, _, _ in fake.calls), 20)
+        # Judged candidates are kept as patches; only small result files remain per run.
+        for run in output.glob("revision-*/run-*"):
+            self.assertTrue((run / "patch.diff").exists())
+            for name in ("generated", "evaluation", "rebuild-check", "generated.tar.gz"):
+                self.assertFalse((run / name).exists(), run / name)
         calls = len(fake.calls)
         self.assertEqual(runner.run_task(task, output, fake, categories), result)
         self.assertEqual(len(fake.calls), calls)
@@ -443,6 +448,45 @@ class RunnerTests(unittest.TestCase):
             if role == "edit":
                 self.assertNotIn("baseline", runner.read_json(cwd / "feedback.json"))
                 self.assertIn("correct or remove", prompt)
+
+    def test_retired_workspace_rebuilds_from_patch_or_archive(self):
+        base = self.root / "base"
+        base.mkdir()
+        (base / "feature.py").write_text("value = 0\n")
+        (base / ".gitignore").write_text("*.log\n")
+        task = {"base": str(base)}
+        def judged(name, ignored_output=False, patch=None):
+            run = self.root / name
+            generated = run / "generated"
+            runner.fresh_workspace(base, generated)
+            (generated / "feature.py").write_text("value = 1\n")
+            (generated / "new.py").write_text("added\n")
+            (generated / "__pycache__").mkdir()
+            (generated / "__pycache__/feature.pyc").write_text("cache")
+            if ignored_output:
+                (generated / "build.log").write_text("ignored output\n")
+            runner.command(["git", "add", "-A"], generated, runner.clean_env())
+            (run / "patch.diff").write_text(patch if patch is not None else runner.command(
+                ["git", "diff", "--cached", "--binary"], generated, runner.clean_env()))
+            return run
+        cases = {"rebuilt": judged("clean"), "archived": judged("ignored", ignored_output=True)}
+        cases["archived-bad-patch"] = judged("bad", patch="not a patch\n")
+        for expected, run in cases.items():
+            self.assertEqual(runner.retire_workspace(task, run), expected.split("-")[0])
+            self.assertFalse((run / "generated").exists())
+            self.assertFalse((run / "rebuild-check").exists())
+            self.assertEqual((run / "generated.tar.gz").exists(), expected != "rebuilt")
+            verdict = {"generated": str(run / "generated")}
+            with runner.materialized(task, [verdict]):
+                self.assertEqual((run / "generated/feature.py").read_text(), "value = 1\n")
+                self.assertEqual((run / "generated/new.py").read_text(), "added\n")
+                self.assertEqual((run / "generated/build.log").exists(), run.name == "ignored")
+                if run.name != "bad":
+                    self.assertEqual(runner.command(["git", "diff", "--cached", "--binary"], run / "generated",
+                                                    runner.clean_env()), (run / "patch.diff").read_text())
+            self.assertFalse((run / "generated").exists())
+            self.assertFalse((run / "materializing").exists())
+        self.assertIsNone(runner.retire_workspace(task, cases["rebuilt"]))
 
     def test_nonconvergence_stops_after_ten_revisions(self):
         base = self.root / "base"
@@ -480,6 +524,7 @@ class FakeCodex:
                                   "deficiency": "" if passed else "Missing behavior"}
                                  for key in runner.CRITERIA]}
         if role == "edit":
+            assert all(Path(path).is_dir() for path in readable), "editor inputs were not rebuilt"
             return {"specification": "Refined specification.", "edits": [
                 {"category": "Architecture", "subsection": "Responsibilities",
                  "operation": "clarify", "change": "implement the behavior",
