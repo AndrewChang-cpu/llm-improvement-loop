@@ -87,7 +87,8 @@ def export_commit(repository, commit, destination):
                 raise ValueError("Git archive contains an unsafe path")
             if member.issym() or member.islnk():
                 target = (destination / member.name).parent / member.linkname
-                if not target.resolve().is_relative_to(destination.resolve()):
+                # Path.is_relative_to needs Python 3.9; some benchmarks run on 3.8.
+                if destination.resolve() not in (target.resolve(), *target.resolve().parents):
                     raise ValueError("Git archive links outside the snapshot")
         archive.extractall(destination)
 
@@ -318,6 +319,7 @@ def resume_settings(output, settings):
             "372559f2a8aafe07cb44fb232065e1bf0a2cdeb61940e3f4dbeb2ce96ca86e0c",
             "6df0fd0d512307adff72d59a1abbf16181d12eeafc164aa4dc471dbaf7364c40",
             "35a0e92f2c4437fa4f742de72b5be40d2c9bfab938e8ad1ee1b8a9a6c6a2dba6",
+            "b492afa421aa2bfe07706d2f2276c1fe00921d35881b398e22d5985d328b883d",
         }
         if old.get("runner_sha256") in compatible:
             if "judge_effort" in current:

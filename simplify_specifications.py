@@ -50,12 +50,14 @@ def simplify(value, output, executable=None, effort=None):
     if saved and saved.get("simplifier_sha256") in {"3a279283849a3c0cc8766e10f4ee11db8f693bd4f91d3039abcebe97f2031667",
                                                    "6baee10bc354aa65fb1ec6a87e50be15aa04443036621ae9592cbb1135224566",
                                                    "2e5404831f465f87cd21cb8bb59bfb00e196b0a74dadd0974e04bef8cb4e9fca",
-                                                   "029af23d6cf6c5ad0e3d76f728427eb322f0182bd200098f740f223134f1528d"}:
+                                                   "029af23d6cf6c5ad0e3d76f728427eb322f0182bd200098f740f223134f1528d",
+                                                   "6696991c7b33b11ddb99e66bfeb9b72c63c67f537ecc74c9d1373c5add5d0e4b"}:
         saved["simplifier_sha256"] = settings["simplifier_sha256"]
     # Deleting judged repository copies did not alter results. Resuming the source experiment
     # rewrites its settings with only the new runner hash, so accept that source change too.
     if saved and saved.get("runner_sha256") in {"6df0fd0d512307adff72d59a1abbf16181d12eeafc164aa4dc471dbaf7364c40",
-                                                "35a0e92f2c4437fa4f742de72b5be40d2c9bfab938e8ad1ee1b8a9a6c6a2dba6"}:
+                                                "35a0e92f2c4437fa4f742de72b5be40d2c9bfab938e8ad1ee1b8a9a6c6a2dba6",
+                                                "b492afa421aa2bfe07706d2f2276c1fe00921d35881b398e22d5985d328b883d"}:
         previous_source = dict(runner.read_json(source / "settings.json"), runner_sha256=saved["runner_sha256"])
         if (hashlib.sha256((json.dumps(previous_source, indent=2) + "\n").encode()).hexdigest()
                 == saved["source_settings_sha256"]):
