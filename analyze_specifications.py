@@ -88,7 +88,9 @@ def load_experiment(value):
     directory = Path(value).resolve()
     if not directory.is_dir():
         directory = (runner.ROOT / ".experiments" / value).resolve()
-    candidates = list((directory / "results").glob("*/comprehensive-specification.md"))
+    candidates = ([directory / "comprehensive-specification.md"]
+                  if (directory / "comprehensive-specification.md").is_file()
+                  else list((directory / "results").glob("*/comprehensive-specification.md")))
     if len(candidates) != 1:
         raise ValueError(f"Expected one completed task in {directory}")
     source = candidates[0].parent
@@ -101,7 +103,10 @@ def load_experiment(value):
     if specification != (revision / "specification.md").read_text():
         raise ValueError("Final specification differs from its evaluated revision")
     saved = []
-    for batch in (revision / "batch.json", revision / "confirmation/batch.json"):
+    batches = [revision / "batch.json"]
+    if settings.get("confirmation", True):
+        batches.append(revision / "confirmation/batch.json")
+    for batch in batches:
         saved.extend(runner.read_json(batch)["runs"])
     for verdict in saved:
         if runner.validate_verdict(verdict) != verdict["passed"]:
@@ -147,7 +152,7 @@ def analyze(value, database, shared_file, artifacts, repetitions, executable):
         (output / "specification.md").write_text(variants[section])
         print(f"{name}: removing {section}", flush=True)
         verdicts = runner.evaluate_batch(original_settings["task"], output,
-                                        runner.Codex(settings["model"], executable), variants[section],
+                                        runner.Codex(settings["model"], executable, original_settings.get("backend", "codex")), variants[section],
                                         runs=repetitions)
         summary = counts(verdicts)
         return {"runs": [{"index": i, "artifact_directory": str(output / f"run-{i:02d}"),
@@ -175,7 +180,7 @@ def main():
     parser.add_argument("--runs", type=int, default=1, help="Fresh generations per removed section (default: 1)")
     parser.add_argument("--output", type=Path, default=runner.ROOT / ".experiments/ablation-analysis.json")
     parser.add_argument("--artifacts", type=Path, default=runner.ROOT / ".experiments/ablations")
-    parser.add_argument("--codex", default="codex")
+    parser.add_argument("--codex")
     args = parser.parse_args()
     if args.runs < 1:
         parser.error("--runs must be positive")

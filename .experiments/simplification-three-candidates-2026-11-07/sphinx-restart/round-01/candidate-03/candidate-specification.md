@@ -1,0 +1,35 @@
+## Goals
+Add Python-domain support for documenting type aliases and cross-referencing them through the existing Python object system. Preserve existing object behavior and registration conventions.
+
+## Workflows
+Allow aliases at module level and in class context. Class context qualifies the alias but does not make its directive a container for nested object declarations. The alias expression is optional. When supplied as canonical, display it after the alias name with an equals sign and parse it as a Python annotation so referenced types use normal cross-reference resolution. Without canonical, the alias must still be documented and indexed. Accept a description body while retaining PyObject’s restriction against nested object contents.
+
+## Data model
+Represent an alias as a Python-domain object with object type name “type,” public label “type alias,” and cross-reference types “type” and “obj.” Register its qualified name as the primary object and, when canonical is present, register that name as an alias for the same object.
+
+## API contracts
+Provide the py:type directive and py:type role. The directive starts its signature with “type,” inherits PyObject’s shared options, including canonical, and does not add PyVariable’s type or value options. With canonical, render the name, equals sign, and expression; parse the expression with the existing annotation parser and retain its annotation structure and cross-reference nodes. Resolve the role through normal Python-domain object lookup and cross-reference resolution.
+
+Use Python-domain module-name configuration for index text. A module-level alias is “Alias (in module example)” when a module is set, otherwise just the alias name. A nested alias is “Alias (type alias in Class)” when module names are disabled. When enabled and a module is set, include it before the class, as “Alias (type alias in example.Class).”
+
+## Module architecture
+Implement the alias as a PyObject specialization in the existing Python-domain component. Register its object type, directive, and role in PythonDomain. Reuse inherited Python-object signature and target handling for module and class context, indexing hooks, canonical alias registration, and non-nestable behavior. Use the existing annotation parser and Python-domain cross-reference machinery; do not add separate rendering or reference paths.
+
+## Naming
+Use “type” for the object type, directive, and role; “canonical” for the optional alias expression; and “type alias” for the public label and nested index text.
+
+## Documentation
+Document the directive and role in the Python-domain documentation. Explain that canonical is optional, describes the represented type, and appears in the signature. Document support for an optional description body and explain the alias cross-reference role. Add a feature bullet naming the directive and role under the current release’s Features added section in CHANGES.rst.
+
+## Behavioral acceptance criteria
+- Module-level and class-scoped aliases receive correct qualified names and participate in Python-domain cross-references.
+- Class-scoped aliases work, while the alias directive itself continues to disallow nested object contents.
+- Omitting canonical still permits documentation, indexing, and cross-referencing.
+- A supplied canonical expression follows the alias name after an equals sign and is parsed into annotation nodes, allowing referenced types to resolve normally.
+- Module-level and nested index entries follow the stated forms; nested entries include a module prefix only when module names are enabled and a module is set.
+- The object type name, directive, and role are “type”; the public object-type label is “type alias.”
+- Shared PyObject options and existing Python-domain behavior remain available.
+- A py:type reference to a declared module-level or nested alias resolves to its target.
+
+## Test requirements
+Add focused regression tests in the existing Python-domain test suite. Cover aliases with and without canonical, annotation cross-references, module-level and class-scoped names, signature prefix and separator, index forms with module names enabled and disabled, object-type label and registration, and py:type role resolution. Include an inline py:type reference and verify its link targets the declared alias; registration or lookup alone does not test role parsing and resolution. Verify both that nested object contents are disallowed and that a class-scoped alias is handled correctly. Follow existing Python-domain test conventions; documentation examples do not replace automated tests.

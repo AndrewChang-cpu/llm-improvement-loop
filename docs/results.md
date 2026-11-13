@@ -1,5 +1,79 @@
 # Pilot results
 
+## Restarted refinement and simplification (2026-11-07)
+
+New refinement requires 10/10 in one batch, without confirmation. Sphinx restarted from the PR baseline and scored **0, 1, 8, 8, 8, 10** passes across revisions 0–5. Its passing specification contains 813 words. Seaborn scored **0, 5, 8, 7, 6, 8, 10** across revisions 0–6. Its passing specification contains 964 words. Simplification completed with **420 words**, a **56.4% reduction** from 964. Each accepted version scored 10/10; no confirmation batch was added. Account usage-limit interruptions were archived separately and unfinished calls resumed without replacing completed judgments.
+
+Sphinx's first, single-proposal simplification reduced 813 words to 528 (35%) and scored 9/10. It was rejected. The revised search proposes three independent drafts per round, each 10–30% shorter, evaluates each eligible draft ten times, and retains the shortest 10/10 candidate. The first round without a qualifying candidate stops the search.
+
+| Sphinx candidate | Words | Reduction | Recorded passes | Outcome |
+| --- | ---: | ---: | ---: | --- |
+| 1 | 616 | 24.2% | 8/10 | Rejected |
+| 2 | 578 | 28.9% | 8/10 | Rejected |
+| 3 | 659 | 18.9% | 9/10 | Rejected |
+
+No reduction was accepted; the retained specification remains 813 words. All 30 candidates passed the configured executable checks. The five rejected implementations had index behavior that differed from the reference: module-prefix handling when module names are disabled, or qualified aliases declared outside a class directive. Post-run execution reproduced those output differences; no judge verdict was replaced or fed corrected feedback.
+
+**Diagnostic output differences do not automatically establish evaluation failures.** Applying the same three diagnostic cases to the original passing batch and all shortened batches produced the counts below. These checks cover only those index cases, not the full rubric.
+
+| Batch | Recorded passes | Implementations matching all three diagnostic cases |
+| --- | ---: | ---: |
+| Original 813-word specification | 10/10 | 8/10 |
+| Candidate 1 | 8/10 | 5/10 |
+| Candidate 2 | 8/10 | 8/10 |
+| Candidate 3 | 9/10 | 8/10 |
+
+Two original passes and four shortened-specification passes differ from the reference on at least one diagnostic case. These include minor label differences, such as a trailing dot, which alone do not establish architectural or core-behavior failures. The probes therefore do not invalidate the recorded passes. The scores also do not establish that shortening caused a regression or that 813 words are necessary. No rubric or verdict has been changed.
+
+Artifacts: [restarted refinement](../.experiments/restart-simplification-2026-11-07/), [three-candidate search](../.experiments/simplification-three-candidates-2026-11-07/), and [post-run validity audit](../.experiments/simplification-three-candidates-2026-11-07/sphinx-restart/index-validity-audit.json). Subscription-limit interruptions are logged separately and resumed from saved calls; they are not implementation failures. Access-log screening has found no forbidden generator reads; original snapshots match their pinned commits. The Sphinx original/reference hashes remained unchanged in the first completed run. Final access and snapshot checks accompany the completed results.
+
+### Seaborn simplification
+
+| Round | Candidate words and passes | Accepted words |
+| --- | --- | ---: |
+| 1 | 713: 10/10; 754: 8/10; 678: 10/10 | 678 |
+| 2 | 558: 10/10; 590: 8/10; 608: 8/10 | 558 |
+| 3 | 469: 8/10; 467: 10/10; 502: 9/10 | 467 |
+| 4 | 420: 10/10; 410: 9/10; 416: 6/10 | 420 |
+| 5 | 378: 9/10; 375: 6/10; 378: 9/10 | None; retain 420 |
+
+The search accepted four successive reductions, **964 → 678 → 558 → 467 → 420 words**, then stopped when all three round-5 proposals failed to qualify. The retained specification uses eleven approved headings. It still names the public API, explains orientation and grouping, specifies NumPy compatibility, and describes documentation and testing expectations. Shortening preserved concrete implementation guidance rather than removing every detailed contract.
+
+In the stopping round, failures included a missing link between the API documentation and example notebook, tests departing from the local class/fixture style, and computing percentiles on the wrong axis. Some rejections concern conventions rather than core algorithmic behavior; raw verdicts remain unchanged. These samples show that the procedure can find a much shorter judged-passing specification, not that 420 words is the minimum or that every failed proposal omitted essential information.
+
+Final audits: original/reference snapshots remained unchanged for both tasks. All 130 restarted-refinement patches and 180 simplification patches match their saved staged diffs, with no unstaged tracked changes. Command screening covered 292 refinement sessions and 394 simplification sessions, including archived interrupted calls. Flagged commands and their interpretations are retained. Some generators attempted off-workspace environment, filename, or missing-skill lookups; no reference implementation contents or other-run feedback reads were demonstrated. Full filesystem access means this screening does not prove isolation. No manual judge replacement or rubric change occurred.
+
+Artifacts: [retained Seaborn specification](../.experiments/simplification-three-candidates-2026-11-07/seaborn-restart/simplified-specification.md), [final search result](../.experiments/simplification-three-candidates-2026-11-07/seaborn-restart/result.json), [access audit review](../.experiments/simplification-three-candidates-2026-11-07/access-audit-review.json), and [patch integrity](../.experiments/simplification-three-candidates-2026-11-07/candidate-patch-integrity.json). No 100-PR run has been started.
+
+## Simplification validation (2026-11-07)
+
+Fresh starting-specification batches used the current 10/10 requirement, with no confirmation. Historical results below remain unchanged.
+
+| Existing experiment | Starting words | Fresh passes | Outcome |
+| --- | ---: | ---: | --- |
+| `sphinx-heading-reru` | 667 | 6/10 | Did not qualify for simplification |
+| `seaborn-heading-run` | 588 | 9/10 | Did not qualify for simplification |
+
+Sphinx had four runs with executable failures: two index-caption mismatches, one runtime error, and one malformed generated-test fixture. Seaborn passed every executable check; one judge rejected documentation example naming. Original judgments were retained. Neither task reached the simplification editor, so no live evidence of shortening or retained quality was obtained. The simplification acceptance/stopping logic passed mocked checks as part of 22 passing local tests; the Luna/tool smoke and both reference environments passed. No 100-PR run was started.
+
+[Results JSON](../.experiments/simplification-validation-2026-11-07/summary.json) records the batches and criterion counts. Detailed outputs and logs are in the same validation directory. A shorter specification is accepted only if it reduces whitespace-separated word count by at least 10% and passes 10/10 fresh generations; the first unsuccessful attempt stops the loop and retains its previous passing version.
+
+## Sphinx fresh-batch comparison
+
+The starting specification is byte-for-byte identical to the historical final specification. All patches start from the same implementation-file Git blob (`75c2cdd`). This comparison examines generated patches and recorded checks, not a complete access-log audit for leakage.
+
+| Fresh run | Difference from historical passing implementations | Recorded result |
+| --- | --- | --- |
+| `run-01`, `run-03` | Index text adds the literal words `containing class`: `Alias2 (type alias in containing class example.Class)` instead of `Alias2 (type alias in example.Class)`. Historical passing patches omit those words. | Candidate tests pass; reference tests reject the caption. |
+| `run-02` | `get_index_text` unpacks `name, _ = name_cls`, shadowing the imported translation function `_`. For a nested alias, `_` is `None`, so calling it raises `TypeError`. Historical passing code uses another unpacking name. | Both candidate and reference tests fail. |
+| `run-04` | Implementation passes reference tests, but its generated test strings omit a blank line between `.. py:class:: Container` and the nested directive. The parser interprets the nested directive as signature text instead of class content. | Candidate tests fail. The judge repeats the symptom as a nested-alias implementation deficiency; this comparison instead identifies malformed test input. No verdict was changed. |
+
+The unchanged specification itself uses the ambiguous example “alias (type alias in containing class)”. Two fresh implementations interpret `containing class` literally. This is a concrete specification defect that earlier passing implementations happened to avoid. The two historical failed implementations instead used a different node structure for the `type` marker (`desc_sig_keyword` rather than plain text), which failed reference tree/HTML assertions. Thus the old and new failed samples do not share a single implementation defect.
+
+Sources: [historical revision](../.experiments/sphinx-heading-reru/results/sphinx-doc__sphinx-11989/revision-02/), [fresh batch](../.experiments/simplification-validation-2026-11-07/sphinx-heading-reru/starting-batch/), and [unchanged specification](../.experiments/simplification-validation-2026-11-07/sphinx-heading-reru/starting-specification.md). These findings explain the observed failures but do not establish why their frequency changed or rule out leakage.
+
+## Historical refinement and ablation results
+
 All roles used GPT-6 Luna. A run passes every required criterion; convergence requires at least 9/10 in an initial batch and 9/10 in a fresh confirmation batch using the same specification.
 
 ## Current runs

@@ -16,6 +16,52 @@ if MODULE.exists():
 
 
 class RunnerTests(unittest.TestCase):
+    def test_resume_allows_effort_change_but_rejects_model_and_unknown_runner(self):
+        settings = {"model": "gpt-6-luna", "backend": "codex", "effort": "low", "judge_effort": "high",
+                    "runner_sha256": "current"}
+        previous = {"model": "gpt-6-luna",
+                    "runner_sha256": "9d66cb870c1d524cedba66900e96f0baf7cbbab753d10030692c04e6ceb21983"}
+        runner.write_json(self.root / "settings.json", previous)
+        runner.resume_settings(self.root, settings)
+        self.assertEqual(runner.read_json(self.root / "settings-history.json"), [previous])
+        for change in ({"model": "different"}, {"runner_sha256": "unknown"}):
+            with self.assertRaisesRegex(ValueError, "settings changed"):
+                runner.resume_settings(self.root, dict(settings, **change))
+
+    def test_judges_use_high_effort_while_other_roles_use_selected_effort(self):
+        for backend in ("codex", "claude"):
+            for selected in ("low", "medium", "high"):
+                agent = runner.Codex(backend=backend, effort=selected)
+                for role in ("generate", "judge", "edit", "simplify"):
+                    output = self.root / backend / selected / role
+                    def fake_run(args, **kwargs):
+                        expected = "high" if role == "judge" else selected
+                        if backend == "claude":
+                            self.assertEqual(args[args.index("--effort") + 1], expected)
+                        else:
+                            self.assertIn(f'model_reasoning_effort="{expected}"', args)
+                        runner.write_json(output / "response.json", {})
+                        return subprocess.CompletedProcess(args, 0)
+                    with patch.object(runner.subprocess, "run", side_effect=fake_run), patch.object(
+                            runner, "claude_response", return_value={}):
+                        agent.run(role, "prompt", self.root, output, {})
+
+    def test_request_comparison_ignores_only_codex_effort(self):
+        high = {"prompt": "feature", "command": ["codex", "-m", "gpt-6-luna",
+                                                     'model_reasoning_effort="high"']}
+        low = dict(high, command=high["command"][:-1] + ['model_reasoning_effort="low"'])
+        self.assertEqual(runner.request_without_effort(high), runner.request_without_effort(low))
+        self.assertNotEqual(runner.request_without_effort(high),
+                            runner.request_without_effort(dict(low, prompt="different")))
+
+    def test_claude_judge_cache_comparison_allows_effort_change_only(self):
+        old = {"role": "judge", "prompt": "evaluate", "command": [
+            "claude", "-p", "--model", "haiku", "--effort", "medium"]}
+        new = dict(old, command=old["command"][:-1] + ["high"])
+        self.assertEqual(runner.request_without_effort(old), runner.request_without_effort(new))
+        self.assertNotEqual(runner.request_without_effort(old),
+                            runner.request_without_effort(dict(new, prompt="changed")))
+
     def setUp(self):
         self.assertTrue(MODULE.exists(), "experiment runner has not been implemented")
         self.temp = tempfile.TemporaryDirectory()
@@ -45,8 +91,17 @@ class RunnerTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     runner.validate_verdict(verdict)
 
-    def test_only_nine_complete_run_passes_converge(self):
-        self.assertTrue(runner.converged([True] * 9 + [False]))
+    def test_failed_verdict_with_evidence_can_have_empty_deficiency(self):
+        verdict = self.verdict("requirement_intent")
+        row = next(c for c in verdict["criteria"] if c["criterion"] == "requirement_intent")
+        row["deficiency"] = ""
+        original = json.dumps(verdict)
+        self.assertFalse(runner.validate_verdict(verdict))
+        self.assertEqual(json.dumps(verdict), original)
+
+    def test_only_ten_complete_run_passes_converge(self):
+        self.assertTrue(runner.converged([True] * 10))
+        self.assertFalse(runner.converged([True] * 9 + [False]))
         self.assertFalse(runner.converged([True] * 8 + [False] * 2))
         self.assertFalse(runner.converged([True] * 9))
 
@@ -68,6 +123,41 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(runner.command(["git", "rev-list", "--count", "HEAD"], generated).strip(), "1")
         self.assertEqual(runner.command(["git", "remote"], generated).strip(), "")
 
+    def test_claude_subscription_command_and_structured_response(self):
+        schema = runner.object_schema({"message": {"type": "string"}})
+        agent = runner.Codex("haiku", backend="claude")
+        args = runner.claude_command(agent.executable, agent.model, schema)
+        self.assertEqual(args[args.index("--effort") + 1], "low")
+        self.assertIn("--safe-mode", args)
+        self.assertIn("--disable-slash-commands", args)
+        self.assertNotIn("--bare", args)
+        settings = json.loads(args[args.index("--settings") + 1])
+        self.assertFalse(settings["sandbox"]["allowUnsandboxedCommands"])
+        self.assertTrue(settings["sandbox"]["filesystem"]["disabled"])
+        self.assertEqual(settings["sandbox"]["network"]["deniedDomains"], ["*"])
+        events = self.root / "events.jsonl"
+        events.write_text(json.dumps({"type": "result", "is_error": False,
+                                     "structured_output": {"message": "OK"}}) + "\n")
+        self.assertEqual(runner.claude_response(events), {"message": "OK"})
+        events.write_text(json.dumps({"type": "result", "is_error": False,
+                                     "structured_output": {"message": "OK"}}) + "\n"
+                          + json.dumps({"type": "result", "is_error": False, "result": "Already submitted."}) + "\n")
+        self.assertEqual(runner.claude_response(events), {"message": "OK"})
+        events.write_text(json.dumps({"type": "result", "is_error": True}) + "\n")
+        with self.assertRaises(RuntimeError):
+            runner.claude_response(events)
+
+    def test_local_backend_uses_ollama_without_subscription_and_serializes_runs(self):
+        agent = runner.Codex("qwen3:8b", backend="ollama")
+        args = runner.codex_command("codex", agent.model, self.root,
+                                    self.root / "result", True, [], agent.backend)
+        self.assertIn("--oss", args)
+        self.assertEqual(args[args.index("--local-provider") + 1], "ollama")
+        self.assertNotIn('forced_login_method="chatgpt"', args)
+        self.assertNotIn("--output-schema", args)
+        self.assertEqual(agent.parallel_runs, 1)
+        self.assertEqual(runner.Codex().parallel_runs, 10)
+
     def test_codex_command_allows_filesystem_access_and_uses_subscription(self):
         cwd = self.root / "generated"
         cwd.mkdir()
@@ -79,6 +169,7 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn('":minimal"', joined)
         self.assertIn('enabled = false', joined)
         self.assertNotIn("dangerously-bypass", joined)
+        self.assertIn('model_reasoning_effort="low"', args)
         self.assertIn("--ephemeral", args)
         self.assertIn("--ignore-user-config", args)
 
@@ -162,8 +253,25 @@ class RunnerTests(unittest.TestCase):
         result = agent.run("baseline", "Behavior", cwd, output, runner.SPEC_SCHEMA)
         self.assertEqual(result, {"specification": "Behavior"})
         self.assertIn("turn.completed", (output / "events.jsonl").read_text())
+        request = runner.read_json(output / "request.json")
+        request["command"] = [arg.replace('model_reasoning_effort="low"',
+                                          'model_reasoning_effort="high"') for arg in request["command"]]
+        runner.write_json(output / "request.json", request)
         executable.unlink()
         self.assertEqual(agent.run("baseline", "Behavior", cwd, output, runner.SPEC_SCHEMA), result)
+        self.assertEqual(runner.read_json(output / "request.json"), request)
+
+    def test_incomplete_codex_call_evidence_is_archived_before_retry(self):
+        output = self.root / "incomplete-call"
+        output.mkdir()
+        (output / "events.jsonl").write_text('{"type":"turn.failed"}\n')
+        (output / "stderr.log").write_text("quota reached\n")
+        (output / "response.json").write_text('{"partial":true}\n')
+        runner.archive_incomplete_call(output)
+        archived = output / "incomplete-attempts/attempt-001"
+        self.assertEqual((archived / "events.jsonl").read_text(), '{"type":"turn.failed"}\n')
+        self.assertEqual((archived / "stderr.log").read_text(), "quota reached\n")
+        self.assertFalse((output / "events.jsonl").exists())
 
     def test_judge_cannot_pass_a_patch_missing_required_test_changes(self):
         base, reference = self.root / "base", self.root / "reference"
@@ -201,6 +309,54 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual([c["phase"] for c in checks["commands"]], ["candidate_tests", "reference_tests"])
         self.assertNotEqual(checks["commands"][0]["returncode"], 0)
         self.assertEqual(checks["commands"][1]["returncode"], 0)
+
+    def test_candidate_owned_tests_run_with_non_pytest_reference_command(self):
+        base = self.root / "base"
+        (base / "tests").mkdir(parents=True)
+        (base / "feature.py").write_text("value = 0\n")
+        (base / "tests/test_feature.py").write_text("def test_value():\n    pass\n")
+        reference = self.root / "reference"
+        runner.fresh_workspace(base, reference)
+        generated = self.root / "generated"
+        runner.fresh_workspace(base, generated)
+        (generated / "feature.py").write_text("value = 1\n")
+        (generated / "tests/test_new.py").write_text("def test_new():\n    pass\n")
+        runner.command(["git", "add", "-A"], generated, runner.clean_env())
+        script = ("import sys; assert 'tests/test_feature.py' in sys.argv; "
+                  "assert 'tests/test_new.py' in sys.argv")
+        task = {"base": str(base), "reference": str(reference),
+                "test_files": ["tests/test_feature.py"], "generator_python": sys.executable,
+                "checks": [[sys.executable, "-c", "pass"]],
+                "candidate_check_prefix": [sys.executable, "-c", script, "--"],
+                "feabench_tests": {"FAIL_TO_PASS": ["tests/test_feature.py"],
+                                   "PASS_TO_PASS": []}}
+        checks = runner.check_candidate(task, generated, self.root)
+        self.assertEqual([c["phase"] for c in checks["commands"]], ["candidate_tests", "reference_tests"])
+        self.assertEqual(checks["commands"][0]["returncode"], 0)
+
+    def test_django_candidate_tests_use_dotted_labels(self):
+        base = self.root / "base"
+        (base / "tests/app").mkdir(parents=True)
+        (base / "feature.py").write_text("value = 0\n")
+        reference = self.root / "reference"
+        runner.fresh_workspace(base, reference)
+        generated = self.root / "generated"
+        runner.fresh_workspace(base, generated)
+        (generated / "tests/app/test_new.py").write_text("def test_new():\n    pass\n")
+        runner.command(["git", "add", "-A"], generated, runner.clean_env())
+        (generated / "runtests.py").write_text("")
+        script = "import sys; assert sys.argv[-1] == 'app.test_new', sys.argv"
+        task = {"base": str(base), "reference": str(reference), "test_files": [],
+                "generator_python": sys.executable, "checks": [],
+                "candidate_check_prefix": [sys.executable, "-c", script, "./tests/runtests.py"]}
+        checks = runner.check_candidate(task, generated, self.root)
+        self.assertEqual(checks["commands"][0]["returncode"], 0, checks["commands"][0]["output"])
+
+    def test_nested_test_packages_are_test_paths(self):
+        self.assertTrue(runner.is_test_path("lib/matplotlib/tests/test_figure.py"))
+        self.assertTrue(runner.is_test_path("lib/matplotlib/tests/baseline_images/a.png"))
+        self.assertTrue(runner.is_test_path("tests/app/models.py"))
+        self.assertFalse(runner.is_test_path("lib/matplotlib/figure.py"))
 
     def test_reference_overlay_does_not_orphan_candidate_only_fixtures(self):
         base = self.root / "base"
@@ -250,7 +406,7 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse((output / "complete.json").exists())
         self.assertEqual((output / "protected-inputs/00-specification.md").read_text(), "original")
 
-    def test_loop_refines_once_confirms_and_resumes_without_new_calls(self):
+    def test_loop_refines_once_without_confirmation_and_resumes_without_new_calls(self):
         base = self.root / "base"
         base.mkdir()
         (base / "feature.py").write_text("value = 0\n")
@@ -270,7 +426,14 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["baseline_passes"], 0)
         self.assertEqual((output / "baseline.md").read_text(), task["description"])
         self.assertFalse(any(role == "baseline" for role, _, _ in fake.calls))
-        self.assertEqual(result["confirmation_passes"], 10)
+        self.assertNotIn("confirmation_passes", result)
+        self.assertFalse((output / "revision-01/confirmation").exists())
+        self.assertEqual(sum(role == "generate" for role, _, _ in fake.calls), 20)
+        # Judged candidates are kept as patches; only small result files remain per run.
+        for run in output.glob("revision-*/run-*"):
+            self.assertTrue((run / "patch.diff").exists())
+            for name in ("generated", "evaluation", "rebuild-check", "generated.tar.gz"):
+                self.assertFalse((run / name).exists(), run / name)
         calls = len(fake.calls)
         self.assertEqual(runner.run_task(task, output, fake, categories), result)
         self.assertEqual(len(fake.calls), calls)
@@ -285,6 +448,45 @@ class RunnerTests(unittest.TestCase):
             if role == "edit":
                 self.assertNotIn("baseline", runner.read_json(cwd / "feedback.json"))
                 self.assertIn("correct or remove", prompt)
+
+    def test_retired_workspace_rebuilds_from_patch_or_archive(self):
+        base = self.root / "base"
+        base.mkdir()
+        (base / "feature.py").write_text("value = 0\n")
+        (base / ".gitignore").write_text("*.log\n")
+        task = {"base": str(base)}
+        def judged(name, ignored_output=False, patch=None):
+            run = self.root / name
+            generated = run / "generated"
+            runner.fresh_workspace(base, generated)
+            (generated / "feature.py").write_text("value = 1\n")
+            (generated / "new.py").write_text("added\n")
+            (generated / "__pycache__").mkdir()
+            (generated / "__pycache__/feature.pyc").write_text("cache")
+            if ignored_output:
+                (generated / "build.log").write_text("ignored output\n")
+            runner.command(["git", "add", "-A"], generated, runner.clean_env())
+            (run / "patch.diff").write_text(patch if patch is not None else runner.command(
+                ["git", "diff", "--cached", "--binary"], generated, runner.clean_env()))
+            return run
+        cases = {"rebuilt": judged("clean"), "archived": judged("ignored", ignored_output=True)}
+        cases["archived-bad-patch"] = judged("bad", patch="not a patch\n")
+        for expected, run in cases.items():
+            self.assertEqual(runner.retire_workspace(task, run), expected.split("-")[0])
+            self.assertFalse((run / "generated").exists())
+            self.assertFalse((run / "rebuild-check").exists())
+            self.assertEqual((run / "generated.tar.gz").exists(), expected != "rebuilt")
+            verdict = {"generated": str(run / "generated")}
+            with runner.materialized(task, [verdict]):
+                self.assertEqual((run / "generated/feature.py").read_text(), "value = 1\n")
+                self.assertEqual((run / "generated/new.py").read_text(), "added\n")
+                self.assertEqual((run / "generated/build.log").exists(), run.name == "ignored")
+                if run.name != "bad":
+                    self.assertEqual(runner.command(["git", "diff", "--cached", "--binary"], run / "generated",
+                                                    runner.clean_env()), (run / "patch.diff").read_text())
+            self.assertFalse((run / "generated").exists())
+            self.assertFalse((run / "materializing").exists())
+        self.assertIsNone(runner.retire_workspace(task, cases["rebuilt"]))
 
     def test_nonconvergence_stops_after_ten_revisions(self):
         base = self.root / "base"
@@ -322,6 +524,7 @@ class FakeCodex:
                                   "deficiency": "" if passed else "Missing behavior"}
                                  for key in runner.CRITERIA]}
         if role == "edit":
+            assert all(Path(path).is_dir() for path in readable), "editor inputs were not rebuilt"
             return {"specification": "Refined specification.", "edits": [
                 {"category": "Architecture", "subsection": "Responsibilities",
                  "operation": "clarify", "change": "implement the behavior",

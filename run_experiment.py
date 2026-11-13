@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
+import filecmp
 import hashlib
 import io
 import json
@@ -43,9 +45,14 @@ def command(args, cwd=None, env=None):
 
 def clean_env():
     env = os.environ.copy()
-    for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "GH_TOKEN", "GITHUB_TOKEN"):
+    for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "GH_TOKEN", "GITHUB_TOKEN",
+                "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+                "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+                "CLAUDECODE"):
         env.pop(key, None)
-    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    # Background auto-gc repacks objects while finished workspaces are being deleted.
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+               GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="gc.auto", GIT_CONFIG_VALUE_0="0")
     return env
 
 
@@ -58,6 +65,9 @@ def write_json(path, value):
 
 def read_json(path):
     return json.loads(path.read_text())
+
+
+COPY_IGNORES = (".git", ".codex", "__pycache__", ".pytest_cache")
 
 
 def initialize_git(directory):
@@ -86,9 +96,97 @@ def fresh_workspace(base, destination):
     # Fresh Git history prevents the generator from finding the reference PR in old commits.
     if destination.exists():
         shutil.rmtree(destination)
-    shutil.copytree(base, destination, symlinks=True,
-                    ignore=shutil.ignore_patterns(".git", ".codex", "__pycache__", ".pytest_cache"))
+    shutil.copytree(base, destination, symlinks=True, ignore=shutil.ignore_patterns(*COPY_IGNORES))
     initialize_git(destination)
+
+
+def rebuild_workspace(task, run, destination):
+    # A judged candidate is the original snapshot plus its recorded patch.
+    fresh_workspace(Path(task["base"]), destination)
+    patch = (run / "patch.diff").resolve()
+    if patch.read_text():
+        command(["git", "apply", "--binary", str(patch)], destination, clean_env())
+    command(["git", "add", "-A"], destination, clean_env())
+
+
+def tree_entries(root):
+    entries = {}
+    for directory, dirs, files in os.walk(root):
+        dirs[:] = [name for name in dirs if name not in COPY_IGNORES]
+        for name in dirs + [name for name in files if name not in COPY_IGNORES]:
+            path = Path(directory) / name
+            if path.is_symlink():
+                entries[path.relative_to(root)] = os.readlink(path)
+            elif name in files:
+                entries[path.relative_to(root)] = None
+    return entries
+
+
+def same_tree(left, right):
+    entries = tree_entries(left)
+    return entries == tree_entries(right) and all(
+        filecmp.cmp(left / path, right / path, shallow=False) for path, link in entries.items() if link is None)
+
+
+def archive_workspace(tree, archive):
+    temporary = archive.with_name(archive.name + ".partial")
+    with tarfile.open(temporary, "w:gz", compresslevel=1) as output:
+        output.add(tree, arcname=tree.name)
+    # Read the whole archive back before its expanded copy can be deleted.
+    expected = 1 + sum(len(dirs) + len(files) for _, dirs, files in os.walk(tree))
+    with tarfile.open(temporary) as written:
+        if sum(1 for _ in written) != expected:
+            raise RuntimeError(f"Incomplete workspace archive: {temporary}")
+    temporary.replace(archive)
+
+
+def retire_workspace(task, run):
+    # After judging, keep a candidate as patch.diff, or as a tarball when the patch cannot rebuild it.
+    generated = run / "generated"
+    if not generated.is_dir() or not (run / "patch.diff").exists():
+        return None
+    check = run / "rebuild-check"
+    shutil.rmtree(check, ignore_errors=True)
+    try:
+        rebuild_workspace(task, run, check)
+        rebuilt = same_tree(generated, check)
+    except RuntimeError:
+        rebuilt = False
+    finally:
+        shutil.rmtree(check, ignore_errors=True)
+    if not rebuilt:
+        archive_workspace(generated, run / "generated.tar.gz")
+    shutil.rmtree(generated)
+    return "rebuilt" if rebuilt else "archived"
+
+
+def materialize(task, run):
+    # Build in a temporary directory so an interrupted rebuild never looks like a judged tree.
+    temporary = run / "materializing"
+    shutil.rmtree(temporary, ignore_errors=True)
+    archive = run / "generated.tar.gz"
+    if archive.exists():
+        temporary.mkdir()
+        with tarfile.open(archive) as source:
+            source.extractall(temporary, **({"filter": "tar"} if hasattr(tarfile, "tar_filter") else {}))
+        (temporary / "generated").rename(run / "generated")
+        temporary.rmdir()
+    else:
+        rebuild_workspace(task, run, temporary)
+        temporary.rename(run / "generated")
+
+
+@contextlib.contextmanager
+def materialized(task, verdicts):
+    # Editors read judged candidate trees, which are kept only as patches between uses.
+    runs = [Path(v["generated"]).parent for v in verdicts if not Path(v["generated"]).exists()]
+    try:
+        for run in runs:
+            materialize(task, run)
+        yield
+    finally:
+        for run in runs:
+            shutil.rmtree(run / "generated", ignore_errors=True)
 
 
 def object_schema(properties):
@@ -121,14 +219,12 @@ def validate_verdict(verdict):
         evidence = row.get("evidence")
         if not isinstance(evidence, list) or not evidence or not all(isinstance(x, str) and x.strip() for x in evidence):
             raise ValueError("Each judgment needs evidence")
-        if not row["passed"] and not str(row.get("deficiency", "")).strip():
-            raise ValueError("Failed judgments need a deficiency")
     return all(row["passed"] for row in rows)
 
 
 def converged(passes):
-    # A run passes only when every criterion passes; convergence requires nine such runs.
-    return len(passes) == 10 and sum(passes) >= 9
+    # Every implementation must pass every criterion; there is no confirmation batch.
+    return len(passes) == 10 and all(passes)
 
 
 def categories_from_docs():
@@ -154,31 +250,146 @@ def validate_revision(revision, categories):
             raise ValueError("Edits need exact changes and hypotheses")
 
 
-def codex_command(executable, model, cwd, output, writable, readable):
+def codex_command(executable, model, cwd, output, writable, readable, backend="codex", effort="low"):
     # Full filesystem access permits system tools; task-code boundaries are prompt instructions.
     policy = '{ filesystem = { ":root" = "write" }, network = { enabled = false }}'
+    provider = (["--oss", "--local-provider", "ollama",
+                 "-c", 'model_provider="ollama"',
+                 "-c", "model_context_window=8192",
+                 "-c", "model_auto_compact_token_limit=6144"] if backend == "ollama"
+                else ["-c", 'forced_login_method="chatgpt"'])
     return [executable, "--no-daemon", "-a", "never", "exec", "--ignore-user-config",
             "--ignore-rules", "--ephemeral", "--json", "-m", model, "-C", str(cwd),
-            "-c", 'model_reasoning_effort="high"',
-            "-c", 'forced_login_method="chatgpt"', "-c", 'default_permissions="experiment"',
+            "-c", f'model_reasoning_effort="{effort}"',
+            *provider, "-c", 'default_permissions="experiment"',
             "-c", "permissions.experiment=" + policy,
             "-c", 'web_search="disabled"', "-c", "mcp_servers={}",
             "-c", "project_doc_max_bytes=0", "-c", "features.skip_host_skill_discovery=true",
             "--disable", "apps", "--disable", "memories", "--disable", "multi_agent",
             "--disable", "hooks", "--disable", "browser_use", "--disable", "computer_use",
-            "--output-schema", str(output / "schema.json"),
+            *([] if backend == "ollama" else ["--output-schema", str(output / "schema.json")]),
             "--output-last-message", str(output / "response.json"), "-"]
 
 
+def claude_command(executable, model, schema, effort="low"):
+    # Keep subscription auth, but disable personal context and command network access.
+    settings = {"sandbox": {"enabled": True, "failIfUnavailable": True,
+                "allowUnsandboxedCommands": False, "filesystem": {"disabled": True},
+                "network": {"allowedDomains": [], "deniedDomains": ["*"]}}}
+    return [executable, "-p", "--model", model, "--effort", effort,
+            "--output-format", "stream-json", "--verbose", "--json-schema", json.dumps(schema),
+            "--safe-mode", "--disable-slash-commands", "--setting-sources", "", "--settings", json.dumps(settings),
+            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+            "--tools", "Bash,Read,Edit,Write,Glob,Grep", "--dangerously-skip-permissions",
+            "--no-session-persistence"]
+
+
+def claude_response(events):
+    results = [event for line in events.read_text().splitlines()
+               for event in [json.loads(line)] if event.get("type") == "result"]
+    # A background task finishing after StructuredOutput can start a later turn whose result has no output.
+    outputs = [r["structured_output"] for r in results
+               if not r.get("is_error") and isinstance(r.get("structured_output"), dict)]
+    if not outputs:
+        raise RuntimeError(f"Claude did not return successful structured output. Logs: {events.parent}")
+    return outputs[-1]
+
+
+def resume_settings(output, settings):
+    path = output / "settings.json"
+    if path.exists():
+        previous = read_json(path)
+        old = dict(previous, backend=previous.get("backend", "codex"),
+                   effort=previous.get("effort", "high"))
+        current = dict(settings)
+        old.pop("effort", None)
+        current.pop("effort", None)
+        # Explicitly migrate known runners; unknown source changes still require a new run.
+        compatible = {
+            "8498de65e6d74c59b21cb8ee7ea4aa71e62609c56cd03821492dfe4caa1198bb",
+            "63b25eb70e6ca785a73d89525a1afd3a9d5d51264006cef980f754ff58ec8b21",
+            "c6556bcea70cc15cf11525b1190ec89135ed660532ca3b25667d25606f5fb4fa",
+            "a07ce2bd4ff7a15c5d8a43b4fe970ebe974da597afcffdcbdff268acc2175b71",
+            "9d66cb870c1d524cedba66900e96f0baf7cbbab753d10030692c04e6ceb21983",
+            "52e95c642ae871f23a4d6881793bfe7dba29f3c328cdb77cafca552ab57bf73d",
+            "f30cffca7d49db1d806a3f3744429f735806713fb6422a5cca7637d4af350b1d",
+            "e45cc86dbb6cb2b2897cd72540cba2bcd53c2129d6bbc4b3f02e1411a760d856",
+            "888f04b454ec063b2c473de6bc745e6eb4710eead121cfd8820bf2009ba04740",
+            "372559f2a8aafe07cb44fb232065e1bf0a2cdeb61940e3f4dbeb2ce96ca86e0c",
+            "6df0fd0d512307adff72d59a1abbf16181d12eeafc164aa4dc471dbaf7364c40",
+            "35a0e92f2c4437fa4f742de72b5be40d2c9bfab938e8ad1ee1b8a9a6c6a2dba6",
+        }
+        if old.get("runner_sha256") in compatible:
+            if "judge_effort" in current:
+                old.setdefault("judge_effort", current["judge_effort"])
+            old["runner_sha256"] = current.get("runner_sha256")
+        if old != current:
+            raise ValueError("Experiment settings changed. Use a new output directory.")
+        if previous != settings:
+            history = output / "settings-history.json"
+            write_json(history, (read_json(history) if history.exists() else []) + [previous])
+    write_json(path, settings)
+
+
+def request_without_effort(request):
+    request = dict(request)
+    request["command"] = [re.sub(r'model_reasoning_effort="[^"]+"',
+                                 'model_reasoning_effort="*"', arg)
+                          if index == 0 or request["command"][index - 1] != "--effort" else "*"
+                          for index, arg in enumerate(request["command"])]
+    return request
+
+
+def archive_incomplete_call(output):
+    if (output / "complete.json").exists():
+        return
+    names = ("events.jsonl", "stderr.log", "response.json", "input-integrity.json")
+    existing = [output / name for name in names if (output / name).is_file()]
+    if not existing:
+        return
+    attempts = output / "incomplete-attempts"
+    attempts.mkdir(exist_ok=True)
+    number = 1
+    while (attempts / f"attempt-{number:03d}").exists():
+        number += 1
+    destination = attempts / f"attempt-{number:03d}"
+    destination.mkdir()
+    for path in existing:
+        shutil.move(str(path), destination / path.name)
+
+
 class Codex:
-    def __init__(self, model="gpt-6-luna", executable="codex"):
+    def __init__(self, model="gpt-6-luna", executable=None, backend="codex", effort="low"):
+        if backend not in ("codex", "ollama", "claude"):
+            raise ValueError(f"Unknown backend: {backend}")
+        self.backend = backend
+        self.effort = effort
+        # One local inference lane avoids competing for the laptop GPU and memory.
+        self.parallel_runs = 1 if backend == "ollama" else 10
         self.model = model
-        self.executable = executable
+        self.executable = executable or (shutil.which("claude") or str(Path.home() / ".local/bin/claude")
+                                         if backend == "claude" else "codex")
 
     def run(self, role, prompt, cwd, output, schema, writable=False, readable=(), python=None, protected=()):
         output.mkdir(parents=True, exist_ok=True)
         cwd.mkdir(parents=True, exist_ok=True)
-        args = codex_command(self.executable, self.model, cwd, output, writable, readable)
+        # Evaluation uses high effort even when generation and editing use less.
+        effort = "high" if role == "judge" else self.effort
+        args = (claude_command(self.executable, self.model, schema, effort) if self.backend == "claude"
+                else codex_command(self.executable, self.model, cwd, output, writable, readable, self.backend, effort))
+        if self.backend == "ollama":
+            # Ollama's constrained output suppresses tool calls; request final JSON in the prompt.
+            prompt += ("\nUse tools as needed before answering. Your final answer must be only a JSON "
+                       "object matching this schema, without Markdown fences:\n" + json.dumps(schema))
+        settings_path = next((parent / "settings.json" for parent in output.parents
+                              if (parent / "settings.json").exists()), None)
+        settings = read_json(settings_path) if settings_path else {}
+        if settings.get("task", {}).get("concise_test_output"):
+            prompt += ("\n\nFor test commands, redirect full stdout/stderr to a unique temporary log "
+                       "outside the repository (use mktemp). Initially display only the command's "
+                       "exit status, log path, and last 40 lines. Preserve the test command's exit "
+                       "status when displaying the tail. Read more of your own log when needed to "
+                       "diagnose failures. Do not skip tests or change evaluation requirements.")
         request = {"role": role, "prompt": prompt, "command": args, "schema": schema}
         if protected:
             request["protected_inputs"] = [str(path) for path in protected]
@@ -189,11 +400,15 @@ class Codex:
                        VIRTUAL_ENV=str(Path(python).parent.parent), PYTHONPATH=str(cwd),
                        PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", MPLBACKEND="Agg")
             request["python"] = python
-        if (output / "request.json").exists() and read_json(output / "request.json") != request:
+        previous = read_json(output / "request.json") if (output / "request.json").exists() else None
+        if previous is not None and request_without_effort(previous) != request_without_effort(request):
             raise ValueError(f"Cached request differs: {output}. Use a new output directory.")
-        write_json(output / "request.json", request)
         if (output / "complete.json").exists():
             return read_json(output / "complete.json")
+        if previous is not None and previous != request:
+            history = output / "request-history.json"
+            write_json(history, (read_json(history) if history.exists() else []) + [previous])
+        write_json(output / "request.json", request)
         write_json(output / "schema.json", schema)
         # Preserve input evidence even when a role has full filesystem access.
         before = {str(path): hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in protected}
@@ -203,9 +418,10 @@ class Codex:
             for number, path in enumerate(protected):
                 shutil.copy2(path, snapshots / f"{number:02d}-{Path(path).name}")
         print(f"  {role}: {output}", flush=True)
+        archive_incomplete_call(output)
         with (output / "events.jsonl").open("w") as stdout, (output / "stderr.log").open("w") as stderr:
             result = subprocess.run(args, input=prompt, text=True, stdout=stdout, stderr=stderr,
-                                    env=env)
+                                    env=env, cwd=cwd)
         after = {path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
                  if Path(path).is_file() else None for path in before}
         if before:
@@ -213,10 +429,17 @@ class Codex:
         if before != after:
             raise RuntimeError(f"{role} modified a protected experiment input. Logs: {output}")
         if result.returncode:
-            raise RuntimeError(f"Codex failed ({result.returncode}); resume after resolving the error. Logs: {output}")
+            raise RuntimeError(f"{self.backend} failed ({result.returncode}); resume after resolving the error. Logs: {output}")
+        if self.backend == "claude":
+            write_json(output / "response.json", claude_response(output / "events.jsonl"))
         response = read_json(output / "response.json")
         write_json(output / "complete.json", response)
         return response
+
+
+def is_test_path(path):
+    # Repositories keep tests in a top-level tests/ or a nested package such as lib/matplotlib/tests/.
+    return "tests" in Path(path).parts[:-1] or Path(path).name.startswith("test_")
 
 
 def check_candidate(task, generated, output):
@@ -229,12 +452,39 @@ def check_candidate(task, generated, output):
                            text=True, capture_output=True, env=clean_env())
     checks = {"patch_applies": bool(patch) and apply.returncode == 0, "commands": []}
     changed = command(["git", "diff", "--cached", "--name-only"], generated, clean_env()).splitlines()
-    checks["candidate_test_changes"] = [path for path in changed if path.startswith("tests/")]
+    checks["candidate_test_changes"] = [path for path in changed if is_test_path(path)]
     env = clean_env()
     env.update(PYTHONPATH=str(evaluation), PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", MPLBACKEND="Agg",
                PYTHONDONTWRITEBYTECODE="1")
     # Validate candidate-owned tests before reference files can replace them.
-    if task.get("generator_python") and task["checks"] and task["checks"][0][1:3] == ["-m", "pytest"]:
+    if task.get("generator_python") and task.get("candidate_check_prefix"):
+        f2p = task.get("feabench_tests", {}).get("FAIL_TO_PASS", [])
+        p2p = task.get("feabench_tests", {}).get("PASS_TO_PASS", [])
+        tests = sorted({path for path in f2p + p2p
+                        if (evaluation / path.split("::")[0]).exists()})
+        changed_tests = [path for path in checks["candidate_test_changes"]
+                         if path.endswith(".py") and (Path(path).name.startswith("test_")
+                         or path.startswith("tests/")) and (evaluation / path).exists()]
+        prefix = list(task["candidate_check_prefix"])
+        if prefix[1:3] == ["-m", "pytest"]:
+            # Platform-specific failures excluded from the reference checks are excluded here too.
+            deselect = [arg for test in task.get("platform_deselect", []) for arg in ("--deselect", test)]
+            args = [prefix[0], "-m", "pytest", "-q", "--basetemp",
+                    str(output / "candidate-test-tmp")] + deselect + tests + changed_tests
+        elif any(word.endswith("runtests.py") for word in prefix):
+            # Django's runner accepts dotted module labels relative to tests/, not file paths.
+            changed_tests = [path[len("tests/"):-len(".py")].replace("/", ".") for path in changed_tests
+                             if path.startswith("tests/") and (Path(path).name.startswith("test_")
+                             or Path(path).name == "tests.py")]
+            args = prefix + tests + changed_tests
+        else:
+            args = prefix + tests + changed_tests
+        if tests or changed_tests:
+            result = subprocess.run(args, cwd=evaluation, env=env, text=True, capture_output=True)
+            checks["commands"].append({"phase": "candidate_tests", "command": args,
+                                       "returncode": result.returncode,
+                                       "output": result.stdout + result.stderr})
+    elif task.get("generator_python") and task["checks"] and task["checks"][0][1:3] == ["-m", "pytest"]:
         paths = task["checks"][0][4:] + [path for path in checks["candidate_test_changes"]
                 if Path(path).name.startswith("test_") and path.endswith(".py")]
         tests = sorted({path for path in paths if (evaluation / path.split("::")[0]).exists()})
@@ -312,8 +562,21 @@ def evaluate_batch(task, output, agent, specification, runs=10):
         run = output / f"run-{number:02d}"
         generated = run / "generated"
         if (run / "verdict.json").exists():
+            retire_workspace(task, run)
             return read_json(run / "verdict.json")
         if not (run / "generation/complete.json").exists():
+            if generated.exists():
+                try:
+                    partial = command(["git", "diff", "HEAD", "--binary"], generated, clean_env())
+                except RuntimeError:
+                    partial = ""
+                if partial:
+                    archive = run / "incomplete-generation-attempts"
+                    archive.mkdir(exist_ok=True)
+                    number = 1
+                    while (archive / f"attempt-{number:03d}.patch.diff").exists():
+                        number += 1
+                    (archive / f"attempt-{number:03d}.patch.diff").write_text(partial)
             fresh_workspace(Path(task["base"]), generated)
         # The generator sees only the specification and its original-code workspace.
         agent.run("generate", "Implement this feature in the repository. Inspect and edit repository files. "
@@ -325,6 +588,9 @@ def evaluate_batch(task, output, agent, specification, runs=10):
                   writable=True, python=task.get("generator_python"))
         command(["git", "add", "-A"], generated, clean_env())
         checks = check_candidate(task, generated, run)
+        # checks.json records the evaluation; nothing reads its repository copy afterwards.
+        shutil.rmtree(run / "evaluation")
+        shutil.rmtree(run / "candidate-test-tmp", ignore_errors=True)
         context = run / "judge-context"
         context.mkdir(exist_ok=True)
         shutil.copy2(run / "checks.json", context / "checks.json")
@@ -350,10 +616,11 @@ def evaluate_batch(task, output, agent, specification, runs=10):
         # The editor needs actual failures and API facts, not only the judge's paraphrase.
         verdict["checks"] = checks
         write_json(run / "verdict.json", verdict)
+        retire_workspace(task, run)
         return verdict
 
     # Each lane has its own repository and logs; only the frozen reference is shared read-only.
-    with ThreadPoolExecutor(max_workers=min(10, runs)) as pool:
+    with ThreadPoolExecutor(max_workers=min(getattr(agent, "parallel_runs", 10), runs)) as pool:
         results = list(pool.map(evaluate_run, range(runs)))
     write_json(output / "batch.json", {"passes": sum(r["passed"] for r in results), "runs": results})
     return results
@@ -361,13 +628,18 @@ def evaluate_batch(task, output, agent, specification, runs=10):
 
 def run_task(task, output, agent, categories):
     output.mkdir(parents=True, exist_ok=True)
+    # Preserve the batch driver's saved prompt policy when resuming through this CLI.
+    saved = output / "settings.json"
+    if saved.exists() and read_json(saved)["task"].get("concise_test_output"):
+        task = dict(task, concise_test_output=True)
     # Refuse to mix cached results with a changed model, task, rubric, or runner.
     settings = {"task": task, "model": agent.model, "categories": categories,
-                "runs": 10, "parallel_runs": 10, "max_revisions": 10,
+                "backend": getattr(agent, "backend", "codex"), "effort": getattr(agent, "effort", "low"),
+                "judge_effort": "high",
+                "runs": 10, "parallel_runs": getattr(agent, "parallel_runs", 10), "max_revisions": 10,
+                "required_passes": 10, "confirmation": False,
                 "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
-    if (output / "settings.json").exists() and read_json(output / "settings.json") != settings:
-        raise ValueError("Experiment settings changed. Use a new output directory.")
-    write_json(output / "settings.json", settings)
+    resume_settings(output, settings)
     if (output / "result.json").exists():
         return read_json(output / "result.json")
     # Preserve the historical request verbatim; only editor-produced revisions prohibit code.
@@ -395,16 +667,11 @@ def run_task(task, output, agent, categories):
         if baseline_passes is None:
             baseline_passes = passes
         if converged([r["passed"] for r in results]):
-            # Confirm a qualifying specification with ten additional independent generations.
-            confirmation = evaluate_batch(task, directory / "confirmation", agent, specification)
-            if converged([r["passed"] for r in confirmation]):
-                (output / "comprehensive-specification.md").write_text(specification + "\n")
-                result = {"task": task["id"], "status": "converged", "revision": revision,
-                          "baseline_passes": baseline_passes, "final_passes": passes,
-                          "confirmation_passes": sum(r["passed"] for r in confirmation)}
-                write_json(output / "result.json", result)
-                return result
-            results += confirmation
+            (output / "comprehensive-specification.md").write_text(specification + "\n")
+            result = {"task": task["id"], "status": "converged", "revision": revision,
+                      "baseline_passes": baseline_passes, "final_passes": passes}
+            write_json(output / "result.json", result)
+            return result
         if revision == 10:
             break
         editor_context = directory / "editor-context"
@@ -440,9 +707,11 @@ def run_task(task, output, agent, categories):
                   "only in the requested JSON response. Do not write, edit, or delete any files, "
                   "including specifications, feedback, and experiment artifacts.\n"
                   + json.dumps({"original": task["base"], "reference": task["reference"]}))
-        response = agent.run("edit", prompt, editor_context, directory / "editing", edit_schema,
-                             readable=readable, protected=[directory / "specification.md",
-                                                          editor_context / "feedback.json"])
+        rebuild = [] if (directory / "editing/complete.json").exists() else results
+        with materialized(task, rebuild):
+            response = agent.run("edit", prompt, editor_context, directory / "editing", edit_schema,
+                                 readable=readable, protected=[directory / "specification.md",
+                                                              editor_context / "feedback.json"])
         validate_revision(response, categories)
         write_json(directory / "revision-edit.json", response)
         specification = response["specification"]
@@ -522,6 +791,8 @@ def prepare_task(task, storage):
     for packages in task["install"]:
         command([python, "-m", "pip", "install"] + packages, reference, clean_env())
     checks = [[python if word == "{python}" else word for word in args] for args in task["checks"]]
+    candidate_check_prefix = [python if word == "{python}" else word
+                              for word in task.get("candidate_check_prefix", [])]
     inspection = [[python if word == "{python}" else word for word in args]
                   for args in task.get("inspection", [])]
     env = clean_env()
@@ -530,10 +801,12 @@ def prepare_task(task, storage):
     for args in checks:
         logs.append({"command": args, "output": command(args, reference, env)})
     write_json(directory / "reference-validation.json", logs)
-    test_files = [f["filename"] for f in read_json(file_list) if f["filename"].startswith("tests/")]
+    test_files = [f["filename"] for f in read_json(file_list) if is_test_path(f["filename"])]
     prepared = {"id": task["id"], "base": str(base), "reference": str(reference),
                 "description": (pull["title"] + "\n\n" + (pull.get("body") or "")),
                 "test_files": test_files, "checks": checks, "inspection": inspection,
+                "candidate_check_prefix": candidate_check_prefix,
+                "platform_deselect": task.get("platform_deselect", []),
                 "generator_python": prepare_generator_environment(task, directory, base),
                 "requires_test_changes": task.get("requires_test_changes", False),
                 "requirements": {key: task.get("requirements", {}).get(key, description)
@@ -562,7 +835,20 @@ def make_audit(storage):
     write_json(destination / "judge-key.json", key)
 
 
-def validate_smoke_events(events):
+def validate_smoke_events(events, backend="codex"):
+    if backend == "claude":
+        transcript = [json.loads(line) for line in events.read_text().splitlines()]
+        calls = {block["id"] for event in transcript
+                 for block in event.get("message", {}).get("content", []) if isinstance(block, dict)
+                 and block.get("type") == "tool_use" and block.get("name") == "Bash"
+                 and "probe.txt" in block.get("input", {}).get("command", "")}
+        if not any(block.get("tool_use_id") in calls and not block.get("is_error")
+                   and "repository access works" in str(block.get("content", ""))
+                   and "outside filesystem access works" in str(block.get("content", ""))
+                   for event in transcript for block in event.get("message", {}).get("content", [])
+                   if isinstance(block, dict)):
+            raise RuntimeError("Claude smoke transcript does not demonstrate filesystem access")
+        return
     # Require a recorded tool result rather than accepting the model's access claim.
     commands = [event["item"] for line in events.read_text().splitlines()
                 for event in [json.loads(line)] if event.get("type") == "item.completed"
@@ -605,12 +891,17 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / ".experiments")
     parser.add_argument("--manifest", type=Path, default=ROOT / "experiments/pilot.json")
     parser.add_argument("--task", help="Run only this task ID")
-    parser.add_argument("--model", default="gpt-6-luna")
-    parser.add_argument("--codex", default="codex")
+    parser.add_argument("--backend", choices=["codex", "ollama", "claude"], default="codex")
+    parser.add_argument("--effort", choices=["low", "medium", "high"], default="low",
+                        help="Generator/editor effort (default low); judges always use high")
+    parser.add_argument("--model", help="Defaults to gpt-6-luna, haiku with --backend claude, or qwen3-experiment:4b with --backend ollama")
+    parser.add_argument("--codex", help="Override the backend CLI executable")
     args = parser.parse_args()
+    args.model = args.model or {"codex": "gpt-6-luna", "claude": "haiku", "ollama": "qwen3-experiment:4b"}[args.backend]
+    args.codex = args.codex or Codex(args.model, backend=args.backend).executable
     storage = args.output.resolve()
     storage.mkdir(parents=True, exist_ok=True)
-    agent = Codex(args.model, args.codex)
+    agent = Codex(args.model, args.codex, args.backend, args.effort)
     if args.action == "audit":
         print(json.dumps(audit_agreement(storage), indent=2))
         return
@@ -620,25 +911,26 @@ def main():
         (cwd / "probe.txt").write_text("repository access works\n")
         outside = storage / "smoke/outside-probe.txt"
         outside.write_text("outside filesystem access works\n")
-        # Test actual filesystem access directly, independently of model testimony.
-        configured = codex_command(args.codex, args.model, cwd, storage / "smoke/session", False, [])
-        sandbox_args = [args.codex, "sandbox", "-P", "experiment", "-C", str(cwd)]
-        for index, value in enumerate(configured):
-            if value == "-c" and configured[index + 1].startswith(("default_permissions=", "permissions.experiment=")):
-                sandbox_args += ["-c", configured[index + 1]]
-        sandbox_args += ["--", "/bin/cat", "probe.txt", str(outside)]
-        probe = subprocess.run(sandbox_args, text=True, capture_output=True, env=clean_env())
-        check = {"command": sandbox_args, "returncode": probe.returncode,
-                 "stdout": probe.stdout, "stderr": probe.stderr}
-        write_json(storage / "smoke/sandbox-check.json", check)
-        validate_sandbox_check(check)
+        if args.backend != "claude":
+            # Test actual filesystem access directly, independently of model testimony.
+            configured = codex_command(args.codex, args.model, cwd, storage / "smoke/session", False, [], args.backend)
+            sandbox_args = [args.codex, "sandbox", "-P", "experiment", "-C", str(cwd)]
+            for index, value in enumerate(configured):
+                if value == "-c" and configured[index + 1].startswith(("default_permissions=", "permissions.experiment=")):
+                    sandbox_args += ["-c", configured[index + 1]]
+            sandbox_args += ["--", "/bin/cat", "probe.txt", str(outside)]
+            probe = subprocess.run(sandbox_args, text=True, capture_output=True, env=clean_env())
+            check = {"command": sandbox_args, "returncode": probe.returncode,
+                     "stdout": probe.stdout, "stderr": probe.stderr}
+            write_json(storage / "smoke/sandbox-check.json", check)
+            validate_sandbox_check(check)
         schema = object_schema({"message": {"type": "string"}, "workspace_access": {"type": "boolean"}})
-        prompt = ("Read probe.txt using the shell tool. Do not change files. Return message OK "
+        prompt = (f"Read probe.txt and {outside} together using one shell tool command. Do not change files. Return message OK "
                   "and workspace_access true only if the tool actually read the file.")
         response = agent.run("smoke", prompt, cwd, storage / "smoke/session", schema)
         if response != {"message": "OK", "workspace_access": True}:
             raise RuntimeError(f"Model or filesystem isolation smoke test failed: {response}")
-        validate_smoke_events(storage / "smoke/session/events.jsonl")
+        validate_smoke_events(storage / "smoke/session/events.jsonl", args.backend)
         print("Model and filesystem-access smoke test passed.")
         return
     tasks = read_json(args.manifest)

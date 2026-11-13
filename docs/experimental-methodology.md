@@ -4,6 +4,14 @@ Research framing and evaluation criteria: [research-design.md](research-design.m
 
 The main experiment investigates how specification content and formulation evolve in response to structural failures, and whether that refinement converges to a specification that reliably communicates the intended implementation. The loop produces the comprehensive specification; it is not assembled in advance by adding every selected category to an unchanged baseline.
 
+## Current simplification validation
+
+The current protocol targets 10/10 passing implementations in one batch, without confirmation. After finding a passing specification, three independent editor sessions each propose a version 10–30% shorter than the current passing version. They receive the same incumbent specification and feedback and cannot inspect one another's drafts. All drafts are proposed before any is evaluated. The script counts whitespace-separated words, including headings, and skips drafts outside the inclusive bounds. Each eligible candidate receives ten fresh implementations. The shortest candidate passing every criterion in all ten implementations becomes the next incumbent; ties use candidate order. The search repeats until no candidate qualifies in a round, then retains the previous passing specification. There is no restriction to adding one section, no repair of rejected simplifications, and no separate ablation analysis for this protocol.
+
+The three-candidate search replaces stopping after one unsuccessful proposal. In the first live trial, Sphinx's 813-word passing specification was shortened to 528 words (35%); that candidate scored 9/10 and the earlier rule stopped immediately. The new upper bound limits each step's reduction, while independent alternatives let the search continue if another candidate passes. Choosing among candidates is an adaptive search procedure, not an independent estimate of a specification's underlying success rate.
+
+Validate on the existing two PRs before the 100-PR run. New refinement runs use 10/10 without confirmation. Simplification reuses that qualifying batch rather than requiring another unchanged-specification batch. Historical 9/10 specifications receive a fresh qualification batch when simplified directly. The earlier direct-qualification trial failed for both tasks; the next trial restarts refinement from each original PR baseline before simplification. Historical results remain unchanged. The historical procedure below describes the earlier experiments; the current protocol in this section takes precedence.
+
 ## Initial pilot
 
 The first run covers two FEA-Bench tasks:
