@@ -71,5 +71,4 @@ Notes:
 - The repo is a clone of the public GitHub repo; manifests are tracked in git. GHC has no GitHub credentials: commit on GHC, then from the Mac run `git pull ssh://aechang@ghc40.ghc.andrew.cmu.edu/tmp/aechang/llm-improvement-loop main && git push`, so a wipe loses nothing.
 - Before starting the queue, prepare one GHC task and confirm that `tasks/<task>/reference-validation.json` shows the reference checks passing:
   `"$(uv python find 3.9)" run_experiment.py prepare --manifest .experiments/batch-100/runner-manifest.json --task sphinx-doc__sphinx-9822 --output "$PWD/.experiments/manual-qwen-ghc"` (use the Python the queue would pick for that task).
-- `/tmp` is not backed up. Pull results to the Mac regularly, from the Mac (`manual-claude-low-ghc` holds the earlier Claude runs):
-  `rsync -a --exclude 'tasks/' --exclude 'generated/' --exclude 'evaluation/' aechang@ghc40.ghc.andrew.cmu.edu:/tmp/aechang/llm-improvement-loop/.experiments/manual-qwen-ghc/ .experiments/manual-qwen-ghc/`
+- `/tmp` is not backed up. The Mac runs `pull-ghc-results.sh` hourly from cron (`0 * * * * <repo>/pull-ghc-results.sh >> /tmp/pull-ghc.log 2>&1`). It copies `manual-qwen-ghc` and `manual-claude-low-ghc` (the earlier Claude runs) without deleting anything, and needs passwordless SSH from the Mac to GHC.
