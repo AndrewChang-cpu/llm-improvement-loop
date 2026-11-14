@@ -274,7 +274,9 @@ def codex_command(executable, model, cwd, output, writable, readable, backend="c
 
 def claude_command(executable, model, schema, effort="low"):
     # Keep subscription auth, but disable personal context and command network access.
-    settings = {"sandbox": {"enabled": True, "failIfUnavailable": True,
+    # Ubuntu's AppArmor blocks the sandbox's user namespaces, so Linux runs unsandboxed.
+    sandboxed = sys.platform != "linux"
+    settings = {"sandbox": {"enabled": sandboxed, "failIfUnavailable": sandboxed,
                 "allowUnsandboxedCommands": False, "filesystem": {"disabled": True},
                 "network": {"allowedDomains": [], "deniedDomains": ["*"]}}}
     return [executable, "-p", "--model", model, "--effort", effort,
@@ -322,6 +324,7 @@ def resume_settings(output, settings):
             "b492afa421aa2bfe07706d2f2276c1fe00921d35881b398e22d5985d328b883d",
             "490f2f919039754e23723dcb747bc6481c774b21d9f528537084b4eb9c777b8f",
             "9818cd7d1a00719e6d99ecacaaa9ef3434b0673f3d1e25420f949d1a93b570c8",
+            "fcca9c114a5a59658d9ce08ee25bd77e7f362027ce9e000c38575989dfb8801c",
         }
         if old.get("runner_sha256") in compatible:
             if "judge_effort" in current:
