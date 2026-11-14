@@ -7,7 +7,9 @@ curl -sf localhost:11434/api/tags >/dev/null || problems+=("ollama server not re
 running=$(pgrep -fc "run_experiment.py run")
 for log in /tmp/aechang/ghc-run.log; do
     [ -f "$log" ] || continue
-    grep -qE "Traceback|Error:" "$log" && problems+=("error in $log: $(grep -E 'Error' "$log" | tail -1)")
+    # Only the current ghc-run.sh attempt counts; earlier attempts' errors were already handled.
+    current=$(awk '/=== .* ghc-run start/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}' "$log")
+    grep -qE "Traceback|Error:" <<< "$current" && problems+=("error in $log: $(grep -E 'Error' <<< "$current" | tail -1)")
 done
 for result in .experiments/*/results/*/result.json; do
     [ -f "$result" ] && echo "result: $result $(python3 -c "import json;print(json.load(open('$result'))['status'])")"
