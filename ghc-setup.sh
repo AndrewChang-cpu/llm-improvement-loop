@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
-# Rebuild the GHC tooling under /tmp/aechang after /tmp is cleared. Safe to rerun.
-# It also starts ghc-run.sh (tmux ghcqueue) and the AFS backup loop (tmux ghcbackup). Shell setup afterward: `. /tmp/aechang/env.sh`.
+# Rebuild GHC's /tmp state after a reboot (GHC empties /tmp daily around 06:50). Safe to rerun.
+# The backup loop copies this file to ~/private/llm/setup.sh; after a reboot run `bash ~/private/llm/setup.sh`.
+# It restores the repo, results and Claude config from AFS, reinstalls the tools, and starts tmux
+# sessions renew (Kerberos/AFS), backup (ghc-backup.sh) and queue (ghc-run.sh). Prompts only when
+# run by hand without a Kerberos ticket. Test overrides: BASE, AFS, GHC_TMUX (tmux socket), and
+# DRY_RUN=1 (no tool installs, no Ollama, and a queue session that runs nothing).
+(return 0 2>/dev/null) && { echo "Run this with bash, not source." >&2; return 1; }
 set -euo pipefail
-BASE=/tmp/aechang
+BASE=${BASE:-/tmp/aechang}
+AFS=${AFS:-$HOME/private/llm}
+DRY_RUN=${DRY_RUN:-0}
 REPO=$BASE/llm-improvement-loop
-UV_VERSION=0.13.8
-CODEX_VERSION=0.169.0
-OLLAMA_VERSION=0.40.16
+tm() { tmux -L "${GHC_TMUX:-default}" "$@"; }
+
+klist -s || { [ -t 0 ] && kinit aechang@ANDREW.CMU.EDU; } || { echo "No Kerberos ticket; run kinit" >&2; exit 1; }
+aklog
 
 mkdir -p "$BASE/bin" "$BASE/ollama" "$BASE/.cache"
 chmod 700 "$BASE"
@@ -17,41 +25,46 @@ cat > "$BASE/env.sh" <<EOF
 export PATH=$BASE/bin:$BASE/ollama/bin:\$PATH
 export UV_CACHE_DIR=$BASE/.cache/uv UV_PYTHON_INSTALL_DIR=$BASE/.uv-python PIP_CACHE_DIR=$BASE/.cache/pip
 export OLLAMA_MODELS=$BASE/.ollama/models OLLAMA_FLASH_ATTENTION=0 CUDA_VISIBLE_DEVICES=-1 OLLAMA_VULKAN=1
+export CLAUDE_CONFIG_DIR=$BASE/claude-config
 EOF
 . "$BASE/env.sh"
 
-[ -x "$BASE/bin/uv" ] || curl -LsSf "https://astral.sh/uv/$UV_VERSION/install.sh" \
-    | env UV_INSTALL_DIR="$BASE/bin" UV_NO_MODIFY_PATH=1 sh
-[ -x "$BASE/bin/codex" ] || {
-    curl -fsSL "https://github.com/openai/codex/releases/download/rust-v$CODEX_VERSION/codex-x86_64-unknown-linux-musl.tar.gz" \
-        | tar -xz -C "$BASE/bin"
-    mv "$BASE/bin/codex-x86_64-unknown-linux-musl" "$BASE/bin/codex"
-}
-[ -x "$BASE/ollama/bin/ollama" ] || curl -fsSL \
-    "https://github.com/ollama/ollama/releases/download/v$OLLAMA_VERSION/ollama-linux-amd64.tar.zst" \
-    | tar --zstd -x -C "$BASE/ollama"
+# Restore from AFS. --ignore-existing keeps newer /tmp files when rerun.
+[ -d "$REPO/.git" ] || git clone -q "$( [ -d "$AFS/repo.git" ] && echo "$AFS/repo.git" \
+    || echo https://github.com/AndrewChang-cpu/llm-improvement-loop.git)" "$REPO"
+[ -d "$AFS/results" ] && rsync -a --ignore-existing "$AFS/results/" "$REPO/.experiments/"
+[ -d "$AFS/claude-config" ] && rsync -a --ignore-existing "$AFS/claude-config/" "$CLAUDE_CONFIG_DIR/"
 
-# The repo is public; GHC holds no GitHub credentials. Push from the Mac (see CLAUDE.md).
-# /tmp is emptied at every boot (GHC reboots daily around 06:50), so the repo and results are
-# mirrored to AFS by ghc-backup.sh. Restore from there, falling back to GitHub.
-MIRROR=$HOME/private/llm-improvement-loop.git
-[ -d "$REPO/.git" ] || git clone "$( [ -d "$MIRROR" ] && echo "$MIRROR" || echo https://github.com/AndrewChang-cpu/llm-improvement-loop.git)" "$REPO"
-[ -d "$HOME/private/ghc-results-backup" ] && rsync -a --ignore-existing "$HOME/private/ghc-results-backup/" "$REPO/.experiments/"
-
-tmux has-session -t ollama 2>/dev/null \
-    || tmux new-session -d -s ollama ". $BASE/env.sh && ollama serve > $BASE/ollama.log 2>&1"
-until ollama list >/dev/null 2>&1; do sleep 1; done
-ollama pull qwen3:4b
-ollama create qwen3-experiment:4b -f "$REPO/experiments/qwen3.Modelfile"
-
-if ! claude -p "Reply with ok" --max-turns 1 >/dev/null 2>&1; then
-    echo "claude is not logged in: run 'claude' and log in (CLAUDE_CONFIG_DIR=$BASE/.claude if ~/.claude is unreadable), then rerun this script"
-    exit 1
+if [ "$DRY_RUN" != 1 ]; then
+    UV_VERSION=0.13.8 CODEX_VERSION=0.169.0 OLLAMA_VERSION=0.40.16
+    [ -x "$BASE/bin/uv" ] || curl -LsSf "https://astral.sh/uv/$UV_VERSION/install.sh" \
+        | env UV_INSTALL_DIR="$BASE/bin" UV_NO_MODIFY_PATH=1 sh
+    [ -x "$BASE/bin/codex" ] || {
+        curl -fsSL "https://github.com/openai/codex/releases/download/rust-v$CODEX_VERSION/codex-x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xz -C "$BASE/bin"
+        mv "$BASE/bin/codex-x86_64-unknown-linux-musl" "$BASE/bin/codex"
+    }
+    [ -x "$BASE/ollama/bin/ollama" ] || curl -fsSL \
+        "https://github.com/ollama/ollama/releases/download/v$OLLAMA_VERSION/ollama-linux-amd64.tar.zst" \
+        | tar --zstd -x -C "$BASE/ollama"
+    tm has-session -t ollama 2>/dev/null \
+        || tm new-session -d -s ollama ". $BASE/env.sh && ollama serve > $BASE/ollama.log 2>&1"
+    until ollama list >/dev/null 2>&1; do sleep 1; done
+    ollama pull qwen3:4b
+    ollama create qwen3-experiment:4b -f "$REPO/experiments/qwen3.Modelfile"
+    if ! claude -p "Reply with ok" --max-turns 1 >/dev/null 2>&1; then
+        echo "claude is not logged in: run '. $BASE/env.sh && claude', log in, then rerun this script" >&2
+        exit 1
+    fi
 fi
 
-# ghc-run.sh holds the current plan and resumes where it stopped; ghc-backup.sh mirrors to AFS.
-tmux has-session -t ghcqueue 2>/dev/null || tmux new-session -d -s ghcqueue \
-    "$REPO/ghc-run.sh 2>&1 | tee -a $BASE/ghc-run.log; exec bash"
-tmux has-session -t ghcbackup 2>/dev/null || tmux new-session -d -s ghcbackup \
-    "while true; do $REPO/ghc-backup.sh; sleep 900; done"
-echo "Setup done; ghc-run.sh running in tmux session ghcqueue. Shell setup: . $BASE/env.sh"
+# Tickets are renewable for 30 days; renewing hourly keeps AFS readable. Try the login ticket,
+# then the one ghc-recover.sh copies from the Mac.
+tm has-session -t renew 2>/dev/null || tm new-session -d -s renew "while true; do { date; { kinit -R && aklog; } \
+    || { export KRB5CCNAME=FILE:/tmp/aechang-krb5cc; kinit -R && aklog; } && echo renewed; } >> $BASE/renew.log 2>&1; sleep 3600; done"
+tm has-session -t backup 2>/dev/null || tm new-session -d -s backup \
+    "while true; do BASE=$BASE AFS=$AFS $REPO/ghc-backup.sh >> $BASE/backup.log 2>&1; sleep 900; done"
+if [ "$DRY_RUN" = 1 ]; then queue="echo 'DRY_RUN: queue not started'; exec bash"
+else queue="$REPO/ghc-run.sh 2>&1 | tee -a $BASE/ghc-run.log; exec bash"; fi
+tm has-session -t queue 2>/dev/null || tm new-session -d -s queue "$queue"
+echo "Setup done: tmux sessions $(tm ls -F '#S' | tr '\n' ' '); shell setup: . $BASE/env.sh"
