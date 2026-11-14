@@ -12,7 +12,7 @@ CC=$(mktemp)
 trap 'rm -f "$CC"' EXIT
 kinit --renewable -c "FILE:$CC" aechang@ANDREW.CMU.EDU </dev/null || { echo "kinit from Keychain failed" >&2; exit 1; }
 ssh -o BatchMode=yes "$HOST" 'umask 077; cat > /tmp/aechang-krb5cc' < "$CC" || exit 1
-ssh -o BatchMode=yes "$HOST" "export KRB5CCNAME=FILE:/tmp/aechang-krb5cc ${GHC_ENV:-}; bash -s ${1:-}" <<'REMOTE'
+ssh -o BatchMode=yes "$HOST" "export KRB5CCNAME=FILE:/tmp/aechang-krb5cc ${GHC_ENV:-}; bash -s -- ${1:-}" <<'REMOTE'
 aklog || { echo "aklog failed on GHC" >&2; exit 1; }
 BASE=${BASE:-/tmp/aechang}
 missing=$(for s in renew backup queue; do tmux -L "${GHC_TMUX:-default}" has-session -t $s 2>/dev/null || echo $s; done)
