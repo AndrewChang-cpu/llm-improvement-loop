@@ -25,6 +25,7 @@ SPECS = ROOT / ".experiments/batch-100/environment-specs.json"
 REPO_COPIES = {"generated", "evaluation", "candidate-test-tmp"}
 status_lock = threading.Lock()
 API_WAIT_SECONDS = 600
+GENERATOR = "claude"
 
 
 def api_unavailable(output):
@@ -89,7 +90,9 @@ def run_feature(task):
     if task.startswith("matplotlib__"):
         # Old bundled FreeType builds on macOS only against the system zlib.
         env.update(CFLAGS="-DFT_CONFIG_OPTION_SYSTEM_ZLIB", LDFLAGS="-lz")
-    steps = [("refining", [python, "run_experiment.py", "run", "--backend", "claude", "--effort", "low",
+    backend = (["--backend", "ollama", "--judge-backend", "claude"] if GENERATOR == "qwen"
+               else ["--backend", "claude"])
+    steps = [("refining", [python, "run_experiment.py", "run", *backend, "--effort", "low",
                            "--manifest", MANIFEST, "--task", task, "--output", str(OUTPUT)]),
              ("simplifying", [python, "simplify_specifications.py", str(OUTPUT / "results" / task),
                               "--output", str(OUTPUT / "simplification")])]
@@ -127,15 +130,18 @@ def task_list(value):
 
 
 def main():
-    global OUTPUT
+    global OUTPUT, GENERATOR
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workers", type=int, default=3)
     parser.add_argument("--retry-failed", action="store_true", help="Also resume features that failed before")
     parser.add_argument("--tasks", type=task_list, help="Run only these tasks (comma-separated or a file)")
     parser.add_argument("--exclude", type=task_list, default=set(), help="Skip these tasks (comma-separated or a file)")
     parser.add_argument("--output", type=Path, default=OUTPUT)
+    parser.add_argument("--generator", choices=["claude", "qwen"], default="claude",
+                        help="qwen: local Ollama Qwen generates and edits; Claude still judges")
     args = parser.parse_args()
     OUTPUT = args.output.resolve()
+    GENERATOR = args.generator
     OUTPUT.mkdir(parents=True, exist_ok=True)
     previous = read(OUTPUT / "queue-status.json") or {}
     skip = {"done", "non_convergent"} | (set() if args.retry_failed else {"failed"})

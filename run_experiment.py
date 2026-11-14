@@ -259,11 +259,13 @@ def codex_command(executable, model, cwd, output, writable, readable, backend="c
                  "-c", "model_context_window=8192",
                  "-c", "model_auto_compact_token_limit=6144"] if backend == "ollama"
                 else ["-c", 'forced_login_method="chatgpt"'])
+    # Ubuntu's AppArmor blocks Codex's bubblewrap sandbox, so Linux runs unsandboxed.
+    permissions = (["--dangerously-bypass-approvals-and-sandbox"] if sys.platform == "linux"
+                   else ["-c", 'default_permissions="experiment"', "-c", "permissions.experiment=" + policy])
     return [executable, "--no-daemon", "-a", "never", "exec", "--ignore-user-config",
             "--ignore-rules", "--ephemeral", "--json", "-m", model, "-C", str(cwd),
             "-c", f'model_reasoning_effort="{effort}"',
-            *provider, "-c", 'default_permissions="experiment"',
-            "-c", "permissions.experiment=" + policy,
+            *provider, *permissions,
             "-c", 'web_search="disabled"', "-c", "mcp_servers={}",
             "-c", "project_doc_max_bytes=0", "-c", "features.skip_host_skill_discovery=true",
             "--disable", "apps", "--disable", "memories", "--disable", "multi_agent",
@@ -325,6 +327,7 @@ def resume_settings(output, settings):
             "490f2f919039754e23723dcb747bc6481c774b21d9f528537084b4eb9c777b8f",
             "9818cd7d1a00719e6d99ecacaaa9ef3434b0673f3d1e25420f949d1a93b570c8",
             "fcca9c114a5a59658d9ce08ee25bd77e7f362027ce9e000c38575989dfb8801c",
+            "c3c6e19becb9500522df04658432aad3abab84244c80bf02efcc1a48233f263a",
         }
         if old.get("runner_sha256") in compatible:
             if "judge_effort" in current:
@@ -366,11 +369,13 @@ def archive_incomplete_call(output):
 
 
 class Codex:
-    def __init__(self, model="gpt-6-luna", executable=None, backend="codex", effort="low"):
+    def __init__(self, model="gpt-6-luna", executable=None, backend="codex", effort="low", judge=None):
         if backend not in ("codex", "ollama", "claude"):
             raise ValueError(f"Unknown backend: {backend}")
         self.backend = backend
         self.effort = effort
+        # An optional separate agent for judgments, e.g. Claude judging local-model implementations.
+        self.judge = judge
         # One local inference lane avoids competing for the laptop GPU and memory.
         self.parallel_runs = 1 if backend == "ollama" else 10
         self.model = model
@@ -378,6 +383,8 @@ class Codex:
                                          if backend == "claude" else "codex")
 
     def run(self, role, prompt, cwd, output, schema, writable=False, readable=(), python=None, protected=()):
+        if role == "judge" and self.judge:
+            return self.judge.run(role, prompt, cwd, output, schema, writable, readable, python, protected)
         output.mkdir(parents=True, exist_ok=True)
         cwd.mkdir(parents=True, exist_ok=True)
         # Evaluation uses high effort even when generation and editing use less.
@@ -648,6 +655,8 @@ def run_task(task, output, agent, categories):
                 "runs": 10, "parallel_runs": getattr(agent, "parallel_runs", 10), "max_revisions": 10,
                 "required_passes": 10, "confirmation": False,
                 "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+    if getattr(agent, "judge", None):
+        settings.update(judge_backend=agent.judge.backend, judge_model=agent.judge.model)
     resume_settings(output, settings)
     if (output / "result.json").exists():
         return read_json(output / "result.json")
@@ -925,12 +934,20 @@ def main():
                         help="Generator/editor effort (default low); judges always use high")
     parser.add_argument("--model", help="Defaults to gpt-6-luna, haiku with --backend claude, or qwen3-experiment:4b with --backend ollama")
     parser.add_argument("--codex", help="Override the backend CLI executable")
+    parser.add_argument("--judge-backend", choices=["codex", "ollama", "claude"],
+                        help="Judge with a different backend than generators and editors")
+    parser.add_argument("--judge-model", help="Judge model; defaults as for --model")
     args = parser.parse_args()
     args.model = args.model or {"codex": "gpt-6-luna", "claude": "haiku", "ollama": "qwen3-experiment:4b"}[args.backend]
     args.codex = args.codex or Codex(args.model, backend=args.backend).executable
     storage = args.output.resolve()
     storage.mkdir(parents=True, exist_ok=True)
-    agent = Codex(args.model, args.codex, args.backend, args.effort)
+    judge = None
+    if args.judge_backend:
+        judge_model = args.judge_model or {"codex": "gpt-6-luna", "claude": "haiku",
+                                           "ollama": "qwen3-experiment:4b"}[args.judge_backend]
+        judge = Codex(judge_model, backend=args.judge_backend)
+    agent = Codex(args.model, args.codex, args.backend, args.effort, judge)
     if args.action == "audit":
         print(json.dumps(audit_agreement(storage), indent=2))
         return
@@ -940,7 +957,7 @@ def main():
         (cwd / "probe.txt").write_text("repository access works\n")
         outside = storage / "smoke/outside-probe.txt"
         outside.write_text("outside filesystem access works\n")
-        if args.backend != "claude":
+        if args.backend != "claude" and sys.platform != "linux":
             # Test actual filesystem access directly, independently of model testimony.
             configured = codex_command(args.codex, args.model, cwd, storage / "smoke/session", False, [], args.backend)
             sandbox_args = [args.codex, "sandbox", "-P", "experiment", "-C", str(cwd)]

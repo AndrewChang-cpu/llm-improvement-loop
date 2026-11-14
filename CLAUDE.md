@@ -32,6 +32,7 @@ python3.12 claude_low_queue.py --workers 1 --retry-failed
 - Simplify only when `results/<task>/result.json` has `"status": "converged"`.
 - Existing result and simplification folders reject changed settings. When you edit `run_experiment.py` or `simplify_specifications.py`, add the old `runner_sha256` to the compatibility lists (`resume_settings` in `run_experiment.py` and the list in `simplify_specifications.py`).
 - Generators and editors run at `--effort low`. Judges always run at high effort.
+- `claude_low_queue.py --generator qwen` has a local Ollama Qwen (`qwen3-experiment:4b`, via the Codex CLI) generate and edit, while Claude (haiku, high effort) judges.
 - Keep docs concise. Commit only the files your change touches, because other work happens in the same tree.
 
 ## Dependencies
@@ -49,17 +50,26 @@ The Mac and GHC run disjoint features. `ghc-tasks.txt` lists GHC's features (31 
 # Mac
 python3.12 claude_low_queue.py --workers 1 --retry-failed --exclude ghc-tasks.txt
 # GHC
-python3.12 claude_low_queue.py --workers 1 --retry-failed --tasks ghc-tasks.txt --output .experiments/manual-claude-low-ghc
+python3.12 claude_low_queue.py --workers 1 --retry-failed --generator qwen --tasks ghc-tasks.txt --output .experiments/manual-qwen-ghc
 ```
 
 `--tasks` and `--exclude` take a file (one task per line) or a comma-separated list.
 
 ## GHC machine (`ghc40.ghc.andrew.cmu.edu`)
 
+GHC runs the Qwen queue (`--generator qwen`, output `.experiments/manual-qwen-ghc`). After `/tmp` is wiped:
+
+1. Run `bash ~/private/ghc-setup.sh` (a copy of `ghc-setup.sh`; keep the two identical). It installs uv, Codex and Ollama under `/tmp/aechang`, clones the repo, builds the Qwen model, and starts the queue in tmux session `ghcqueue`. If it says `claude` is not logged in, log in and rerun it.
+2. Before the queue runs, or the queue restarts those features from scratch, push the Mac's copy of the results back: `rsync -a .experiments/manual-qwen-ghc/ aechang@ghc40.ghc.andrew.cmu.edu:/tmp/aechang/llm-improvement-loop/.experiments/manual-qwen-ghc/` (from the Mac). The simplest order is: stop the queue (`tmux kill-session -t ghcqueue`), rsync, rerun the setup script.
+
+Notes:
+
+- The sandboxes of Claude and Codex need user namespaces, which Ubuntu's AppArmor blocks here (no sudo), so on Linux both run unsandboxed.
+- The NVIDIA driver (12.4) is too old for Ollama's CUDA build, which fails with "CUDA error: out of memory", so Ollama runs on the GPU through Vulkan. `ghc-setup.sh` writes these settings to `/tmp/aechang/env.sh`; source it in every shell.
 - The AFS home quota is 2 GB, so work in `/tmp/aechang/llm-improvement-loop` (local disk, not backed up, `chmod 700 /tmp/aechang`). Keep caches out of home too: `export UV_CACHE_DIR=/tmp/aechang/.cache/uv UV_PYTHON_INSTALL_DIR=/tmp/aechang/.uv-python PIP_CACHE_DIR=/tmp/aechang/.cache/pip`.
 - Run the queue inside `tmux`. AFS tokens expire, which can make `~/.claude` unreadable. If `claude` auth fails, set `CLAUDE_CONFIG_DIR=/tmp/aechang/.claude` and log in again.
-- The tree is copied from the Mac with code and the two manifest files only; no Mac results.
+- The repo is a clone of GitHub; manifests are tracked in git. Push code changes so a wipe loses nothing.
 - Before starting the queue, prepare one GHC task and confirm that `tasks/<task>/reference-validation.json` shows the reference checks passing:
-  `"$(uv python find 3.9)" run_experiment.py prepare --manifest .experiments/batch-100/runner-manifest.json --task sphinx-doc__sphinx-9822 --output "$PWD/.experiments/manual-claude-low-ghc"` (use the Python the queue would pick for that task).
-- `/tmp` is not backed up. Pull results to the Mac regularly, from the Mac:
-  `rsync -a --exclude 'tasks/' --exclude 'generated/' --exclude 'evaluation/' aechang@ghc40.ghc.andrew.cmu.edu:/tmp/aechang/llm-improvement-loop/.experiments/manual-claude-low-ghc/ .experiments/manual-claude-low-ghc/`
+  `"$(uv python find 3.9)" run_experiment.py prepare --manifest .experiments/batch-100/runner-manifest.json --task sphinx-doc__sphinx-9822 --output "$PWD/.experiments/manual-qwen-ghc"` (use the Python the queue would pick for that task).
+- `/tmp` is not backed up. Pull results to the Mac regularly, from the Mac (`manual-claude-low-ghc` holds the earlier Claude runs):
+  `rsync -a --exclude 'tasks/' --exclude 'generated/' --exclude 'evaluation/' aechang@ghc40.ghc.andrew.cmu.edu:/tmp/aechang/llm-improvement-loop/.experiments/manual-qwen-ghc/ .experiments/manual-qwen-ghc/`
