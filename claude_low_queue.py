@@ -12,6 +12,7 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import threading
@@ -24,6 +25,22 @@ SPECS = ROOT / ".experiments/batch-100/environment-specs.json"
 MIN_FREE_GB = 30
 REPO_COPIES = {"generated", "evaluation", "candidate-test-tmp"}
 status_lock = threading.Lock()
+API_WAIT_SECONDS = 600
+
+
+def api_unavailable(output):
+    # A Claude call that ended on a usage limit or API/auth error is retried after a wait.
+    failure = re.search(r"claude failed \(\d+\); resume after resolving the error\. Logs: (\S+)", output)
+    if not failure:
+        return False
+    logs = Path(failure[1])
+    events = (logs / "events.jsonl").read_text(errors="replace").splitlines() if (logs / "events.jsonl").exists() else []
+    results = [event for line in events if '"type":"result"' in line for event in [json.loads(line)] if event.get("type") == "result"]
+    final = results[-1] if results else {}
+    stderr = (logs / "stderr.log").read_text(errors="replace") if (logs / "stderr.log").exists() else ""
+    message = (str(final.get("result", "")) if final.get("is_error") else "") + stderr
+    return (final.get("terminal_reason") == "api_error"
+            or bool(re.search(r"hit your .*limit|\b40[13]\b|log ?in|authenticat", message, re.I)))
 
 
 def claude_tasks():
@@ -90,11 +107,19 @@ def run_feature(task):
         if state == "simplifying" and simplified.exists():
             break
         wait_for_disk(task)
-        update(task, state=state, python=python)
-        with log.open("a") as out:
-            out.write(f"\n=== {datetime.now().isoformat(timespec='seconds')} {state} ===\n")
-            out.flush()
-            code = subprocess.run(command, cwd=ROOT, env=env, stdout=out, stderr=subprocess.STDOUT).returncode
+        while True:
+            update(task, state=state, python=python)
+            start = log.stat().st_size if log.exists() else 0
+            with log.open("a") as out:
+                out.write(f"\n=== {datetime.now().isoformat(timespec='seconds')} {state} ===\n")
+                out.flush()
+                code = subprocess.run(command, cwd=ROOT, env=env, stdout=out, stderr=subprocess.STDOUT).returncode
+            with log.open() as out:
+                out.seek(start)
+                if not code or not api_unavailable(out.read()):
+                    break
+            update(task, state="waiting_for_api", detail=f"Claude unavailable; retrying {state} in {API_WAIT_SECONDS}s")
+            time.sleep(API_WAIT_SECONDS)
         if code:
             update(task, state="failed", detail=f"{state} exited {code}; see {log.name}")
             return
