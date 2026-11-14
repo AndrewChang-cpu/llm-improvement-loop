@@ -14,10 +14,12 @@ cp ghc-setup.sh "$AFS/setup.sh"
 cp CLAUDE.md "$AFS/CLAUDE.md"
 
 # GHC's results are the untracked folders in .experiments; tracked ones are in the mirror.
+# Skip features prune-ghc-afs-results.sh (Mac) deleted after confirming the Mac has them.
 git ls-files --others --directory --exclude-standard .experiments | while read -r path; do
+    dest=$AFS/results/${path#.experiments/}
+    skip=(); [ -f "$dest.mac-has" ] && skip=(--exclude-from="$dest.mac-has")
     rsync -a --prune-empty-dirs --max-size=2m --exclude-from=<(sed -n 's|^\.experiments/\*\*/||p' .gitignore) \
-        --exclude 'tasks/' --exclude '*.tar.gz' --exclude '*.jsonl' \
-        "$path" "$AFS/results/${path#.experiments/}"
+        --exclude 'tasks/' --exclude '*.tar.gz' --exclude '*.jsonl' "${skip[@]}" "$path" "$dest"
 done
 
 if [ -d "$CONFIG" ]; then

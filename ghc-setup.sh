@@ -2,8 +2,8 @@
 # Rebuild GHC's /tmp state after a reboot (GHC empties /tmp daily around 06:50). Safe to rerun.
 # The backup loop copies this file to ~/private/llm/setup.sh; after a reboot run `bash ~/private/llm/setup.sh`.
 # It restores the repo, results and Claude config from AFS, reinstalls the tools, and starts tmux
-# sessions renew (Kerberos/AFS), backup (ghc-backup.sh) and queue (ghc-run.sh). Prompts only when
-# run by hand without a Kerberos ticket. Test overrides: BASE, AFS, GHC_TMUX (tmux socket), and
+# sessions renew (Kerberos/AFS), backup (ghc-backup.sh) and queue (ghc-run.sh; skipped while claude
+# is not logged in). Prompts only when run by hand without a Kerberos ticket. Test overrides: BASE, AFS, GHC_TMUX (tmux socket), and
 # DRY_RUN=1 (no tool installs, no Ollama, and a queue session that runs nothing).
 (return 0 2>/dev/null) && { echo "Run this with bash, not source." >&2; return 1; }
 set -euo pipefail
@@ -52,11 +52,11 @@ if [ "$DRY_RUN" != 1 ]; then
     until ollama list >/dev/null 2>&1; do sleep 1; done
     ollama pull qwen3:4b
     ollama create qwen3-experiment:4b -f "$REPO/experiments/qwen3.Modelfile"
-    if ! claude -p "Reply with ok" --max-turns 1 >/dev/null 2>&1; then
-        echo "claude is not logged in: run '. $BASE/env.sh && claude', log in, then rerun this script" >&2
-        exit 1
-    fi
 fi
+# Without a Claude login everything else still runs; only the queue waits.
+claude_error=
+[ "$DRY_RUN" = 1 ] || { claude_error=$(cd "$BASE" && claude -p "Reply with ok" --max-turns 1 \
+    --no-session-persistence 2>&1) && claude_error= || claude_error=${claude_error:-claude check failed}; }
 
 # Tickets are renewable for 30 days; renewing hourly keeps AFS readable. Try the login ticket,
 # then the one ghc-recover.sh copies from the Mac.
@@ -66,5 +66,8 @@ tm has-session -t backup 2>/dev/null || tm new-session -d -s backup \
     "while true; do BASE=$BASE AFS=$AFS $REPO/ghc-backup.sh >> $BASE/backup.log 2>&1; sleep 900; done"
 if [ "$DRY_RUN" = 1 ]; then queue="echo 'DRY_RUN: queue not started'; exec bash"
 else queue="$REPO/ghc-run.sh 2>&1 | tee -a $BASE/ghc-run.log; exec bash"; fi
-tm has-session -t queue 2>/dev/null || tm new-session -d -s queue "$queue"
+if [ -n "$claude_error" ]; then
+    echo "WARNING: claude is not logged in ($(head -1 <<< "$claude_error")); queue not started." \
+        "Run '. $BASE/env.sh && claude' and log in, then rerun this script; backup saves the login to AFS." >&2
+else tm has-session -t queue 2>/dev/null || tm new-session -d -s queue "$queue"; fi
 echo "Setup done: tmux sessions $(tm ls -F '#S' | tr '\n' ' '); shell setup: . $BASE/env.sh"
