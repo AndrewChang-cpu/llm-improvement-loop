@@ -54,18 +54,23 @@ def simplify(value, output, executable=None, effort=None):
                                                    "6696991c7b33b11ddb99e66bfeb9b72c63c67f537ecc74c9d1373c5add5d0e4b",
                                                    "a1a9a79016d3ed487419e01a5240083f62589d65b87c971be1bbf29855d7357f",
                                                    "864ad5d02ed06cc426250d4284ba15ebc358322f69f2cd8ceba7abbb9f292530",
-                                                   "867e5afa69c46e05d41664be09495cf213485f0d4c2fb55e5bdb92668579f416"}:
+                                                   "867e5afa69c46e05d41664be09495cf213485f0d4c2fb55e5bdb92668579f416",
+                                                   "e281ab0c7b46e5ec505864840360c89039015ffa1f1ce289728308bfc9eef739"}:
         saved["simplifier_sha256"] = settings["simplifier_sha256"]
     # Deleting judged repository copies did not alter results. Resuming the source experiment
     # rewrites its settings with only the new runner hash, so accept that source change too.
-    if saved and saved.get("runner_sha256") in {"6df0fd0d512307adff72d59a1abbf16181d12eeafc164aa4dc471dbaf7364c40",
-                                                "35a0e92f2c4437fa4f742de72b5be40d2c9bfab938e8ad1ee1b8a9a6c6a2dba6",
-                                                "b492afa421aa2bfe07706d2f2276c1fe00921d35881b398e22d5985d328b883d",
-                                                "490f2f919039754e23723dcb747bc6481c774b21d9f528537084b4eb9c777b8f",
-                                                "9818cd7d1a00719e6d99ecacaaa9ef3434b0673f3d1e25420f949d1a93b570c8"}:
-        previous_source = dict(runner.read_json(source / "settings.json"), runner_sha256=saved["runner_sha256"])
-        if (hashlib.sha256((json.dumps(previous_source, indent=2) + "\n").encode()).hexdigest()
-                == saved["source_settings_sha256"]):
+    # A simplification interrupted before its source resumed under the current runner saved the
+    # source settings with an earlier compatible runner hash; accept any of them.
+    compatible_runners = {"6df0fd0d512307adff72d59a1abbf16181d12eeafc164aa4dc471dbaf7364c40",
+                          "35a0e92f2c4437fa4f742de72b5be40d2c9bfab938e8ad1ee1b8a9a6c6a2dba6",
+                          "b492afa421aa2bfe07706d2f2276c1fe00921d35881b398e22d5985d328b883d",
+                          "490f2f919039754e23723dcb747bc6481c774b21d9f528537084b4eb9c777b8f",
+                          "9818cd7d1a00719e6d99ecacaaa9ef3434b0673f3d1e25420f949d1a93b570c8",
+                          "fcca9c114a5a59658d9ce08ee25bd77e7f362027ce9e000c38575989dfb8801c"}
+    if saved and saved.get("runner_sha256") in compatible_runners:
+        source_settings = runner.read_json(source / "settings.json")
+        if any(hashlib.sha256((json.dumps(dict(source_settings, runner_sha256=old), indent=2) + "\n").encode()).hexdigest()
+               == saved["source_settings_sha256"] for old in compatible_runners):
             saved["source_settings_sha256"] = settings["source_settings_sha256"]
         saved["runner_sha256"] = settings["runner_sha256"]
     if saved is not None and saved != settings:
