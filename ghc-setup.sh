@@ -22,7 +22,7 @@ chmod 700 "$BASE"
 # Keep tools and caches off the 2 GB AFS home. The driver (12.4) is too old for Ollama's CUDA
 # build, which fails with "out of memory", so Ollama uses the same GPU through Vulkan.
 cat > "$BASE/env.sh" <<EOF
-export PATH=$BASE/bin:$BASE/ollama/bin:\$PATH
+export PATH=$BASE/bin:$BASE/ollama/bin:$HOME/.local/bin:\$PATH
 export UV_CACHE_DIR=$BASE/.cache/uv UV_PYTHON_INSTALL_DIR=$BASE/.uv-python PIP_CACHE_DIR=$BASE/.cache/pip
 export OLLAMA_MODELS=$BASE/.ollama/models OLLAMA_FLASH_ATTENTION=0 CUDA_VISIBLE_DEVICES=-1 OLLAMA_VULKAN=1
 export CLAUDE_CONFIG_DIR=$BASE/claude-config
