@@ -328,6 +328,7 @@ def resume_settings(output, settings):
             "9818cd7d1a00719e6d99ecacaaa9ef3434b0673f3d1e25420f949d1a93b570c8",
             "fcca9c114a5a59658d9ce08ee25bd77e7f362027ce9e000c38575989dfb8801c",
             "c3c6e19becb9500522df04658432aad3abab84244c80bf02efcc1a48233f263a",
+            "71d0f58eef5bb673726dfe17df8f3ccd202780b14694252ef39d9e086e13bc3a",
         }
         if old.get("runner_sha256") in compatible:
             if "judge_effort" in current:
@@ -446,7 +447,13 @@ class Codex:
             raise RuntimeError(f"{self.backend} failed ({result.returncode}); resume after resolving the error. Logs: {output}")
         if self.backend == "claude":
             write_json(output / "response.json", claude_response(output / "events.jsonl"))
-        response = read_json(output / "response.json")
+        try:
+            response = read_json(output / "response.json")
+        except json.JSONDecodeError:
+            if role != "generate":
+                raise
+            # Only the generator's patch is judged; keep its unparseable final message as is.
+            response = {"unparseable_final_message": True}
         write_json(output / "complete.json", response)
         return response
 

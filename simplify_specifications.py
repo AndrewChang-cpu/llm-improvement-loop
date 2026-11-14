@@ -58,7 +58,8 @@ def simplify(value, output, executable=None, effort=None):
                                                    "a1a9a79016d3ed487419e01a5240083f62589d65b87c971be1bbf29855d7357f",
                                                    "864ad5d02ed06cc426250d4284ba15ebc358322f69f2cd8ceba7abbb9f292530",
                                                    "867e5afa69c46e05d41664be09495cf213485f0d4c2fb55e5bdb92668579f416",
-                                                   "6fbe29f02599bb4d7221616a9d32666e668693b8aaed960a6fe85c176096afc5"}:
+                                                   "6fbe29f02599bb4d7221616a9d32666e668693b8aaed960a6fe85c176096afc5",
+                                                   "860666c2d19d48560d75d03e4e8b9b3d144c863d59f4196707dc10868f504d20"}:
         saved["simplifier_sha256"] = settings["simplifier_sha256"]
     # Deleting judged repository copies did not alter results. Resuming the source experiment
     # rewrites its settings with only the new runner hash, so accept that source change too.
@@ -68,7 +69,8 @@ def simplify(value, output, executable=None, effort=None):
                                                 "490f2f919039754e23723dcb747bc6481c774b21d9f528537084b4eb9c777b8f",
                                                 "9818cd7d1a00719e6d99ecacaaa9ef3434b0673f3d1e25420f949d1a93b570c8",
                                                 "fcca9c114a5a59658d9ce08ee25bd77e7f362027ce9e000c38575989dfb8801c",
-                                                "c3c6e19becb9500522df04658432aad3abab84244c80bf02efcc1a48233f263a"}:
+                                                "c3c6e19becb9500522df04658432aad3abab84244c80bf02efcc1a48233f263a",
+                                                "71d0f58eef5bb673726dfe17df8f3ccd202780b14694252ef39d9e086e13bc3a"}:
         previous_source = dict(runner.read_json(source / "settings.json"), runner_sha256=saved["runner_sha256"])
         if (hashlib.sha256((json.dumps(previous_source, indent=2) + "\n").encode()).hexdigest()
                 == saved["source_settings_sha256"]):
