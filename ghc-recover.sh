@@ -43,7 +43,7 @@ problems=$(grep '^PROBLEM' <<< "$health")
 if [ "${FIXER_TEST:-}" = 1 ]; then
     prompt="Smoke test of the unattended fixer: $problems. Do not run any tools or change anything. Reply with exactly: fixer smoke ok"
 else
-    prompt="You are the unattended fixer for the GHC experiment run (plan: ghc-run.sh, log /tmp/aechang/ghc-run.log, queue in tmux session 'queue'). Health check reported: $problems. Investigate only that, fix per CLAUDE.md rules (never alter or redo judgments; keep original model outputs), and resume the run, e.g. tmux kill-session -t queue; tmux new-session -d -s queue \"./ghc-run.sh 2>&1 | tee -a /tmp/aechang/ghc-run.log; exec bash\". Do not commit or push. Reply in under 100 words: cause, what you changed, current state."
+    prompt="You are the unattended fixer for the GHC experiment run (plan: ghc-run.sh, two independent tracks: claude in tmux session 'queue' with log /tmp/aechang/ghc-run.log, qwen in session 'qwen' with log /tmp/aechang/ghc-qwen.log). Health check reported: $problems. Investigate only that, fix per CLAUDE.md rules (never alter or redo judgments; keep original model outputs), and resume the run, e.g. tmux kill-session -t queue; tmux new-session -d -s queue \"./ghc-run.sh claude 2>&1 | tee -a /tmp/aechang/ghc-run.log; exec bash\" (qwen likewise). Do not commit or push. Reply in under 100 words: cause, what you changed, current state."
 fi
 echo "fixer: $problems"
 ssh -o BatchMode=yes "$HOST" "export KRB5CCNAME=FILE:/tmp/aechang-krb5cc; aklog; cd /tmp/aechang/llm-improvement-loop && . /tmp/aechang/env.sh \

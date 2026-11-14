@@ -256,8 +256,8 @@ def codex_command(executable, model, cwd, output, writable, readable, backend="c
     policy = '{ filesystem = { ":root" = "write" }, network = { enabled = false }}'
     provider = (["--oss", "--local-provider", "ollama",
                  "-c", 'model_provider="ollama"',
-                 "-c", "model_context_window=8192",
-                 "-c", "model_auto_compact_token_limit=6144"] if backend == "ollama"
+                 "-c", "model_context_window=32768",
+                 "-c", "model_auto_compact_token_limit=24576"] if backend == "ollama"
                 else ["-c", 'forced_login_method="chatgpt"'])
     # Ubuntu's AppArmor blocks Codex's bubblewrap sandbox, so Linux runs unsandboxed.
     permissions = (["--dangerously-bypass-approvals-and-sandbox"] if sys.platform == "linux"

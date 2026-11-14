@@ -1,29 +1,45 @@
 #!/usr/bin/env bash
-# Hourly health check: prints OK, or PROBLEM lines that need attention.
+# Hourly health check of the two ghc-run.sh tracks: prints OK, or PROBLEM lines that need attention.
+# The Claude track is a problem when it stops unfinished; the Qwen side track only while it runs
+# (a finished or stopped Qwen track is reported but never flagged).
 cd "$(dirname "$0")" || exit 1
 problems=()
-tmux has-session -t ollama 2>/dev/null || problems+=("ollama tmux session is gone")
-curl -sf localhost:11434/api/tags >/dev/null || problems+=("ollama server not responding")
-running=$(pgrep -fc "run_experiment.py run")
-for log in /tmp/aechang/ghc-run.log; do
-    [ -f "$log" ] || continue
-    # Only the current ghc-run.sh attempt counts; earlier attempts' errors were already handled.
-    current=$(awk '/=== .* ghc-run start/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}' "$log")
-    grep -qE "Traceback|Error:" <<< "$current" && problems+=("error in $log: $(grep -E 'Error' <<< "$current" | tail -1)")
-done
+# Only the current attempt in a log counts; earlier attempts' errors were already handled.
+log_error() {
+    [ -f "$2" ] || return
+    local current=$(awk '/=== .* ghc-run .*start/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}' "$2")
+    grep -qE "Traceback|Error:" <<< "$current" && problems+=("$1: error in $2: $(grep -E 'Error' <<< "$current" | tail -1)")
+}
+# The track's log counts too, so a track restarted less than an hour ago is not reported as stuck.
+stuck() {
+    [ -n "$(find "$2" "$3" -mmin -60 -type f -not -path "*/tasks/*" 2>/dev/null | head -1)" ] \
+        || problems+=("$1: running but no file in $2 changed in 60 minutes")
+}
 for result in .experiments/*/results/*/result.json; do
     [ -f "$result" ] && echo "result: $result $(python3 -c "import json;print(json.load(open('$result'))['status'])")"
 done
-if [ "$running" -gt 0 ]; then
-    # ghc-run.log counts too, so a run restarted less than an hour ago is not reported as stuck.
-    newest=$(find .experiments /tmp/aechang/ghc-run.log -mmin -60 -type f -not -path "*/tasks/*" 2>/dev/null | head -1)
-    [ -n "$newest" ] || problems+=("runs active but no results file changed in 60 minutes")
-elif ! grep -q "followup done" /tmp/aechang/ghc-run.log 2>/dev/null; then
-    problems+=("no run_experiment process running and the follow-up has not finished")
+
+CLOG=/tmp/aechang/ghc-run.log
+if pgrep -f "[c]laude_low_queue.py" >/dev/null; then
+    claude=running
+    log_error claude "$CLOG"
+    stuck claude .experiments/manual-claude-low-ghc "$CLOG"
+    status=.experiments/manual-claude-low-ghc/queue-status.json
+    failed=$([ -f "$status" ] && python3 -c "import json;print(' '.join(k for k,v in json.load(open('$status')).items() if v['state']=='failed'))")
+    [ -n "$failed" ] && problems+=("claude: failed in $status: $failed")
+elif grep -q "claude done" "$CLOG" 2>/dev/null; then claude=done
+else claude=stopped; problems+=("claude: queue not running and not finished (see $CLOG)")
 fi
-pgrep -f "claude_low_queue.py" >/dev/null && for status in .experiments/manual-*-ghc/queue-status.json; do
-    [ -f "$status" ] || continue
-    failed=$(python3 -c "import json;print(' '.join(k for k,v in json.load(open('$status')).items() if v['state']=='failed'))")
-    [ -n "$failed" ] && problems+=("failed in $status: $failed")
-done
-if [ ${#problems[@]} -eq 0 ]; then echo "OK ($running runs active)"; else printf 'PROBLEM: %s\n' "${problems[@]}"; fi
+
+QLOG=/tmp/aechang/ghc-qwen.log
+if pgrep -f "[r]un_experiment.py run --backend ollama" >/dev/null; then
+    qwen=running
+    tmux has-session -t ollama 2>/dev/null || problems+=("qwen: ollama tmux session is gone")
+    curl -sf localhost:11434/api/tags >/dev/null || problems+=("qwen: ollama server not responding")
+    log_error qwen "$QLOG"
+    stuck qwen .experiments/qwen32k-sphinx-11989 "$QLOG"
+elif grep -q "qwen done" "$QLOG" 2>/dev/null; then qwen=done
+else qwen=stopped
+fi
+
+if [ ${#problems[@]} -eq 0 ]; then echo "OK (claude $claude, qwen $qwen)"; else printf 'PROBLEM: %s\n' "${problems[@]}"; fi
