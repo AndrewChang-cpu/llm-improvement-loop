@@ -2,6 +2,11 @@
 
 Read `AGENTS.md` first; its rules apply here too.
 
+## Responses
+
+- When the user asks a question, answer it directly first, before anything else.
+- Keep responses under 100 words.
+
 ## Purpose
 
 Iterative specification refinement on FEA-Bench PRs. Each revision of a feature's specification gets 10 independent implementations, which are then judged. A feature converges when 10/10 implementations pass all criteria, with at most 10 revisions. A converged specification is then simplified: 3 candidates per round, each cutting 10–30% of the words, keeping the shortest candidate that still gets 10/10.
