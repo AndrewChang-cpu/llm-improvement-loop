@@ -22,7 +22,6 @@ ROOT = Path(__file__).resolve().parent
 OUTPUT = ROOT / ".experiments/manual-claude-low-v2"
 MANIFEST = ".experiments/batch-100/runner-manifest.json"
 SPECS = ROOT / ".experiments/batch-100/environment-specs.json"
-MIN_FREE_GB = 30
 REPO_COPIES = {"generated", "evaluation", "candidate-test-tmp"}
 status_lock = threading.Lock()
 API_WAIT_SECONDS = 600
@@ -81,12 +80,6 @@ def clean(task):
     shutil.rmtree(OUTPUT / "tasks" / task, ignore_errors=True)
 
 
-def wait_for_disk(task):
-    while shutil.disk_usage(OUTPUT).free < MIN_FREE_GB * 1024 ** 3:
-        update(task, state="waiting_for_disk")
-        time.sleep(300)
-
-
 def run_feature(task):
     result = OUTPUT / "results" / task / "result.json"
     simplified = OUTPUT / "simplification" / task / "result.json"
@@ -106,7 +99,6 @@ def run_feature(task):
             return
         if state == "simplifying" and simplified.exists():
             break
-        wait_for_disk(task)
         while True:
             update(task, state=state, python=python)
             start = log.stat().st_size if log.exists() else 0
