@@ -5,8 +5,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 HOST=aechang@ghc40.ghc.andrew.cmu.edu
 REMOTE=/tmp/aechang/llm-improvement-loop/.experiments
-for dir in manual-qwen-ghc manual-claude-low-ghc; do
-    ssh -o BatchMode=yes "$HOST" test -d "$REMOTE/$dir" || continue
+# Every GHC results folder; batch-100 holds tracked inputs, not results.
+for dir in $(ssh -o BatchMode=yes "$HOST" ls "$REMOTE" | grep -vx batch-100); do
     mkdir -p ".experiments/$dir"
     rsync -a -e "ssh -o BatchMode=yes" --exclude 'tasks/' --exclude 'generated/' --exclude 'evaluation/' \
         "$HOST:$REMOTE/$dir/" ".experiments/$dir/"
