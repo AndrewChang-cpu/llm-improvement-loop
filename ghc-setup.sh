@@ -72,6 +72,7 @@ if [ -n "$claude_error" ]; then
         "Run '. $BASE/env.sh && claude' and log in, then rerun this script; backup saves the login to AFS." >&2
 else
     tm has-session -t queue 2>/dev/null || tm new-session -d -s queue "$(track claude ghc-run.log)"
-    tm has-session -t qwen 2>/dev/null || tm new-session -d -s qwen "$(track qwen ghc-qwen.log)"
+    # Qwen track stopped by the user (2026-11-14): 0/30 runs passed at 32k.
+    : tm has-session -t qwen 2>/dev/null || tm new-session -d -s qwen "$(track qwen ghc-qwen.log)"
 fi
 echo "Setup done: tmux sessions $(tm ls -F '#S' | tr '\n' ' '); shell setup: . $BASE/env.sh"
