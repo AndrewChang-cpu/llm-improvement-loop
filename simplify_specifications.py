@@ -61,7 +61,8 @@ def simplify(value, output, executable=None, effort=None):
     if saved and saved.get("runner_sha256") in {"6df0fd0d512307adff72d59a1abbf16181d12eeafc164aa4dc471dbaf7364c40",
                                                 "35a0e92f2c4437fa4f742de72b5be40d2c9bfab938e8ad1ee1b8a9a6c6a2dba6",
                                                 "b492afa421aa2bfe07706d2f2276c1fe00921d35881b398e22d5985d328b883d",
-                                                "490f2f919039754e23723dcb747bc6481c774b21d9f528537084b4eb9c777b8f"}:
+                                                "490f2f919039754e23723dcb747bc6481c774b21d9f528537084b4eb9c777b8f",
+                                                "9818cd7d1a00719e6d99ecacaaa9ef3434b0673f3d1e25420f949d1a93b570c8"}:
         previous_source = dict(runner.read_json(source / "settings.json"), runner_sha256=saved["runner_sha256"])
         if (hashlib.sha256((json.dumps(previous_source, indent=2) + "\n").encode()).hexdigest()
                 == saved["source_settings_sha256"]):

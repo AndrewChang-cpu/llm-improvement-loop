@@ -321,6 +321,7 @@ def resume_settings(output, settings):
             "35a0e92f2c4437fa4f742de72b5be40d2c9bfab938e8ad1ee1b8a9a6c6a2dba6",
             "b492afa421aa2bfe07706d2f2276c1fe00921d35881b398e22d5985d328b883d",
             "490f2f919039754e23723dcb747bc6481c774b21d9f528537084b4eb9c777b8f",
+            "9818cd7d1a00719e6d99ecacaaa9ef3434b0673f3d1e25420f949d1a93b570c8",
         }
         if old.get("runner_sha256") in compatible:
             if "judge_effort" in current:
@@ -735,6 +736,23 @@ def download(url):
         return response.read()
 
 
+def build_in_place(python, source):
+    # meson-python editable installs import the package from this tree through an import hook that
+    # overrides PYTHONPATH, so checks of another workspace would run this tree's code. Copy the built
+    # files into the source tree and drop the hook, as setup.py develop builds would.
+    site = Path(command([python, "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"]).strip())
+    hooks = list(site.glob("_*_editable_loader.py"))
+    if not hooks:
+        return
+    for build in (source / "build").glob("cp*"):
+        for path in build.rglob("*"):
+            target = source / path.relative_to(build)
+            if path.suffix in (".so", ".py") and target.parent.is_dir() and not target.exists():
+                shutil.copy2(path, target)
+    for path in hooks + list(site.glob("*-editable.pth")):
+        path.unlink()
+
+
 def prepare_generator_environment(task, directory, base):
     venv = directory / "generator-venv"
     python = str(venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
@@ -747,6 +765,7 @@ def prepare_generator_environment(task, directory, base):
     # Install the original project, never the merged reference implementation.
     for packages in task["install"]:
         command([python, "-m", "pip", "install"] + packages, base, clean_env())
+    build_in_place(python, base)
     command([python, "-m", "pip", "check"], base, clean_env())
     write_json(marker, configuration)
     return python
@@ -796,6 +815,7 @@ def prepare_task(task, storage):
         command([sys.executable, "-m", "venv", "--clear", str(venv)])
     for packages in task["install"]:
         command([python, "-m", "pip", "install"] + packages, reference, clean_env())
+    build_in_place(python, reference)
     checks = [[python if word == "{python}" else word for word in args] for args in task["checks"]]
     candidate_check_prefix = [python if word == "{python}" else word
                               for word in task.get("candidate_check_prefix", [])]
