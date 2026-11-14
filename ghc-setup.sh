@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Rebuild the GHC tooling under /tmp/aechang after /tmp is cleared. Safe to rerun.
-# Afterward: `. /tmp/aechang/env.sh`, then start the queue (see CLAUDE.md).
+# It also starts the Qwen queue in tmux session ghcqueue. Shell setup afterward: `. /tmp/aechang/env.sh`.
 set -euo pipefail
 BASE=/tmp/aechang
 REPO=$BASE/llm-improvement-loop
@@ -31,6 +31,7 @@ EOF
     "https://github.com/ollama/ollama/releases/download/v$OLLAMA_VERSION/ollama-linux-amd64.tar.zst" \
     | tar --zstd -x -C "$BASE/ollama"
 
+# The repo is public; GHC holds no GitHub credentials. Push from the Mac (see CLAUDE.md).
 [ -d "$REPO/.git" ] || git clone https://github.com/AndrewChang-cpu/llm-improvement-loop.git "$REPO"
 
 tmux has-session -t ollama 2>/dev/null \

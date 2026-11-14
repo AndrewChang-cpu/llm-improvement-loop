@@ -68,7 +68,7 @@ Notes:
 - The NVIDIA driver (12.4) is too old for Ollama's CUDA build, which fails with "CUDA error: out of memory", so Ollama runs on the GPU through Vulkan. `ghc-setup.sh` writes these settings to `/tmp/aechang/env.sh`; source it in every shell.
 - The AFS home quota is 2 GB, so work in `/tmp/aechang/llm-improvement-loop` (local disk, not backed up, `chmod 700 /tmp/aechang`). Keep caches out of home too: `export UV_CACHE_DIR=/tmp/aechang/.cache/uv UV_PYTHON_INSTALL_DIR=/tmp/aechang/.uv-python PIP_CACHE_DIR=/tmp/aechang/.cache/pip`.
 - Run the queue inside `tmux`. AFS tokens expire, which can make `~/.claude` unreadable. If `claude` auth fails, set `CLAUDE_CONFIG_DIR=/tmp/aechang/.claude` and log in again.
-- The repo is a clone of GitHub; manifests are tracked in git. Push code changes so a wipe loses nothing.
+- The repo is a clone of the public GitHub repo; manifests are tracked in git. GHC has no GitHub credentials: commit on GHC, then from the Mac run `git pull ssh://aechang@ghc40.ghc.andrew.cmu.edu/tmp/aechang/llm-improvement-loop main && git push`, so a wipe loses nothing.
 - Before starting the queue, prepare one GHC task and confirm that `tasks/<task>/reference-validation.json` shows the reference checks passing:
   `"$(uv python find 3.9)" run_experiment.py prepare --manifest .experiments/batch-100/runner-manifest.json --task sphinx-doc__sphinx-9822 --output "$PWD/.experiments/manual-qwen-ghc"` (use the Python the queue would pick for that task).
 - `/tmp` is not backed up. Pull results to the Mac regularly, from the Mac (`manual-claude-low-ghc` holds the earlier Claude runs):
