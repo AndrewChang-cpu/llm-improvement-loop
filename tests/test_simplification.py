@@ -104,7 +104,7 @@ class SimplificationTests(unittest.TestCase):
         with patch.object(runner, "Codex") as factory, patch.object(
                 runner, "evaluate_batch", return_value=verdicts(9)) as evaluate:
             result = simplification.simplify("example", self.output, effort="medium")
-            factory.assert_called_once_with("fake", None, "codex", "medium")
+            factory.assert_called_once_with("fake", None, "codex", "medium", None)
             evaluate.assert_called_once()
             self.assertEqual(result["stop_reason"], "starting_batch_below_10_of_10")
             self.assertEqual(runner.read_json(self.output / "settings.json")["effort"], "medium")

@@ -44,6 +44,9 @@ def simplify(value, output, executable=None, effort=None):
         "runner_sha256": file_hash(Path(runner.__file__)),
         "simplifier_sha256": file_hash(Path(__file__)),
     }
+    # Keep the source experiment's separate judge, if it had one.
+    settings.update({key: original_settings[key] for key in ("judge_backend", "judge_model")
+                     if key in original_settings})
     output.mkdir(parents=True, exist_ok=True)
     saved = runner.read_json(output / "settings.json") if (output / "settings.json").exists() else None
     # The per-experiment locking change did not alter simplification behavior.
@@ -55,7 +58,11 @@ def simplify(value, output, executable=None, effort=None):
                                                    "a1a9a79016d3ed487419e01a5240083f62589d65b87c971be1bbf29855d7357f",
                                                    "864ad5d02ed06cc426250d4284ba15ebc358322f69f2cd8ceba7abbb9f292530",
                                                    "867e5afa69c46e05d41664be09495cf213485f0d4c2fb55e5bdb92668579f416",
-                                                   "e281ab0c7b46e5ec505864840360c89039015ffa1f1ce289728308bfc9eef739"}:
+                                                   "e281ab0c7b46e5ec505864840360c89039015ffa1f1ce289728308bfc9eef739",
+                                                   "6fbe29f02599bb4d7221616a9d32666e668693b8aaed960a6fe85c176096afc5",
+                                                   "860666c2d19d48560d75d03e4e8b9b3d144c863d59f4196707dc10868f504d20",
+                                                   "b4edb20e7a25ed233473f1af8ce00c23480f05b2911bc992891612e0c653cda8",
+                                                   "949ee36de8247e42d6e76936892e56e0e49a4c80d90f72aac5a07bc0cbbf69b2"}:
         saved["simplifier_sha256"] = settings["simplifier_sha256"]
     # Deleting judged repository copies did not alter results. Resuming the source experiment
     # rewrites its settings with only the new runner hash, so accept that source change too.
@@ -66,7 +73,9 @@ def simplify(value, output, executable=None, effort=None):
                           "b492afa421aa2bfe07706d2f2276c1fe00921d35881b398e22d5985d328b883d",
                           "490f2f919039754e23723dcb747bc6481c774b21d9f528537084b4eb9c777b8f",
                           "9818cd7d1a00719e6d99ecacaaa9ef3434b0673f3d1e25420f949d1a93b570c8",
-                          "fcca9c114a5a59658d9ce08ee25bd77e7f362027ce9e000c38575989dfb8801c"}
+                          "fcca9c114a5a59658d9ce08ee25bd77e7f362027ce9e000c38575989dfb8801c",
+                          "c3c6e19becb9500522df04658432aad3abab84244c80bf02efcc1a48233f263a",
+                          "71d0f58eef5bb673726dfe17df8f3ccd202780b14694252ef39d9e086e13bc3a"}
     if saved and saved.get("runner_sha256") in compatible_runners:
         source_settings = runner.read_json(source / "settings.json")
         if any(hashlib.sha256((json.dumps(dict(source_settings, runner_sha256=old), indent=2) + "\n").encode()).hexdigest()
@@ -81,7 +90,9 @@ def simplify(value, output, executable=None, effort=None):
         return runner.read_json(output / "result.json")
 
     task = settings["task"]
-    agent = runner.Codex(settings["model"], executable, settings["backend"], settings["effort"])
+    judge = (runner.Codex(settings["judge_model"], backend=settings["judge_backend"])
+             if "judge_backend" in settings else None)
+    agent = runner.Codex(settings["model"], executable, settings["backend"], settings["effort"], judge)
     initial_words = word_count(specification)
     (output / "starting-specification.md").write_text(specification + "\n")
     if (original_settings.get("required_passes") == 10 and original_settings.get("confirmation") is False

@@ -161,8 +161,13 @@ class RunnerTests(unittest.TestCase):
     def test_codex_command_allows_filesystem_access_and_uses_subscription(self):
         cwd = self.root / "generated"
         cwd.mkdir()
-        args = runner.codex_command("codex", "gpt-6-luna", cwd,
-                                    self.root / "result", True, [])
+        with patch.object(runner.sys, "platform", "linux"):
+            linux = " ".join(runner.codex_command("codex", "gpt-6-luna", cwd, self.root / "result", True, []))
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", linux)
+        self.assertNotIn("permissions.experiment", linux)
+        with patch.object(runner.sys, "platform", "darwin"):
+            args = runner.codex_command("codex", "gpt-6-luna", cwd,
+                                        self.root / "result", True, [])
         joined = " ".join(args)
         self.assertIn('forced_login_method="chatgpt"', joined)
         self.assertIn('":root" = "write"', joined)
