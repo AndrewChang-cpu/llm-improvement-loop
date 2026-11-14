@@ -15,7 +15,8 @@ for result in .experiments/*/results/*/result.json; do
     [ -f "$result" ] && echo "result: $result $(python3 -c "import json;print(json.load(open('$result'))['status'])")"
 done
 if [ "$running" -gt 0 ]; then
-    newest=$(find .experiments -newermt "-60 minutes" -type f -not -path "*/tasks/*" 2>/dev/null | head -1)
+    # ghc-run.log counts too, so a run restarted less than an hour ago is not reported as stuck.
+    newest=$(find .experiments /tmp/aechang/ghc-run.log -mmin -60 -type f -not -path "*/tasks/*" 2>/dev/null | head -1)
     [ -n "$newest" ] || problems+=("runs active but no results file changed in 60 minutes")
 elif ! grep -q "followup done" /tmp/aechang/ghc-run.log 2>/dev/null; then
     problems+=("no run_experiment process running and the follow-up has not finished")
