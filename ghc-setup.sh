@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Rebuild the GHC tooling under /tmp/aechang after /tmp is cleared. Safe to rerun.
-# It also starts the Qwen queue in tmux session ghcqueue. Shell setup afterward: `. /tmp/aechang/env.sh`.
+# It also starts ghc-run.sh (tmux ghcqueue) and the AFS backup loop (tmux ghcbackup). Shell setup afterward: `. /tmp/aechang/env.sh`.
 set -euo pipefail
 BASE=/tmp/aechang
 REPO=$BASE/llm-improvement-loop
@@ -32,7 +32,11 @@ EOF
     | tar --zstd -x -C "$BASE/ollama"
 
 # The repo is public; GHC holds no GitHub credentials. Push from the Mac (see CLAUDE.md).
-[ -d "$REPO/.git" ] || git clone https://github.com/AndrewChang-cpu/llm-improvement-loop.git "$REPO"
+# /tmp is emptied at every boot (GHC reboots daily around 06:50), so the repo and results are
+# mirrored to AFS by ghc-backup.sh. Restore from there, falling back to GitHub.
+MIRROR=$HOME/private/llm-improvement-loop.git
+[ -d "$REPO/.git" ] || git clone "$( [ -d "$MIRROR" ] && echo "$MIRROR" || echo https://github.com/AndrewChang-cpu/llm-improvement-loop.git)" "$REPO"
+[ -d "$HOME/private/ghc-results-backup" ] && rsync -a --ignore-existing "$HOME/private/ghc-results-backup/" "$REPO/.experiments/"
 
 tmux has-session -t ollama 2>/dev/null \
     || tmux new-session -d -s ollama ". $BASE/env.sh && ollama serve > $BASE/ollama.log 2>&1"
@@ -45,7 +49,9 @@ if ! claude -p "Reply with ok" --max-turns 1 >/dev/null 2>&1; then
     exit 1
 fi
 
-# Qwen generates and edits; Claude judges at high effort. Reruns resume where the queue stopped.
+# ghc-run.sh holds the current plan and resumes where it stopped; ghc-backup.sh mirrors to AFS.
 tmux has-session -t ghcqueue 2>/dev/null || tmux new-session -d -s ghcqueue \
-    "cd $REPO && . $BASE/env.sh && python3.12 claude_low_queue.py --workers 1 --retry-failed --generator qwen --tasks ghc-tasks.txt --output .experiments/manual-qwen-ghc 2>&1 | tee -a $BASE/queue.out; exec bash"
-echo "Setup done; queue running in tmux session ghcqueue. Shell setup: . $BASE/env.sh"
+    "$REPO/ghc-run.sh 2>&1 | tee -a $BASE/ghc-run.log; exec bash"
+tmux has-session -t ghcbackup 2>/dev/null || tmux new-session -d -s ghcbackup \
+    "while true; do $REPO/ghc-backup.sh; sleep 900; done"
+echo "Setup done; ghc-run.sh running in tmux session ghcqueue. Shell setup: . $BASE/env.sh"

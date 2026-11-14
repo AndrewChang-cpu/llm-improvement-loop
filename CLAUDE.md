@@ -62,10 +62,7 @@ python3.12 claude_low_queue.py --workers 1 --retry-failed --generator qwen --tas
 
 ## GHC machine (`ghc40.ghc.andrew.cmu.edu`)
 
-GHC runs the Qwen queue (`--generator qwen`, output `.experiments/manual-qwen-ghc`). After `/tmp` is wiped:
-
-1. Run `bash ~/private/ghc-setup.sh` (a copy of `ghc-setup.sh`; keep the two identical). It installs uv, Codex and Ollama under `/tmp/aechang`, clones the repo, builds the Qwen model, and starts the queue in tmux session `ghcqueue`. If it says `claude` is not logged in, log in and rerun it.
-2. Before the queue runs, or the queue restarts those features from scratch, push the Mac's copy of the results back: `rsync -a .experiments/manual-qwen-ghc/ aechang@ghc40.ghc.andrew.cmu.edu:/tmp/aechang/llm-improvement-loop/.experiments/manual-qwen-ghc/` (from the Mac). The simplest order is: stop the queue (`tmux kill-session -t ghcqueue`), rsync, rerun the setup script.
+GHC reboots daily around 06:50, and every boot empties `/tmp`. `ghc-backup.sh` (tmux `ghcbackup`, every 15 minutes) mirrors the repo to `~/private/llm-improvement-loop.git` and results to `~/private/ghc-results-backup/` on AFS. After a reboot, log in with a password (so AFS is readable) and run `bash ~/private/ghc-setup.sh` (a copy of `ghc-setup.sh`; keep the two identical). It reinstalls uv, Codex and Ollama under `/tmp/aechang`, restores the repo and results from AFS, builds the Qwen model, and starts `ghc-run.sh` (the current plan) in tmux `ghcqueue`. If it says `claude` is not logged in, log in and rerun it. `ghc-health-check.sh` prints OK or the problems.
 
 Notes:
 
