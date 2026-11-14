@@ -127,15 +127,28 @@ def run_feature(task):
     update(task, state="done", detail=(read(simplified) or {}).get("status", "simplified"))
 
 
+def task_list(value):
+    # A comma-separated list of tasks, or a file with one task per line.
+    path = Path(value)
+    names = path.read_text().split() if path.is_file() else value.split(",")
+    return {name for name in names if name}
+
+
 def main():
+    global OUTPUT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workers", type=int, default=3)
     parser.add_argument("--retry-failed", action="store_true", help="Also resume features that failed before")
+    parser.add_argument("--tasks", type=task_list, help="Run only these tasks (comma-separated or a file)")
+    parser.add_argument("--exclude", type=task_list, default=set(), help="Skip these tasks (comma-separated or a file)")
+    parser.add_argument("--output", type=Path, default=OUTPUT)
     args = parser.parse_args()
+    OUTPUT = args.output.resolve()
     OUTPUT.mkdir(parents=True, exist_ok=True)
     previous = read(OUTPUT / "queue-status.json") or {}
     skip = {"done", "non_convergent"} | (set() if args.retry_failed else {"failed"})
-    tasks = [t for t in claude_tasks() if previous.get(t, {}).get("state") not in skip]
+    tasks = [t for t in claude_tasks() if previous.get(t, {}).get("state") not in skip
+             and (args.tasks is None or t in args.tasks) and t not in args.exclude]
     for task in tasks:
         update(task, state="queued")
     with ThreadPoolExecutor(args.workers) as pool:
