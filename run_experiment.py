@@ -14,6 +14,7 @@ from pathlib import Path
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -21,6 +22,8 @@ import urllib.request
 
 
 ROOT = Path(__file__).resolve().parent
+# Normal evaluation commands finish in seconds to a few minutes.
+CHECK_TIMEOUT = 1800
 CRITERIA = {
     "patch_and_checks": "Patch applies and the recorded executable checks pass.",
     "file_location": "Code is placed in the required existing module or component.",
@@ -41,6 +44,19 @@ def command(args, cwd=None, env=None):
     if result.returncode:
         raise RuntimeError(f"Command failed: {args!r}\n{result.stdout[-2000:]}{result.stderr[-2000:]}")
     return result.stdout
+
+
+def run_check(args, cwd, env):
+    # Generated code can loop forever; bound each evaluation command and kill its whole process group.
+    process = subprocess.Popen(args, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=CHECK_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        stdout, stderr = process.communicate()
+        stderr += f"\nTimed out after {CHECK_TIMEOUT}s; the process group was killed.\n"
+    return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
 
 
 def clean_env():
@@ -318,6 +334,7 @@ def resume_settings(output, settings):
         current.pop("effort", None)
         # Explicitly migrate known runners; unknown source changes still require a new run.
         compatible = {
+            "0674ebbdedc0534abb792e86bc4494247b663363e35cbe6be188eee983c7244e",
             "50c587c8ca7df3ee323db2df6f6fac9898a3743679ba0f4237163490ab4ebe53",
             "8498de65e6d74c59b21cb8ee7ea4aa71e62609c56cd03821492dfe4caa1198bb",
             "63b25eb70e6ca785a73d89525a1afd3a9d5d51264006cef980f754ff58ec8b21",
@@ -511,7 +528,7 @@ def check_candidate(task, generated, output):
         else:
             args = prefix + tests + changed_tests
         if tests or changed_tests:
-            result = subprocess.run(args, cwd=evaluation, env=env, text=True, capture_output=True)
+            result = run_check(args, evaluation, env)
             checks["commands"].append({"phase": "candidate_tests", "command": args,
                                        "returncode": result.returncode,
                                        "output": result.stdout + result.stderr})
@@ -521,7 +538,7 @@ def check_candidate(task, generated, output):
         tests = sorted({path for path in paths if (evaluation / path.split("::")[0]).exists()})
         args = [task["generator_python"], "-m", "pytest", "-q", "--basetemp",
                 str(output / "candidate-test-tmp")] + tests
-        result = subprocess.run(args, cwd=evaluation, env=env, text=True, capture_output=True)
+        result = run_check(args, evaluation, env)
         checks["commands"].append({"phase": "candidate_tests", "command": args,
                                    "returncode": result.returncode,
                                    "output": result.stdout + result.stderr})
@@ -545,12 +562,12 @@ def check_candidate(task, generated, output):
                               ("generated", str(generated))):
         for args in task.get("inspection", []):
             probe_env = dict(env, PYTHONPATH=repository)
-            result = subprocess.run(args, cwd=repository, env=probe_env, text=True, capture_output=True)
+            result = run_check(args, repository, probe_env)
             checks["api_inspection"].append({"snapshot": label, "command": args,
                                             "returncode": result.returncode,
                                             "output": result.stdout + result.stderr})
     for args in task["checks"]:
-        result = subprocess.run(args, cwd=evaluation, env=env, text=True, capture_output=True)
+        result = run_check(args, evaluation, env)
         checks["commands"].append({"phase": "reference_tests", "command": args, "returncode": result.returncode,
                                    "output": result.stdout + result.stderr})
     write_json(output / "checks.json", checks)
