@@ -83,7 +83,8 @@ def simplify(value, output, executable=None, effort=None):
                           "50c587c8ca7df3ee323db2df6f6fac9898a3743679ba0f4237163490ab4ebe53",
                           "0674ebbdedc0534abb792e86bc4494247b663363e35cbe6be188eee983c7244e",
                           "07c810cb0fa245b71baccfbf275d8e7d48f972378ebe6e0f1435e30d41894722",
-                          "659b8adbf302b69a88522186d36c7558d67ed106e8bb5812b9f8db308ed786d5"}
+                          "659b8adbf302b69a88522186d36c7558d67ed106e8bb5812b9f8db308ed786d5",
+                          "7260356a613b4425b8a0ebaeeec6a15a45ee13fd2ee29d554c3d4b7ec02c1a55"}
     if saved and saved.get("runner_sha256") in compatible_runners:
         source_settings = runner.read_json(source / "settings.json")
         if any(hashlib.sha256((json.dumps(dict(source_settings, runner_sha256=old), indent=2) + "\n").encode()).hexdigest()

@@ -154,6 +154,8 @@ def load_batch(path):
 
 
 COPY_IGNORES = (".git", ".codex", "__pycache__", ".pytest_cache")
+# Build and test byproducts stay out of patch.diff, which judges read.
+GENERATED_IGNORES = ("__pycache__/", "*.py[co]", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/")
 
 
 def initialize_git(directory):
@@ -162,6 +164,9 @@ def initialize_git(directory):
     command(["git", "-c", "user.name=Experiment", "-c", "user.email=experiment@example.invalid",
              "-c", "core.hooksPath=" + os.devnull, "commit", "-qm", "Original snapshot"],
             directory, clean_env())
+    # Written after the snapshot commit, so the original tree is unchanged.
+    with open(directory / ".git/info/exclude", "a") as exclude:
+        exclude.write("\n".join(GENERATED_IGNORES) + "\n")
 
 
 def export_commit(repository, commit, destination):
@@ -199,7 +204,8 @@ def rebuild_workspace(task, run, destination):
 def tree_entries(root):
     entries = {}
     for directory, dirs, files in os.walk(root):
-        dirs[:] = [name for name in dirs if name not in COPY_IGNORES]
+        dirs[:] = [name for name in dirs if name not in COPY_IGNORES + (".mypy_cache", ".ruff_cache")]
+        files = [name for name in files if not name.endswith((".pyc", ".pyo"))]
         for name in dirs + [name for name in files if name not in COPY_IGNORES]:
             path = Path(directory) / name
             if path.is_symlink():
@@ -423,6 +429,7 @@ def resume_settings(output, settings):
             "c3c6e19becb9500522df04658432aad3abab84244c80bf02efcc1a48233f263a",
             "71d0f58eef5bb673726dfe17df8f3ccd202780b14694252ef39d9e086e13bc3a",
             "659b8adbf302b69a88522186d36c7558d67ed106e8bb5812b9f8db308ed786d5",
+            "7260356a613b4425b8a0ebaeeec6a15a45ee13fd2ee29d554c3d4b7ec02c1a55",
         }
         if old.get("runner_sha256") in compatible:
             if "judge_effort" in current:

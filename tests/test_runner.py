@@ -123,6 +123,20 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(runner.command(["git", "rev-list", "--count", "HEAD"], generated).strip(), "1")
         self.assertEqual(runner.command(["git", "remote"], generated).strip(), "")
 
+    def test_patch_excludes_python_build_artifacts(self):
+        base = self.root / "base"
+        base.mkdir()
+        (base / "feature.py").write_text("value = 0\n")
+        generated = self.root / "generated"
+        runner.fresh_workspace(base, generated)
+        (generated / "feature.py").write_text("value = 1\n")
+        for junk in ("__pycache__/feature.cpython-311.pyc", ".pytest_cache/v/cache/lastfailed", "old.pyc"):
+            (generated / junk).parent.mkdir(parents=True, exist_ok=True)
+            (generated / junk).write_text("junk")
+        runner.command(["git", "add", "-A"], generated)
+        changed = runner.command(["git", "diff", "--cached", "--name-only"], generated).split()
+        self.assertEqual(changed, ["feature.py"])
+
     def test_claude_subscription_command_and_structured_response(self):
         schema = runner.object_schema({"message": {"type": "string"}})
         agent = runner.Codex("haiku", backend="claude")
