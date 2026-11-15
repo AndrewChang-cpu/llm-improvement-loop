@@ -56,6 +56,13 @@ def clean_env():
     return env
 
 
+def venv_env(python):
+    # Build backends such as meson-python run tools (meson, ninja) installed in the venv.
+    env = clean_env()
+    env["PATH"] = str(Path(python).parent) + os.pathsep + env.get("PATH", "")
+    return env
+
+
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -311,6 +318,7 @@ def resume_settings(output, settings):
         current.pop("effort", None)
         # Explicitly migrate known runners; unknown source changes still require a new run.
         compatible = {
+            "50c587c8ca7df3ee323db2df6f6fac9898a3743679ba0f4237163490ab4ebe53",
             "8498de65e6d74c59b21cb8ee7ea4aa71e62609c56cd03821492dfe4caa1198bb",
             "63b25eb70e6ca785a73d89525a1afd3a9d5d51264006cef980f754ff58ec8b21",
             "c6556bcea70cc15cf11525b1190ec89135ed660532ca3b25667d25606f5fb4fa",
@@ -601,6 +609,9 @@ def evaluate_batch(task, output, agent, specification, runs=10):
                         number += 1
                     (archive / f"attempt-{number:03d}.patch.diff").write_text(partial)
             fresh_workspace(Path(task["base"]), generated)
+        elif not (generated / ".git").exists():
+            # Without its workspace, git would run in an enclosing repository.
+            raise RuntimeError(f"Generated workspace missing for completed generation: {generated}")
         # The generator sees only the specification and its original-code workspace.
         agent.run("generate", "Implement this feature in the repository. Inspect and edit repository files. "
                   "Do not use the network, other repository directories, additional agents, or outside feedback. "
@@ -783,7 +794,7 @@ def prepare_generator_environment(task, directory, base):
         command([sys.executable, "-m", "venv", str(venv)])
     # Install the original project, never the merged reference implementation.
     for packages in task["install"]:
-        command([python, "-m", "pip", "install"] + packages, base, clean_env())
+        command([python, "-m", "pip", "install"] + packages, base, venv_env(python))
     build_in_place(python, base)
     command([python, "-m", "pip", "check"], base, clean_env())
     write_json(marker, configuration)
@@ -833,7 +844,7 @@ def prepare_task(task, storage):
     if not venv.exists() or subprocess.run([python, "-m", "pip", "--version"], capture_output=True).returncode:
         command([sys.executable, "-m", "venv", "--clear", str(venv)])
     for packages in task["install"]:
-        command([python, "-m", "pip", "install"] + packages, reference, clean_env())
+        command([python, "-m", "pip", "install"] + packages, reference, venv_env(python))
     build_in_place(python, reference)
     checks = [[python if word == "{python}" else word for word in args] for args in task["checks"]]
     candidate_check_prefix = [python if word == "{python}" else word
