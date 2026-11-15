@@ -4,9 +4,11 @@
 # are copied to ~/.local/share/llm-ghc; rerun this after changing them. Pass --check-only to make
 # the job only report GHC's health instead of running setup.sh there.
 set -euo pipefail
+# HOST (the GHC login) is passed to the job; LABEL names it.
 REPO=$(cd "$(dirname "$0")" && pwd)
+HOST=${HOST:-aechang@ghc40.ghc.andrew.cmu.edu}
 DIR=$HOME/.local/share/llm-ghc
-LABEL=edu.cmu.aechang.llm-ghc
+LABEL=${LABEL:-edu.cmu.aechang.llm-ghc}
 PLIST=$HOME/Library/LaunchAgents/$LABEL.plist
 mkdir -p "$DIR"
 cp "$REPO/ghc-recover.sh" "$REPO/pull-ghc-results.sh" "$REPO/prune-ghc-afs-results.sh" "$DIR/"
@@ -18,7 +20,7 @@ cat > "$PLIST" <<PLIST
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key><array><string>/bin/bash</string><string>-c</string>
     <string>"$DIR/ghc-recover.sh" $mode; "$DIR/pull-ghc-results.sh" &amp;&amp; "$DIR/prune-ghc-afs-results.sh"</string></array>
-  <key>EnvironmentVariables</key><dict><key>REPO</key><string>$REPO</string>
+  <key>EnvironmentVariables</key><dict><key>REPO</key><string>$REPO</string><key>HOST</key><string>$HOST</string>
     <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
   <key>StartCalendarInterval</key><dict><key>Minute</key><integer>5</integer></dict>
   <key>StandardOutPath</key><string>$DIR/job.log</string>

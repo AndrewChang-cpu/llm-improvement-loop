@@ -7,7 +7,7 @@
 set -euo pipefail
 HOST=${HOST:-aechang@ghc40.ghc.andrew.cmu.edu}
 REPO=${REPO:-$(cd "$(dirname "$0")" && pwd)}
-REMOTE=${REMOTE:-/tmp/aechang/llm-improvement-loop}
+REMOTE=${REMOTE:-/tmp/$([[ $HOST == *@* ]] && echo "${HOST%%@*}" || echo "$USER")/llm-improvement-loop}
 failed=()
 for path in $(ssh -o BatchMode=yes "$HOST" "cd $REMOTE && git ls-files --others --directory --exclude-standard .experiments"); do
     mkdir -p "$(dirname "$REPO/$path")"

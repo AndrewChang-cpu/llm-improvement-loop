@@ -4,14 +4,14 @@
 # this project's newest transcripts. Needs a live AFS token.
 set -euo pipefail
 cd "$(dirname "$0")"
-BASE=${BASE:-/tmp/aechang}
+BASE=${BASE:-/tmp/${USER:-$(id -un)}}
 AFS=${AFS:-$HOME/private/llm}
 CONFIG=$BASE/claude-config
 mkdir -p "$AFS/results" "$AFS/claude-config"
 [ -d "$AFS/repo.git" ] || git clone -q --bare . "$AFS/repo.git"
 git push -q --force "$AFS/repo.git" main
 cp ghc-setup.sh "$AFS/setup.sh"
-cp CLAUDE.md "$AFS/CLAUDE.md"
+cp CLAUDE.md AGENTS.md "$AFS/"
 
 # GHC's results are the untracked folders in .experiments; tracked ones are in the mirror.
 # Skip features prune-ghc-afs-results.sh (Mac) deleted after confirming the Mac has them.

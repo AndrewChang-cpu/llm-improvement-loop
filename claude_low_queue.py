@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Run the Claude PRs from experiment-commands.txt at low effort, three features at a time.
+"""Run a queue of PRs at low effort, three features at a time: by default the Claude PRs from
+experiment-commands.txt with Claude; with --manifest, that manifest's tasks; --backend codex uses Codex.
 
 Each feature refines its specification and, when it converges, simplifies it. After a feature
 finishes simplification, its repository copies are deleted and every result file is kept.
@@ -20,25 +21,29 @@ import time
 
 ROOT = Path(__file__).resolve().parent
 OUTPUT = ROOT / ".experiments/manual-claude-low-v2"
-MANIFEST = ".experiments/batch-100/runner-manifest.json"
+MANIFEST = ROOT / ".experiments/batch-100/runner-manifest.json"
 SPECS = ROOT / ".experiments/batch-100/environment-specs.json"
 REPO_COPIES = {"generated", "evaluation", "candidate-test-tmp"}
 status_lock = threading.Lock()
 API_WAIT_SECONDS = 600
 GENERATOR = "claude"
+EFFORT = "low"
 
 
 def api_unavailable(output):
-    # A Claude call that ended on a usage limit or API/auth error is retried after a wait.
-    failure = re.search(r"claude failed \(\d+\); resume after resolving the error\. Logs: (\S+)", output)
+    # A model call that ended on a usage limit or API/auth error is retried after a wait.
+    failure = re.search(r"(claude|codex) failed \(\d+\); resume after resolving the error\. Logs: (\S+)", output)
     if not failure:
         return False
-    logs = Path(failure[1])
+    logs = Path(failure[2])
     events = (logs / "events.jsonl").read_text(errors="replace").splitlines() if (logs / "events.jsonl").exists() else []
     results = [event for line in events if '"type":"result"' in line for event in [json.loads(line)] if event.get("type") == "result"]
     final = results[-1] if results else {}
     stderr = (logs / "stderr.log").read_text(errors="replace") if (logs / "stderr.log").exists() else ""
     message = (str(final.get("result", "")) if final.get("is_error") else "") + stderr
+    if failure[1] == "codex":
+        # Codex reports failures as error events rather than a final result.
+        message += "\n".join(line for line in events[-20:] if '"error"' in line or "failed" in line)
     return (final.get("terminal_reason") == "api_error"
             or bool(re.search(r"hit your .*limit|\b40[13]\b|log ?in|authenticat", message, re.I)))
 
@@ -91,9 +96,9 @@ def run_feature(task):
         # Old bundled FreeType builds on macOS only against the system zlib.
         env.update(CFLAGS="-DFT_CONFIG_OPTION_SYSTEM_ZLIB", LDFLAGS="-lz")
     backend = (["--backend", "ollama", "--judge-backend", "claude"] if GENERATOR == "qwen"
-               else ["--backend", "claude"])
-    steps = [("refining", [python, "run_experiment.py", "run", *backend, "--effort", "low",
-                           "--manifest", MANIFEST, "--task", task, "--output", str(OUTPUT)]),
+               else ["--backend", GENERATOR])
+    steps = [("refining", [python, "run_experiment.py", "run", *backend, "--effort", EFFORT,
+                           "--manifest", str(MANIFEST), "--task", task, "--output", str(OUTPUT)]),
              ("simplifying", [python, "simplify_specifications.py", str(OUTPUT / "results" / task),
                               "--output", str(OUTPUT / "simplification")])]
     for state, command in steps:
@@ -113,7 +118,7 @@ def run_feature(task):
                 out.seek(start)
                 if not code or not api_unavailable(out.read()):
                     break
-            update(task, state="waiting_for_api", detail=f"Claude unavailable; retrying {state} in {API_WAIT_SECONDS}s")
+            update(task, state="waiting_for_api", detail=f"{GENERATOR} unavailable; retrying {state} in {API_WAIT_SECONDS}s")
             time.sleep(API_WAIT_SECONDS)
         if code:
             update(task, state="failed", detail=f"{state} exited {code}; see {log.name}")
@@ -123,29 +128,40 @@ def run_feature(task):
 
 
 def task_list(value):
-    # A comma-separated list of tasks, or a file with one task per line.
+    # A comma-separated list of tasks, or a file with one task per line ("#" starts a comment).
     path = Path(value)
-    names = path.read_text().split() if path.is_file() else value.split(",")
+    names = ([line.split("#")[0].strip() for line in path.read_text().splitlines()] if path.is_file()
+             else value.split(","))
     return {name for name in names if name}
 
 
 def main():
-    global OUTPUT, GENERATOR
+    global OUTPUT, GENERATOR, MANIFEST, SPECS, EFFORT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workers", type=int, default=3)
     parser.add_argument("--retry-failed", action="store_true", help="Also resume features that failed before")
     parser.add_argument("--tasks", type=task_list, help="Run only these tasks (comma-separated or a file)")
     parser.add_argument("--exclude", type=task_list, default=set(), help="Skip these tasks (comma-separated or a file)")
     parser.add_argument("--output", type=Path, default=OUTPUT)
-    parser.add_argument("--generator", choices=["claude", "qwen"], default="claude",
-                        help="qwen: local Ollama Qwen generates and edits; Claude still judges")
+    parser.add_argument("--manifest", type=Path, default=MANIFEST, help="Runner manifest of the tasks")
+    parser.add_argument("--specs", type=Path, help="Environment specs (Python version per task); "
+                        "default: environment-specs.json next to the manifest")
+    parser.add_argument("--generator", "--backend", choices=["claude", "codex", "qwen"], default="claude",
+                        help="claude or codex: that CLI generates, edits and judges; "
+                             "qwen: local Ollama Qwen generates and edits, Claude judges")
+    parser.add_argument("--effort", choices=["low", "medium", "high"], default="low",
+                        help="Generator/editor effort (default low); judges always use high")
     args = parser.parse_args()
-    OUTPUT = args.output.resolve()
-    GENERATOR = args.generator
+    OUTPUT, MANIFEST = args.output.resolve(), args.manifest.resolve()
+    SPECS = (args.specs or MANIFEST.parent / "environment-specs.json").resolve()
+    GENERATOR, EFFORT = args.generator, args.effort
     OUTPUT.mkdir(parents=True, exist_ok=True)
     previous = read(OUTPUT / "queue-status.json") or {}
     skip = {"done", "non_convergent"} | (set() if args.retry_failed else {"failed"})
-    tasks = [t for t in claude_tasks() if previous.get(t, {}).get("state") not in skip
+    # The default manifest holds every batch-100 PR; only its Claude PRs belong to this queue.
+    candidates = (claude_tasks() if MANIFEST == ROOT / ".experiments/batch-100/runner-manifest.json"
+                  else [task["id"] for task in json.loads(MANIFEST.read_text())])
+    tasks = [t for t in candidates if previous.get(t, {}).get("state") not in skip
              and (args.tasks is None or t in args.tasks) and t not in args.exclude]
     for task in tasks:
         update(task, state="queued")

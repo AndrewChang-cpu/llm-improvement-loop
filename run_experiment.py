@@ -90,6 +90,69 @@ def read_json(path):
     return json.loads(path.read_text())
 
 
+# Model prompts and commands need absolute paths, but files record paths relative to the
+# experiment folder or repo so results stay usable after copying them to another machine.
+def record_path(path):
+    path = Path(path)
+    return os.path.relpath(path, ROOT) if ROOT in path.parents else str(path)
+
+
+def recorded_path(value):
+    # Relative paths are repo-relative. Old files recorded absolute paths, maybe from another
+    # machine (e.g. /tmp/aechang/llm-improvement-loop/.experiments/...); remap those into this repo.
+    path = Path(value)
+    if not path.is_absolute():
+        return ROOT / path
+    if path.exists() or ".experiments" not in path.parts:
+        return path
+    return ROOT.joinpath(*path.parts[path.parts.index(".experiments"):])
+
+
+def relocate_task(task, directory):
+    # A prepared task's paths all lie in its tasks/<id> folder; move them to another folder.
+    old, new = str(Path(task["base"]).parent), str(directory)
+    def move(word):
+        if isinstance(word, str) and (word == old or word.startswith(old + "/")):
+            return new + word[len(old):]
+        return word
+    task = dict(task)
+    for key in ("base", "reference", "generator_python"):
+        if key in task:
+            task[key] = move(task[key])
+    for key in ("checks", "inspection"):
+        if key in task:
+            task[key] = [[move(word) for word in args] for args in task[key]]
+    if "candidate_check_prefix" in task:
+        task["candidate_check_prefix"] = [move(word) for word in task["candidate_check_prefix"]]
+    return task
+
+
+def portable_task(task):
+    # Paths relative to the experiment folder, as new files record them.
+    return relocate_task(task, Path("tasks") / task["id"]) if "base" in task and "id" in task else task
+
+
+def local_task(task, storage):
+    # Absolute paths for running; old absolute paths that still exist are kept unchanged.
+    if "base" not in task or "id" not in task or Path(task["base"]).is_absolute() and Path(task["base"]).exists():
+        return task
+    return relocate_task(task, Path(storage) / "tasks" / task["id"])
+
+
+def settings_task(directory):
+    # The task of a results/<id> or simplification/<id> folder, with paths for this machine.
+    settings = read_json(directory / "settings.json")
+    source = recorded_path(settings["source"]) if "source" in settings else directory
+    return local_task(settings["task"], source.parent.parent)
+
+
+def load_batch(path):
+    # A batch's candidates are always run-NN/generated next to batch.json.
+    runs = read_json(path)["runs"]
+    return [dict(run, generated=str(path.parent / f"run-{number:02d}" / "generated"))
+            for number, run in enumerate(runs)]
+
+
 COPY_IGNORES = (".git", ".codex", "__pycache__", ".pytest_cache")
 
 
@@ -325,11 +388,15 @@ def claude_response(events):
 
 def resume_settings(output, settings):
     path = output / "settings.json"
+    # New settings record task paths relative to the experiment folder.
+    written = dict(settings, task=portable_task(settings["task"])) if "task" in settings else settings
     if path.exists():
         previous = read_json(path)
+        # Compare paths relative to the task folder, so a copied experiment still resumes.
         old = dict(previous, backend=previous.get("backend", "codex"),
-                   effort=previous.get("effort", "high"))
-        current = dict(settings)
+                   effort=previous.get("effort", "high"), **({"task": portable_task(previous["task"])}
+                                                            if "task" in previous else {}))
+        current = dict(written)
         old.pop("effort", None)
         current.pop("effort", None)
         # Explicitly migrate known runners; unknown source changes still require a new run.
@@ -355,6 +422,7 @@ def resume_settings(output, settings):
             "fcca9c114a5a59658d9ce08ee25bd77e7f362027ce9e000c38575989dfb8801c",
             "c3c6e19becb9500522df04658432aad3abab84244c80bf02efcc1a48233f263a",
             "71d0f58eef5bb673726dfe17df8f3ccd202780b14694252ef39d9e086e13bc3a",
+            "659b8adbf302b69a88522186d36c7558d67ed106e8bb5812b9f8db308ed786d5",
         }
         if old.get("runner_sha256") in compatible:
             if "judge_effort" in current:
@@ -362,10 +430,13 @@ def resume_settings(output, settings):
             old["runner_sha256"] = current.get("runner_sha256")
         if old != current:
             raise ValueError("Experiment settings changed. Use a new output directory.")
-        if previous != settings:
+        # Settings saved with absolute paths keep them, so their files change only as before.
+        if "task" in previous and Path(previous["task"].get("base", "")).is_absolute():
+            written = settings
+        if previous != written:
             history = output / "settings-history.json"
             write_json(history, (read_json(history) if history.exists() else []) + [previous])
-    write_json(path, settings)
+    write_json(path, written)
 
 
 def request_without_effort(request):
@@ -612,7 +683,8 @@ def evaluate_batch(task, output, agent, specification, runs=10):
         generated = run / "generated"
         if (run / "verdict.json").exists():
             retire_workspace(task, run)
-            return read_json(run / "verdict.json")
+            verdict = read_json(run / "verdict.json")
+            return dict(verdict, generated=str(generated)) if "generated" in verdict else verdict
         if not (run / "generation/complete.json").exists():
             if generated.exists():
                 try:
@@ -667,14 +739,17 @@ def evaluate_batch(task, output, agent, specification, runs=10):
         verdict["generated"] = str(generated)
         # The editor needs actual failures and API facts, not only the judge's paraphrase.
         verdict["checks"] = checks
-        write_json(run / "verdict.json", verdict)
+        # The file records the candidate's path relative to it.
+        write_json(run / "verdict.json", dict(verdict, generated="generated"))
         retire_workspace(task, run)
         return verdict
 
     # Each lane has its own repository and logs; only the frozen reference is shared read-only.
     with ThreadPoolExecutor(max_workers=min(getattr(agent, "parallel_runs", 10), runs)) as pool:
         results = list(pool.map(evaluate_run, range(runs)))
-    write_json(output / "batch.json", {"passes": sum(r["passed"] for r in results), "runs": results})
+    write_json(output / "batch.json", {"passes": sum(r["passed"] for r in results),
+                                       "runs": [dict(r, generated=f"run-{n:02d}/generated")
+                                                for n, r in enumerate(results)]})
     return results
 
 
@@ -825,10 +900,10 @@ def prepare_task(task, storage):
         prepared = read_json(directory / "prepared.json")
         if prepared["manifest"] != task:
             raise ValueError("Task manifest changed. Use a new output directory.")
-        prepared["task"]["generator_python"] = prepare_generator_environment(
-            task, directory, Path(prepared["task"]["base"]))
-        write_json(directory / "prepared.json", prepared)
-        return prepared["task"]
+        local = local_task(prepared["task"], storage)
+        local["generator_python"] = prepare_generator_environment(task, directory, Path(local["base"]))
+        write_json(directory / "prepared.json", dict(prepared, task=portable_task(local)))
+        return local
     directory.mkdir(parents=True, exist_ok=True)
     metadata = directory / "pull.json"
     if not metadata.exists():
@@ -885,7 +960,7 @@ def prepare_task(task, storage):
                 "requires_test_changes": task.get("requires_test_changes", False),
                 "requirements": {key: task.get("requirements", {}).get(key, description)
                                  for key, description in CRITERIA.items()}}
-    write_json(directory / "prepared.json", {"manifest": task, "task": prepared})
+    write_json(directory / "prepared.json", {"manifest": task, "task": portable_task(prepared)})
     return prepared
 
 
@@ -898,11 +973,11 @@ def make_audit(storage):
     cases, key = [], []
     for number, path in enumerate(sample):
         verdict = read_json(path)
-        task = read_json(storage / "results" / path.relative_to(storage / "results").parts[0] / "settings.json")["task"]
-        cases.append({"id": number, "patch": str(path.parent / "patch.diff"),
-                      "generated": verdict["generated"], "original": task["base"],
-                      "reference": task["reference"], "requirements": task["requirements"],
-                      "checks": str(path.parent / "checks.json"),
+        task = settings_task(storage / "results" / path.relative_to(storage / "results").parts[0])
+        cases.append({"id": number, "patch": record_path(path.parent / "patch.diff"),
+                      "generated": record_path(path.parent / "generated"), "original": record_path(task["base"]),
+                      "reference": record_path(task["reference"]), "requirements": task["requirements"],
+                      "checks": record_path(path.parent / "checks.json"),
                       "manual": {c: None for c in CRITERIA}})
         key.append({"id": number, "judge": verdict["criteria"]})
     write_json(destination / "sample.json", cases)

@@ -60,7 +60,7 @@ The driver updates `.experiments/batch-100/evaluation.html` after each completed
 python3 view_experiment.py .experiments/batch-100 .experiments/restart-simplification-2026-11-07 \
   --simplification .experiments/batch-100/simplification \
   --simplification .experiments/simplification-three-candidates-2026-11-07 \
-  --output /Users/andrew/orca/workspaces/llm-improvement-loop/humpback/.experiments/evaluation.html
+  --output .experiments/evaluation.html
 ```
 
 ## Section-removal analysis

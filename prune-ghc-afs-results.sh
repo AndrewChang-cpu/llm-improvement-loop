@@ -10,7 +10,8 @@ set -euo pipefail
 HOST=${HOST:-aechang@ghc40.ghc.andrew.cmu.edu}
 REPO=${REPO:-$(cd "$(dirname "$0")" && pwd)}
 AFS=${AFS:-private/llm}   # relative to the GHC home
-AUTH='[ -f /tmp/aechang-krb5cc ] && export KRB5CCNAME=FILE:/tmp/aechang-krb5cc; aklog;'
+CC=/tmp/$([[ $HOST == *@* ]] && echo "${HOST%%@*}" || echo "$USER")-krb5cc   # copied there by ghc-recover.sh
+AUTH="[ -f $CC ] && export KRB5CCNAME=FILE:$CC; aklog;"
 finished=$(ssh -o BatchMode=yes "$HOST" "$AUTH cd $AFS/results && python3 -c '
 import glob, json, os
 for status in glob.glob(\"*/queue-status.json\"):

@@ -4,16 +4,22 @@
 # It restores the repo, results and Claude config from AFS, reinstalls the tools, and starts tmux
 # sessions renew (Kerberos/AFS), backup (ghc-backup.sh), queue (ghc-run.sh claude) and qwen
 # (ghc-run.sh qwen); the last two are skipped while claude is not logged in. Prompts only when run by hand without a Kerberos ticket. Test overrides: BASE, AFS, GHC_TMUX (tmux socket), and
-# DRY_RUN=1 (no tool installs, no Ollama, and a queue session that runs nothing).
+# DRY_RUN=1 (no tool installs, no Ollama, and a queue session that runs nothing). Machine settings:
+# KRB_PRINCIPAL (default $USER@ANDREW.CMU.EDU), KRB5_FILE (the ticket ghc-recover.sh copies here),
+# REPO_URL (clone source when AFS has no mirror).
 (return 0 2>/dev/null) && { echo "Run this with bash, not source." >&2; return 1; }
 set -euo pipefail
-BASE=${BASE:-/tmp/aechang}
+USER=${USER:-$(id -un)}
+BASE=${BASE:-/tmp/$USER}
 AFS=${AFS:-$HOME/private/llm}
+KRB_PRINCIPAL=${KRB_PRINCIPAL:-$USER@ANDREW.CMU.EDU}
+KRB5_FILE=${KRB5_FILE:-/tmp/$USER-krb5cc}
+REPO_URL=${REPO_URL:-https://github.com/AndrewChang-cpu/llm-improvement-loop.git}
 DRY_RUN=${DRY_RUN:-0}
 REPO=$BASE/llm-improvement-loop
 tm() { tmux -L "${GHC_TMUX:-default}" "$@"; }
 
-klist -s || { [ -t 0 ] && kinit aechang@ANDREW.CMU.EDU; } || { echo "No Kerberos ticket; run kinit" >&2; exit 1; }
+klist -s || { [ -t 0 ] && kinit "$KRB_PRINCIPAL"; } || { echo "No Kerberos ticket; run kinit" >&2; exit 1; }
 aklog
 
 mkdir -p "$BASE/bin" "$BASE/ollama" "$BASE/.cache"
@@ -32,7 +38,7 @@ EOF
 
 # Restore from AFS. --ignore-existing keeps newer /tmp files when rerun.
 [ -d "$REPO/.git" ] || git clone -q "$( [ -d "$AFS/repo.git" ] && echo "$AFS/repo.git" \
-    || echo https://github.com/AndrewChang-cpu/llm-improvement-loop.git)" "$REPO"
+    || echo "$REPO_URL")" "$REPO"
 [ -d "$AFS/results" ] && rsync -a --ignore-existing "$AFS/results/" "$REPO/.experiments/"
 [ -d "$AFS/claude-config" ] && rsync -a --ignore-existing "$AFS/claude-config/" "$CLAUDE_CONFIG_DIR/"
 
@@ -62,11 +68,11 @@ claude_error=
 # Tickets are renewable for 30 days; renewing hourly keeps AFS readable. Try the login ticket,
 # then the one ghc-recover.sh copies from the Mac.
 tm has-session -t renew 2>/dev/null || tm new-session -d -s renew "while true; do { date; { kinit -R && aklog; } \
-    || { export KRB5CCNAME=FILE:/tmp/aechang-krb5cc; kinit -R && aklog; } && echo renewed; } >> $BASE/renew.log 2>&1; sleep 3600; done"
+    || { export KRB5CCNAME=FILE:$KRB5_FILE; kinit -R && aklog; } && echo renewed; } >> $BASE/renew.log 2>&1; sleep 3600; done"
 tm has-session -t backup 2>/dev/null || tm new-session -d -s backup \
     "while true; do BASE=$BASE AFS=$AFS $REPO/ghc-backup.sh >> $BASE/backup.log 2>&1; sleep 900; done"
 track() { [ "$DRY_RUN" = 1 ] && echo "echo 'DRY_RUN: $1 not started'; exec bash" \
-    || echo "$REPO/ghc-run.sh $1 2>&1 | tee -a $BASE/$2; exec bash"; }
+    || echo "BASE=$BASE $REPO/ghc-run.sh $1 2>&1 | tee -a $BASE/$2; exec bash"; }
 if [ -n "$claude_error" ]; then
     echo "WARNING: claude is not logged in ($(head -1 <<< "$claude_error")); queue and qwen not started." \
         "Run '. $BASE/env.sh && claude' and log in, then rerun this script; backup saves the login to AFS." >&2

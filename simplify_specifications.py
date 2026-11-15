@@ -32,7 +32,7 @@ def simplify(value, output, executable=None, effort=None):
     specification = specification.strip()
     categories = runner.categories_from_docs()
     settings = {
-        "source": str(source), "source_settings_sha256": file_hash(source / "settings.json"),
+        "source": runner.record_path(source), "source_settings_sha256": file_hash(source / "settings.json"),
         "source_specification_sha256": hashlib.sha256(specification.encode()).hexdigest(),
         "model": original_settings["model"], "codex": executable,
         "backend": original_settings.get("backend", "codex"), "effort": effort or original_settings.get("effort", "low"),
@@ -49,6 +49,9 @@ def simplify(value, output, executable=None, effort=None):
                      if key in original_settings})
     output.mkdir(parents=True, exist_ok=True)
     saved = runner.read_json(output / "settings.json") if (output / "settings.json").exists() else None
+    # Older settings recorded the source's absolute path, maybe on another machine; keep it.
+    if saved and runner.recorded_path(saved["source"]).resolve() == source.resolve():
+        settings["source"] = saved["source"]
     # The per-experiment locking change did not alter simplification behavior.
     if saved and saved.get("simplifier_sha256") in {"3a279283849a3c0cc8766e10f4ee11db8f693bd4f91d3039abcebe97f2031667",
                                                    "6baee10bc354aa65fb1ec6a87e50be15aa04443036621ae9592cbb1135224566",
@@ -62,7 +65,8 @@ def simplify(value, output, executable=None, effort=None):
                                                    "6fbe29f02599bb4d7221616a9d32666e668693b8aaed960a6fe85c176096afc5",
                                                    "860666c2d19d48560d75d03e4e8b9b3d144c863d59f4196707dc10868f504d20",
                                                    "b4edb20e7a25ed233473f1af8ce00c23480f05b2911bc992891612e0c653cda8",
-                                                   "949ee36de8247e42d6e76936892e56e0e49a4c80d90f72aac5a07bc0cbbf69b2"}:
+                                                   "949ee36de8247e42d6e76936892e56e0e49a4c80d90f72aac5a07bc0cbbf69b2",
+                                                   "f8bbf390d9d6767a145bc809b16423604832a50a4881f5e642cdc884702c0d77"}:
         saved["simplifier_sha256"] = settings["simplifier_sha256"]
     # Deleting judged repository copies did not alter results. Resuming the source experiment
     # rewrites its settings with only the new runner hash, so accept that source change too.
@@ -78,7 +82,8 @@ def simplify(value, output, executable=None, effort=None):
                           "71d0f58eef5bb673726dfe17df8f3ccd202780b14694252ef39d9e086e13bc3a",
                           "50c587c8ca7df3ee323db2df6f6fac9898a3743679ba0f4237163490ab4ebe53",
                           "0674ebbdedc0534abb792e86bc4494247b663363e35cbe6be188eee983c7244e",
-                          "07c810cb0fa245b71baccfbf275d8e7d48f972378ebe6e0f1435e30d41894722"}
+                          "07c810cb0fa245b71baccfbf275d8e7d48f972378ebe6e0f1435e30d41894722",
+                          "659b8adbf302b69a88522186d36c7558d67ed106e8bb5812b9f8db308ed786d5"}
     if saved and saved.get("runner_sha256") in compatible_runners:
         source_settings = runner.read_json(source / "settings.json")
         if any(hashlib.sha256((json.dumps(dict(source_settings, runner_sha256=old), indent=2) + "\n").encode()).hexdigest()
@@ -92,7 +97,7 @@ def simplify(value, output, executable=None, effort=None):
         print(f"Skipping completed simplification: {directory.name}", flush=True)
         return runner.read_json(output / "result.json")
 
-    task = settings["task"]
+    task = runner.local_task(settings["task"], source.parent.parent)
     judge = (runner.Codex(settings["judge_model"], backend=settings["judge_backend"])
              if "judge_backend" in settings else None)
     agent = runner.Codex(settings["model"], executable, settings["backend"], settings["effort"], judge)
@@ -104,10 +109,10 @@ def simplify(value, output, executable=None, effort=None):
         # Reuse the qualifying batch instead of reintroducing a confirmation requirement.
         revision = runner.read_json(source / "result.json")["revision"]
         batch = source / f"revision-{revision:02d}" / "batch.json"
-        verdicts = runner.read_json(batch)["runs"]
+        verdicts = runner.load_batch(batch)
         if not runner.converged([v["passed"] for v in verdicts]):
             raise ValueError("Source specification did not pass its recorded 10/10 batch")
-        runner.write_json(output / "starting-batch-source.json", {"batch": str(batch)})
+        runner.write_json(output / "starting-batch-source.json", {"batch": runner.record_path(batch)})
         print(f"{directory.name}: using qualifying batch ({initial_words} words, 10/10)", flush=True)
     else:
         print(f"{directory.name}: checking starting specification ({initial_words} words)", flush=True)
@@ -203,11 +208,11 @@ def simplify(value, output, executable=None, effort=None):
                               "candidate_words": candidate_words,
                               "length_passed": minimum <= candidate_words <= target,
                               "qualified": False, "accepted": False,
-                              "artifact_directory": str(destination)})
+                              "artifact_directory": runner.record_path(destination)})
 
         evaluated = {}
         for decision in proposals:
-            destination = Path(decision["artifact_directory"])
+            destination = runner.recorded_path(decision["artifact_directory"])
             if decision["length_passed"]:
                 candidate = (destination / "candidate-specification.md").read_text().strip()
                 print(f"{directory.name}: round {round_number}, candidate {decision['candidate']}, "
@@ -223,13 +228,13 @@ def simplify(value, output, executable=None, effort=None):
                         "candidates": proposals, "selected_candidate": selected["candidate"] if selected else None}
         if selected:
             selected["accepted"] = True
-            runner.write_json(Path(selected["artifact_directory"]) / "decision.json", selected)
+            runner.write_json(runner.recorded_path(selected["artifact_directory"]) / "decision.json", selected)
         runner.write_json(round_directory / "round.json", round_result)
         if not selected:
             return finish("no_qualifying_candidate", round_result)
         # Only the shortest qualifying candidate replaces the incumbent.
         accepted.append(round_result)
-        specification = (Path(selected["artifact_directory"]) / "candidate-specification.md").read_text().strip()
+        specification = (runner.recorded_path(selected["artifact_directory"]) / "candidate-specification.md").read_text().strip()
         verdicts = evaluated[selected["candidate"]]
         (output / "simplified-specification.md").write_text(specification + "\n")
         print(f"{directory.name}: accepted round {round_number}, candidate {selected['candidate']} "

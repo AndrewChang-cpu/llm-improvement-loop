@@ -23,7 +23,7 @@ def judged_runs(root):
         if "settings.json" in files:
             settings = runner.read_json(path / "settings.json")
             if "task" in settings:
-                tasks[path] = settings["task"]
+                tasks[path] = runner.settings_task(path)
         if path.name.startswith("run-") and "verdict.json" in files and "patch.diff" in files:
             owner = next(p for p in path.parents if p in tasks)
             yield tasks[owner], path

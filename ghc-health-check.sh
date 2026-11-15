@@ -3,6 +3,7 @@
 # The Claude track is a problem when it stops unfinished; the Qwen side track only while it runs
 # (a finished or stopped Qwen track is reported but never flagged).
 cd "$(dirname "$0")" || exit 1
+BASE=${BASE:-/tmp/${USER:-$(id -un)}}   # ghc-setup.sh's folder, which holds the track logs
 problems=()
 # Only the current attempt in a log counts; earlier attempts' errors were already handled.
 log_error() {
@@ -29,7 +30,7 @@ for result in .experiments/*/results/*/result.json; do
     [ -f "$result" ] && echo "result: $result $(python3 -c "import json;print(json.load(open('$result'))['status'])")"
 done
 
-CLOG=/tmp/aechang/ghc-run.log
+CLOG=$BASE/ghc-run.log
 if pgrep -f "[c]laude_low_queue.py" >/dev/null; then
     claude=running
     log_error claude "$CLOG"
@@ -42,7 +43,7 @@ elif grep -q "claude done" "$CLOG" 2>/dev/null; then claude=done
 else claude=stopped; problems+=("claude: queue not running and not finished (see $CLOG)")
 fi
 
-QLOG=/tmp/aechang/ghc-qwen.log
+QLOG=$BASE/ghc-qwen.log
 if pgrep -f "[r]un_experiment.py run --backend ollama" >/dev/null; then
     qwen=running
     tmux has-session -t ollama 2>/dev/null || problems+=("qwen: ollama tmux session is gone")

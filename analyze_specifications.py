@@ -107,12 +107,12 @@ def load_experiment(value):
     if settings.get("confirmation", True):
         batches.append(revision / "confirmation/batch.json")
     for batch in batches:
-        saved.extend(runner.read_json(batch)["runs"])
+        saved.extend(runner.load_batch(batch))
     for verdict in saved:
         if runner.validate_verdict(verdict) != verdict["passed"]:
             raise ValueError("Saved verdict is inconsistent")
     # Reuse the original environments and snapshots; never expose reference paths to generation.
-    task = settings["task"]
+    task = runner.local_task(settings["task"], source.parent.parent)
     for key in ("base", "reference", "generator_python"):
         if not Path(task[key]).exists():
             raise ValueError(f"Missing prepared input: {task[key]}")
@@ -129,13 +129,13 @@ def analyze(value, database, shared_file, artifacts, repetitions, executable):
     spec_hash = fingerprint(specification.encode())
     existing = database["experiments"].get(name)
     if existing:
-        if existing["spec_hash"] != spec_hash or existing["settings"] != settings or existing["source_directory"] != str(directory):
+        if existing["spec_hash"] != spec_hash or existing["settings"] != settings or runner.recorded_path(existing["source_directory"]) != directory:
             raise ValueError(f"Analysis inputs changed for {name}; use a different --output file")
         if existing["status"] == "complete":
             print(f"Skipping completed analysis: {name}", flush=True)
             return
     variants = section_variants(specification, {s for values in runner.categories_from_docs().values() for s in values})
-    record = existing or {"task_id": original_settings["task"]["id"], "source_directory": str(directory),
+    record = existing or {"task_id": original_settings["task"]["id"], "source_directory": runner.record_path(directory),
                           "spec_hash": spec_hash, "settings": settings, "sections": list(variants),
                           "full_spec_results": full_results, "ablations": {}, "status": "in_progress"}
     database["experiments"][name] = record
@@ -151,11 +151,11 @@ def analyze(value, database, shared_file, artifacts, repetitions, executable):
         output.mkdir(parents=True, exist_ok=True)
         (output / "specification.md").write_text(variants[section])
         print(f"{name}: removing {section}", flush=True)
-        verdicts = runner.evaluate_batch(original_settings["task"], output,
+        verdicts = runner.evaluate_batch(runner.local_task(original_settings["task"], source.parent.parent), output,
                                         runner.Codex(settings["model"], executable, original_settings.get("backend", "codex")), variants[section],
                                         runs=repetitions)
         summary = counts(verdicts)
-        return {"runs": [{"index": i, "artifact_directory": str(output / f"run-{i:02d}"),
+        return {"runs": [{"index": i, "artifact_directory": runner.record_path(output / f"run-{i:02d}"),
                           "passed_all": v["passed"],
                           "criteria": {c["criterion"]: {k: c[k] for k in ("passed", "evidence", "deficiency")}
                                        for c in v["criteria"]}} for i, v in enumerate(verdicts)],
