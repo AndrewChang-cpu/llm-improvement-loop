@@ -430,6 +430,7 @@ def resume_settings(output, settings):
             "71d0f58eef5bb673726dfe17df8f3ccd202780b14694252ef39d9e086e13bc3a",
             "659b8adbf302b69a88522186d36c7558d67ed106e8bb5812b9f8db308ed786d5",
             "7260356a613b4425b8a0ebaeeec6a15a45ee13fd2ee29d554c3d4b7ec02c1a55",
+            "e0c2f5f51a7834a0168d99b95234fe37fd73add9fb07201fb455fd10d38faf75",
         }
         if old.get("runner_sha256") in compatible:
             if "judge_effort" in current:
@@ -706,6 +707,9 @@ def evaluate_batch(task, output, agent, specification, runs=10):
                         number += 1
                     (archive / f"attempt-{number:03d}.patch.diff").write_text(partial)
             fresh_workspace(Path(task["base"]), generated)
+        elif not (generated / ".git").exists() and (run / "patch.diff").exists():
+            # A reboot can delete an unjudged workspace; its recorded patch rebuilds it.
+            rebuild_workspace(task, run, generated)
         elif not (generated / ".git").exists():
             # Without its workspace, git would run in an enclosing repository.
             raise RuntimeError(f"Generated workspace missing for completed generation: {generated}")
