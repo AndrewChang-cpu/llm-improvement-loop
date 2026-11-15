@@ -4,6 +4,8 @@
 # (a finished or stopped Qwen track is reported but never flagged).
 cd "$(dirname "$0")" || exit 1
 BASE=${BASE:-/tmp/${USER:-$(id -un)}}   # ghc-setup.sh's folder, which holds the track logs
+# The Windows watcher points these at its own queue (windows-watch.sh).
+CLOG=${CLOG:-$BASE/ghc-run.log} QUEUE_OUTPUT=${QUEUE_OUTPUT:-.experiments/manual-claude-low-ghc}
 problems=()
 # Only the current attempt in a log counts; earlier attempts' errors were already handled.
 log_error() {
@@ -30,13 +32,12 @@ for result in .experiments/*/results/*/result.json; do
     [ -f "$result" ] && echo "result: $result $(python3 -c "import json;print(json.load(open('$result'))['status'])")"
 done
 
-CLOG=$BASE/ghc-run.log
 if pgrep -f "[c]laude_low_queue.py" >/dev/null; then
     claude=running
     log_error claude "$CLOG"
-    stuck claude .experiments/manual-claude-low-ghc "$CLOG"
-    stuck_features claude .experiments/manual-claude-low-ghc
-    status=.experiments/manual-claude-low-ghc/queue-status.json
+    stuck claude $QUEUE_OUTPUT "$CLOG"
+    stuck_features claude $QUEUE_OUTPUT
+    status=$QUEUE_OUTPUT/queue-status.json
     failed=$([ -f "$status" ] && python3 -c "import json;print(' '.join(k for k,v in json.load(open('$status')).items() if v['state']=='failed'))")
     [ -n "$failed" ] && problems+=("claude: failed in $status: $failed")
 elif grep -q "claude done" "$CLOG" 2>/dev/null; then claude=done

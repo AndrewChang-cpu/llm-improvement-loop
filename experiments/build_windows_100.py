@@ -1,39 +1,50 @@
 #!/usr/bin/env python3
 """Select 100 FEA-Bench PRs not in batch-100 and write their runner manifest and environment specs.
 
-Selection: every remaining instance of the eight shortlisted repositories (84), plus a seeded random
-sample of instances from other repositories that SWE-bench gives its default environment
-(Python 3.9, `pip install -e .`, `pytest -rA`). Environments reuse batch-100's validated install
-lists for the same repository and version (the nearest version when none exists).
+Selection: a seeded uniform random sample of all FEA-Bench instances outside batch-100 and the two
+pilots. Repositories batch-100 covers reuse its validated install lists for the same version (the
+nearest version when none exists); others get SWE-bench's environment for the repository and version
+(its default, Python 3.9 with `pip install -e .` and `pytest -rA`, when it has none), converted to pip.
 Output: experiments/windows-100/{selection.json, runner-manifest.json, environment-specs.json}.
 """
 import json
 from pathlib import Path
 import random
 import re
+import runpy
+import shlex
 
 ROOT = Path(__file__).resolve().parents[1]
 BATCH = ROOT / ".experiments/batch-100"
 OUTPUT = ROOT / "experiments/windows-100"
-SEED = 20261114
+SEED = 20261115
 PILOTS = {"mwaskom__seaborn-3063", "sphinx-doc__sphinx-11989"}
-SHORTLIST = {"scikit-learn/scikit-learn", "matplotlib/matplotlib", "boto/boto3", "scrapy/scrapy",
-             "django/django", "mwaskom/seaborn", "pallets/flask", "sphinx-doc/sphinx"}
-# The SWE-bench constants FEA-Bench patches; repositories missing from its map use the default.
-SPECIFIED = {"astropy/astropy", "dbt-labs/dbt-core", "django/django", "matplotlib/matplotlib",
-             "marshmallow-code/marshmallow", "mwaskom/seaborn", "pallets/flask", "psf/requests",
-             "pvlib/pvlib-python", "pydata/xarray", "pydicom/pydicom", "pylint-dev/astroid",
-             "pylint-dev/pylint", "pytest-dev/pytest", "pyvista/pyvista", "scikit-learn/scikit-learn",
-             "sphinx-doc/sphinx", "sqlfluff/sqlfluff", "swe-bench/humaneval", "sympy/sympy",
-             "huggingface/datasets", "huggingface/accelerate", "encode/django-rest-framework",
-             "twisted/twisted", "Cog-Creators/Red-DiscordBot", "conan-io/conan", "pytorch/vision",
-             "gradio-app/gradio", "tensorflow/datasets", "tortoise/tortoise-orm"}
-DEFAULT = {"python": "3.9", "install": "pip install -e .", "pip_packages": ["pytest"], "test_cmd": "pytest -rA"}
+SWEBENCH = runpy.run_path(str(BATCH / "source/swebench-python-constants.py"))
 
 
 def number(version):
     major, minor = (version or "0.0").split(".")[:2]
     return int(major) + int(minor) / 100
+
+
+def swebench_environment(row):
+    """SWE-bench's spec for the row's repository and version, as pip install lists and a check prefix."""
+    specs = SWEBENCH["MAP_REPO_VERSION_TO_SPECS_PY"]
+    by_version = specs.get(row["repo"], specs["default"])
+    spec = by_version[row["version"]] if row["version"] in by_version else by_version[sorted(
+        (v for v in by_version if v not in (None, "default")), key=lambda v: abs(number(v) - number(row["version"])))[0]]
+    packages = spec.get("packages", "")
+    first = shlex.split(packages) if packages not in ("", "requirements.txt", "environment.yml") else []
+    install = [first + [shlex.split(p)[0] for p in spec.get("pip_packages", [])]]
+    if packages == "requirements.txt":
+        install.append(["-r", SWEBENCH["MAP_REPO_TO_REQS_PATHS"][row["repo"]][0]])
+    for step in spec["install"].split(";"):
+        words = shlex.split(step)
+        install.append(words[words.index("install") + 1:])
+    test = shlex.split(spec["test_cmd"])
+    # sympy's bin/test needs test files, which FEA-Bench does not record; run its named tests with pytest.
+    prefix = ["{python}", "-m"] + test if test[0] == "pytest" else ["{python}", "-m", "pytest", "-rA"]
+    return [step for step in install if step], prefix, spec
 
 
 def django_label(test):
@@ -58,16 +69,14 @@ def main():
     templates = {}
     for task in manifest:
         templates.setdefault((task["repo"], specs[task["id"]]["version"]), task)
-    pool = [row for row in rows if row["instance_id"] not in used]
-    shortlisted = [row for row in pool if row["repo"] in SHORTLIST]
-    others = sorted((row for row in pool if row["repo"] not in SPECIFIED | SHORTLIST), key=lambda row: row["instance_id"])
-    chosen = {row["instance_id"] for row in shortlisted + random.Random(SEED).sample(others, 100 - len(shortlisted))}
+    pool = sorted((row for row in rows if row["instance_id"] not in used), key=lambda row: row["instance_id"])
+    chosen = {row["instance_id"] for row in random.Random(SEED).sample(pool, 100)}
     selected = [row for row in rows if row["instance_id"] in chosen]   # official dataset order
 
     tasks, environments = [], []
     for row in selected:
         tests = list(dict.fromkeys(row["FAIL_TO_PASS"] + row["PASS_TO_PASS"]))
-        if row["repo"] in SHORTLIST:
+        if any(repo == row["repo"] for repo, _ in templates):
             versions = [version for repo, version in templates if repo == row["repo"]]
             exact = row["version"] in versions
             version = row["version"] if exact else min(versions, key=lambda v: abs(number(v) - number(row["version"])))
@@ -76,9 +85,16 @@ def main():
             install, python = template["install"], template["python_version"]
             note = None if exact else f"install list of version {version} (no batch-100 task has {row['version']})"
         else:
-            prefix, official = ["{python}", "-m", "pytest", "-rA"], DEFAULT
-            install, python, note = [["pytest"], ["-e", "."]], "3.9", "SWE-bench default environment"
-        labels = [django_label(t) if row["repo"] == "django/django" else pytest_id(t) for t in tests]
+            install, prefix, official = swebench_environment(row)
+            python = official["python"]
+            note = "SWE-bench environment converted to pip" + ("; pre_install steps skipped" if official.get("pre_install") else "")
+        if row["repo"] == "django/django":
+            labels = [django_label(t) for t in tests]
+        elif row["repo"] == "sympy/sympy":
+            labels = []
+        else:
+            # FEA-Bench lists a few malformed entries (e.g. "[") among pytest IDs.
+            labels = [pytest_id(t) for t in tests if "::" in t]
         # FEA-Bench names some Django tests by their docstring, which runtests.py cannot select.
         dropped = [label for label in labels if " " in label]
         if dropped:
@@ -86,11 +102,14 @@ def main():
             note = "; ".join(filter(None, [note, f"{len(dropped)} docstring-named tests not run"]))
         task = {"id": row["instance_id"], "repo": row["repo"], "pr": row["pull_number"],
                 "base_commit": row["base_commit"], "install": install,
-                "checks": [prefix + list(dict.fromkeys(labels))], "test_files": [],
+                "checks": [prefix + (["-k", " or ".join(tests), "sympy"] if row["repo"] == "sympy/sympy"
+                                     else list(dict.fromkeys(labels)))], "test_files": [],
                 "python_version": python, "official_test_command": official["test_cmd"],
                 "official_environment": official, "environment_setup_commit": row["environment_setup_commit"],
                 "feabench_tests": {"FAIL_TO_PASS": row["FAIL_TO_PASS"], "PASS_TO_PASS": row["PASS_TO_PASS"]},
                 "candidate_check_prefix": prefix, "requirements": manifest[0]["requirements"]}
+        if row["repo"] == "sympy/sympy":
+            note += "; tests selected by name with pytest -k (substring match) instead of bin/test"
         if note:
             task["environment_note"] = note
         tasks.append(task)
@@ -103,7 +122,7 @@ def main():
          "excluded": "batch-100 and the two pilots", "ids": [row["instance_id"] for row in selected]}, indent=2) + "\n")
     (OUTPUT / "runner-manifest.json").write_text(json.dumps(tasks, indent=2) + "\n")
     (OUTPUT / "environment-specs.json").write_text(json.dumps(environments, indent=2) + "\n")
-    print(f"{len(tasks)} tasks ({len(shortlisted)} shortlisted) written to {OUTPUT.relative_to(ROOT)}")
+    print(f"{len(tasks)} tasks written to {OUTPUT.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":
