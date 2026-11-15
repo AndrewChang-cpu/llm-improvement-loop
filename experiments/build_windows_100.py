@@ -79,6 +79,11 @@ def main():
             prefix, official = ["{python}", "-m", "pytest", "-rA"], DEFAULT
             install, python, note = [["pytest"], ["-e", "."]], "3.9", "SWE-bench default environment"
         labels = [django_label(t) if row["repo"] == "django/django" else pytest_id(t) for t in tests]
+        # FEA-Bench names some Django tests by their docstring, which runtests.py cannot select.
+        dropped = [label for label in labels if " " in label]
+        if dropped:
+            labels = [label for label in labels if " " not in label]
+            note = "; ".join(filter(None, [note, f"{len(dropped)} docstring-named tests not run"]))
         task = {"id": row["instance_id"], "repo": row["repo"], "pr": row["pull_number"],
                 "base_commit": row["base_commit"], "install": install,
                 "checks": [prefix + list(dict.fromkeys(labels))], "test_files": [],
