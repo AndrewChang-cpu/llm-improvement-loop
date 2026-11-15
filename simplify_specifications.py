@@ -77,7 +77,8 @@ def simplify(value, output, executable=None, effort=None):
                           "c3c6e19becb9500522df04658432aad3abab84244c80bf02efcc1a48233f263a",
                           "71d0f58eef5bb673726dfe17df8f3ccd202780b14694252ef39d9e086e13bc3a",
                           "50c587c8ca7df3ee323db2df6f6fac9898a3743679ba0f4237163490ab4ebe53",
-                          "0674ebbdedc0534abb792e86bc4494247b663363e35cbe6be188eee983c7244e"}
+                          "0674ebbdedc0534abb792e86bc4494247b663363e35cbe6be188eee983c7244e",
+                          "07c810cb0fa245b71baccfbf275d8e7d48f972378ebe6e0f1435e30d41894722"}
     if saved and saved.get("runner_sha256") in compatible_runners:
         source_settings = runner.read_json(source / "settings.json")
         if any(hashlib.sha256((json.dumps(dict(source_settings, runner_sha256=old), indent=2) + "\n").encode()).hexdigest()

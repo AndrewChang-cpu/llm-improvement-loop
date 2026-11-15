@@ -23,7 +23,7 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parent
 # Normal evaluation commands finish in seconds to a few minutes.
-CHECK_TIMEOUT = 1800
+CHECK_TIMEOUT = 600
 CRITERIA = {
     "patch_and_checks": "Patch applies and the recorded executable checks pass.",
     "file_location": "Code is placed in the required existing module or component.",
@@ -334,6 +334,7 @@ def resume_settings(output, settings):
         current.pop("effort", None)
         # Explicitly migrate known runners; unknown source changes still require a new run.
         compatible = {
+            "07c810cb0fa245b71baccfbf275d8e7d48f972378ebe6e0f1435e30d41894722",
             "0674ebbdedc0534abb792e86bc4494247b663363e35cbe6be188eee983c7244e",
             "50c587c8ca7df3ee323db2df6f6fac9898a3743679ba0f4237163490ab4ebe53",
             "8498de65e6d74c59b21cb8ee7ea4aa71e62609c56cd03821492dfe4caa1198bb",
