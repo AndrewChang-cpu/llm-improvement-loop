@@ -11,8 +11,13 @@ REMOTE=${REMOTE:-/tmp/$([[ $HOST == *@* ]] && echo "${HOST%%@*}" || echo "$USER"
 failed=()
 for path in $(ssh -o BatchMode=yes "$HOST" "cd $REMOTE && git ls-files --others --directory --exclude-standard .experiments"); do
     mkdir -p "$(dirname "$REPO/$path")"
+    # rebuild-check/, materializing/, candidate-test-tmp/ and *.tmp are runner temp files that can
+    # vanish mid-copy; rsync exit 24 (files vanished) still counts as a good pull.
+    status=0
     rsync -a -e "ssh -o BatchMode=yes" --exclude 'tasks/' --exclude 'generated/' --exclude 'evaluation/' \
-        "$HOST:$REMOTE/$path" "$REPO/$path" || failed+=("$path")
+        --exclude 'rebuild-check/' --exclude 'materializing/' --exclude 'candidate-test-tmp/' --exclude '*.tmp' \
+        "$HOST:$REMOTE/$path" "$REPO/$path" || status=$?
+    [ "$status" -eq 0 ] || [ "$status" -eq 24 ] || failed+=("$path")
 done
 if [ ${#failed[@]} -gt 0 ]; then
     echo "$(date '+%F %T') not pulled: ${failed[*]} (see pull-ghc-results.sh and CLAUDE.md)" >&2; exit 1
