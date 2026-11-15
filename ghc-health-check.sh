@@ -15,6 +15,16 @@ stuck() {
     [ -n "$(find "$2" "$3" -mmin -60 -type f -not -path "*/tasks/*" 2>/dev/null | head -1)" ] \
         || problems+=("$1: running but no file in $2 changed in 60 minutes")
 }
+# A feature being refined or simplified is stuck when none of its files changed in 60 minutes:
+# results, simplification, tasks/ (where preparing installs and builds) and its log.
+stuck_features() {
+    local exp=$2 task
+    [ -f "$exp/queue-status.json" ] || return
+    for task in $(python3 -c "import json;print(' '.join(k for k,v in json.load(open('$exp/queue-status.json')).items() if v['state'] in ('refining','simplifying')))"); do
+        [ -n "$(find "$exp/results/$task" "$exp/simplification/$task" "$exp/tasks/$task" "$exp/$task.log" \
+            -mmin -60 -type f -print -quit 2>/dev/null)" ] || problems+=("$1: $task changed no file in 60 minutes (see $exp/$task.log)")
+    done
+}
 for result in .experiments/*/results/*/result.json; do
     [ -f "$result" ] && echo "result: $result $(python3 -c "import json;print(json.load(open('$result'))['status'])")"
 done
@@ -24,6 +34,7 @@ if pgrep -f "[c]laude_low_queue.py" >/dev/null; then
     claude=running
     log_error claude "$CLOG"
     stuck claude .experiments/manual-claude-low-ghc "$CLOG"
+    stuck_features claude .experiments/manual-claude-low-ghc
     status=.experiments/manual-claude-low-ghc/queue-status.json
     failed=$([ -f "$status" ] && python3 -c "import json;print(' '.join(k for k,v in json.load(open('$status')).items() if v['state']=='failed'))")
     [ -n "$failed" ] && problems+=("claude: failed in $status: $failed")
