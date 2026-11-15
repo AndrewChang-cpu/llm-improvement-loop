@@ -19,7 +19,9 @@ git ls-files --others --directory --exclude-standard .experiments | while read -
     dest=$AFS/results/${path#.experiments/}
     skip=(); [ -f "$dest.mac-has" ] && skip=(--exclude-from="$dest.mac-has")
     rsync -a --prune-empty-dirs --max-size=2m --exclude-from=<(sed -n 's|^\.experiments/\*\*/||p' .gitignore) \
-        --exclude 'tasks/' --exclude '*.tar.gz' --exclude '*.jsonl' "${skip[@]}" "$path" "$dest"
+        --exclude 'tasks/' --exclude '*.tar.gz' --exclude '*.jsonl' "${skip[@]}" \
+        --exclude 'rebuild-check/' --exclude 'materializing/' --exclude 'candidate-test-tmp/' --exclude '*.tmp' \
+        --exclude '.mac-has' "$path" "$dest"   # runner temp folders (not pulled); AFS's .mac-has is the prune's
 done
 
 if [ -d "$CONFIG" ]; then

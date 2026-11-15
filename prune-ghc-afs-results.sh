@@ -23,7 +23,9 @@ for status in glob.glob(\"*/queue-status.json\"):
                     print(f\"{exp}/{kind}/{task}\")
 '")
 for path in $finished; do
+    # Runner temp folders are never pulled, so they do not count as missing.
     missing=$(rsync -an --checksum --out-format='%n' -e "ssh -o BatchMode=yes" --rsync-path="$AUTH rsync" \
+        --exclude 'rebuild-check/' --exclude 'materializing/' --exclude 'candidate-test-tmp/' --exclude '*.tmp' \
         "$HOST:$AFS/results/$path/" "$REPO/.experiments/$path/" | grep -v '/$' || true)
     if [ -n "$missing" ]; then echo "keep $path: $(wc -l <<< "$missing" | tr -d ' ') files not on the Mac"; continue; fi
     exp=${path%%/*}
