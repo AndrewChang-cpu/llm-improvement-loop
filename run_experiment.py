@@ -431,6 +431,8 @@ def resume_settings(output, settings):
             "659b8adbf302b69a88522186d36c7558d67ed106e8bb5812b9f8db308ed786d5",
             "7260356a613b4425b8a0ebaeeec6a15a45ee13fd2ee29d554c3d4b7ec02c1a55",
             "e0c2f5f51a7834a0168d99b95234fe37fd73add9fb07201fb455fd10d38faf75",
+            "2248826d95a8e47debcc378d0235aeb85426b8e8332b63adc4e87e04ae4d7da2",
+            "886ce80667915958b6bd08c07130168b3d9abfca86b9fe604dded07fef0046ac",
         }
         if old.get("runner_sha256") in compatible:
             if "judge_effort" in current:
@@ -676,6 +678,8 @@ def judge_prompt(task, generated, checks=None):
             "Use checks.json for executable status and recorded API inspection facts; do not contradict "
             "a successful inspection of an effective inherited attribute. Never invent execution results. "
             "Do not modify files.\n"
+            + ("No tests were run for this experiment; judge behavior by reading the code.\n"
+               if task.get("no_tests") else "")
             + json.dumps({"verified_api_facts": facts,
                           "candidate_test_changes": (checks or {}).get("candidate_test_changes", []),
                           "requires_test_changes": task.get("requires_test_changes", False),
@@ -719,6 +723,8 @@ def evaluate_batch(task, output, agent, specification, runs=10):
                   "Do not modify tests to conceal failures. Do not commit changes. "
                   + (f"Run tests using {task['generator_python']}. This prepared environment is shared; "
                      "do not install packages or modify it. " if task.get("generator_python") else "")
+                  + ("Do not run tests, scripts, or any repository code, and do not install packages; "
+                     "work by reading and editing files. " if task.get("no_tests") else "")
                   + "\n\nSPECIFICATION:\n" + specification, generated, run / "generation", GEN_SCHEMA,
                   writable=True, python=task.get("generator_python"))
         command(["git", "add", "-A"], generated, clean_env())
@@ -909,12 +915,15 @@ def prepare_task(task, storage):
     directory = storage / "tasks" / task["id"]
     if (directory / "prepared.json").exists():
         prepared = read_json(directory / "prepared.json")
-        if prepared["manifest"] != task:
+        # A task prepared with tests but never run may be prepared again without them.
+        if prepared["manifest"] != task and dict(prepared["manifest"], no_tests=True) != task:
             raise ValueError("Task manifest changed. Use a new output directory.")
-        local = local_task(prepared["task"], storage)
-        local["generator_python"] = prepare_generator_environment(task, directory, Path(local["base"]))
-        write_json(directory / "prepared.json", dict(prepared, task=portable_task(local)))
-        return local
+        if prepared["manifest"] == task:
+            local = local_task(prepared["task"], storage)
+            if not task.get("no_tests"):
+                local["generator_python"] = prepare_generator_environment(task, directory, Path(local["base"]))
+            write_json(directory / "prepared.json", dict(prepared, task=portable_task(local)))
+            return local
     directory.mkdir(parents=True, exist_ok=True)
     metadata = directory / "pull.json"
     if not metadata.exists():
@@ -942,6 +951,18 @@ def prepare_task(task, storage):
     export_commit(repository, task["base_commit"], base)
     fresh_workspace(base, reference)
     command(["git", "apply", "--binary", str(patch_file)], reference, clean_env())
+    test_files = [f["filename"] for f in read_json(file_list) if is_test_path(f["filename"])]
+    requirements = {key: task.get("requirements", {}).get(key, description) for key, description in CRITERIA.items()}
+    if task.get("no_tests"):
+        # Without tests no environment is installed; the first criterion is patch application alone.
+        requirements["patch_and_checks"] = "Patch applies to the original snapshot (no tests are run)."
+        prepared = {"id": task["id"], "base": str(base), "reference": str(reference),
+                    "description": (pull["title"] + "\n\n" + (pull.get("body") or "")),
+                    "test_files": test_files, "checks": [], "inspection": [], "no_tests": True,
+                    "requires_test_changes": task.get("requires_test_changes", False),
+                    "requirements": requirements}
+        write_json(directory / "prepared.json", {"manifest": task, "task": portable_task(prepared)})
+        return prepared
     venv = directory / "venv"
     python = str(venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python"))
     # A venv left by an interpreter that crashed mid-creation has no pip; rebuild it.
@@ -961,7 +982,6 @@ def prepare_task(task, storage):
     for args in checks:
         logs.append({"command": args, "output": command(args, reference, env)})
     write_json(directory / "reference-validation.json", logs)
-    test_files = [f["filename"] for f in read_json(file_list) if is_test_path(f["filename"])]
     prepared = {"id": task["id"], "base": str(base), "reference": str(reference),
                 "description": (pull["title"] + "\n\n" + (pull.get("body") or "")),
                 "test_files": test_files, "checks": checks, "inspection": inspection,
@@ -969,8 +989,7 @@ def prepare_task(task, storage):
                 "platform_deselect": task.get("platform_deselect", []),
                 "generator_python": prepare_generator_environment(task, directory, base),
                 "requires_test_changes": task.get("requires_test_changes", False),
-                "requirements": {key: task.get("requirements", {}).get(key, description)
-                                 for key, description in CRITERIA.items()}}
+                "requirements": requirements}
     write_json(directory / "prepared.json", {"manifest": task, "task": portable_task(prepared)})
     return prepared
 
@@ -1059,6 +1078,8 @@ def main():
     parser.add_argument("--judge-backend", choices=["codex", "ollama", "claude"],
                         help="Judge with a different backend than generators and editors")
     parser.add_argument("--judge-model", help="Judge model; defaults as for --model")
+    parser.add_argument("--no-tests", action="store_true",
+                        help="Install no environments and run no tests (generators and checks)")
     args = parser.parse_args()
     args.model = args.model or {"codex": "gpt-6-luna", "claude": "haiku", "ollama": "qwen3-experiment:4b"}[args.backend]
     args.codex = args.codex or Codex(args.model, backend=args.backend).executable
@@ -1106,6 +1127,8 @@ def main():
         tasks = [task for task in tasks if task["id"] == args.task]
         if not tasks:
             parser.error("Unknown task ID")
+    if args.no_tests:
+        tasks = [dict(task, no_tests=True) for task in tasks]
     for task in tasks:
         print(f"Preparing {task['id']}", flush=True)
         prepared = prepare_task(task, storage)

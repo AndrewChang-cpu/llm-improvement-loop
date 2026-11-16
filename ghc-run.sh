@@ -6,15 +6,16 @@
 # Safe to rerun: a finished track is skipped and an unfinished one resumes. Logs "<track> done".
 # BASE (default /tmp/$USER) is ghc-setup.sh's folder; GHC_TASKS and GHC_OUTPUT select the Claude track's work,
 # and BACKEND (default claude) and MANIFEST its backend and manifest (Windows: codex, windows-100).
+# NO_TESTS=1 (default) runs features not started yet without environments or tests; NO_TESTS= keeps them.
 BASE=${BASE:-/tmp/${USER:-$(id -un)}}
-GHC_TASKS=${GHC_TASKS:-tasks/ghc.txt} GHC_OUTPUT=${GHC_OUTPUT:-.experiments/manual-claude-low-ghc} BACKEND=${BACKEND:-claude}
+GHC_TASKS=${GHC_TASKS:-tasks/ghc.txt} GHC_OUTPUT=${GHC_OUTPUT:-.experiments/manual-claude-low-ghc} BACKEND=${BACKEND:-claude} NO_TESTS=${NO_TESTS-1}
 cd "$(dirname "$0")" || exit 1
 [ -f "$BASE/env.sh" ] && . "$BASE/env.sh"   # GHC only
 track=${1:?usage: ghc-run.sh claude|qwen}
 echo "=== $(date) ghc-run $track start"
 case "$track" in
 claude)
-    python3.12 claude_low_queue.py --backend "$BACKEND" --workers 3 --retry-failed ${MANIFEST:+--manifest "$MANIFEST"} \
+    python3.12 claude_low_queue.py --backend "$BACKEND" --workers 3 --retry-failed ${MANIFEST:+--manifest "$MANIFEST"} ${NO_TESTS:+--no-tests} \
         --tasks "$GHC_TASKS" --output "$GHC_OUTPUT" || exit 1
     # The queue exits 0 even when features fail; only finish when none is left unfinished.
     left=$(python3 -c "import json;print(' '.join(k for k,v in json.load(open('$GHC_OUTPUT/queue-status.json')).items() if v['state'] not in ('done','non_convergent')))")

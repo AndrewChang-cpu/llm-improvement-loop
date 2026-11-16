@@ -28,6 +28,7 @@ status_lock = threading.Lock()
 API_WAIT_SECONDS = 600
 GENERATOR = "claude"
 EFFORT = "low"
+NO_TESTS = False
 
 
 def api_unavailable(output):
@@ -86,6 +87,12 @@ def clean(task):
     shutil.rmtree(OUTPUT / "tasks" / task, ignore_errors=True)
 
 
+def no_tests(task):
+    # --no-tests applies to features not started yet; a started feature keeps the settings it began with.
+    settings = read(OUTPUT / "results" / task / "settings.json")
+    return settings["task"].get("no_tests", False) if settings else NO_TESTS
+
+
 def run_feature(task):
     result = OUTPUT / "results" / task / "result.json"
     simplified = OUTPUT / "simplification" / task / "result.json"
@@ -98,7 +105,8 @@ def run_feature(task):
     backend = (["--backend", "ollama", "--judge-backend", "claude"] if GENERATOR == "qwen"
                else ["--backend", GENERATOR])
     steps = [("refining", [python, "run_experiment.py", "run", *backend, "--effort", EFFORT,
-                           "--manifest", str(MANIFEST), "--task", task, "--output", str(OUTPUT)]),
+                           "--manifest", str(MANIFEST), "--task", task, "--output", str(OUTPUT)]
+                          + (["--no-tests"] if no_tests(task) else [])),
              ("simplifying", [python, "simplify_specifications.py", str(OUTPUT / "results" / task),
                               "--output", str(OUTPUT / "simplification")])]
     for state, command in steps:
@@ -136,7 +144,7 @@ def task_list(value):
 
 
 def main():
-    global OUTPUT, GENERATOR, MANIFEST, SPECS, EFFORT
+    global OUTPUT, GENERATOR, MANIFEST, SPECS, EFFORT, NO_TESTS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workers", type=int, default=3)
     parser.add_argument("--retry-failed", action="store_true", help="Also resume features that failed before")
@@ -151,7 +159,10 @@ def main():
                              "qwen: local Ollama Qwen generates and edits, Claude judges")
     parser.add_argument("--effort", choices=["low", "medium", "high"], default="low",
                         help="Generator/editor effort (default low); judges always use high")
+    parser.add_argument("--no-tests", action="store_true",
+                        help="Features not started yet install no environments and run no tests")
     args = parser.parse_args()
+    NO_TESTS = args.no_tests
     OUTPUT, MANIFEST = args.output.resolve(), args.manifest.resolve()
     SPECS = (args.specs or MANIFEST.parent / "environment-specs.json").resolve()
     GENERATOR, EFFORT = args.generator, args.effort

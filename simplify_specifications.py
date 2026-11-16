@@ -66,7 +66,8 @@ def simplify(value, output, executable=None, effort=None):
                                                    "860666c2d19d48560d75d03e4e8b9b3d144c863d59f4196707dc10868f504d20",
                                                    "b4edb20e7a25ed233473f1af8ce00c23480f05b2911bc992891612e0c653cda8",
                                                    "949ee36de8247e42d6e76936892e56e0e49a4c80d90f72aac5a07bc0cbbf69b2",
-                                                   "f8bbf390d9d6767a145bc809b16423604832a50a4881f5e642cdc884702c0d77"}:
+                                                   "f8bbf390d9d6767a145bc809b16423604832a50a4881f5e642cdc884702c0d77",
+                                                   "86229d46fbfad3784ad8becaca62387b394b72f2431e3e9c91b5d381835cbcf0"}:
         saved["simplifier_sha256"] = settings["simplifier_sha256"]
     # Deleting judged repository copies did not alter results. Resuming the source experiment
     # rewrites its settings with only the new runner hash, so accept that source change too.
@@ -84,7 +85,10 @@ def simplify(value, output, executable=None, effort=None):
                           "0674ebbdedc0534abb792e86bc4494247b663363e35cbe6be188eee983c7244e",
                           "07c810cb0fa245b71baccfbf275d8e7d48f972378ebe6e0f1435e30d41894722",
                           "659b8adbf302b69a88522186d36c7558d67ed106e8bb5812b9f8db308ed786d5",
-                          "7260356a613b4425b8a0ebaeeec6a15a45ee13fd2ee29d554c3d4b7ec02c1a55"}
+                          "7260356a613b4425b8a0ebaeeec6a15a45ee13fd2ee29d554c3d4b7ec02c1a55",
+                          "e0c2f5f51a7834a0168d99b95234fe37fd73add9fb07201fb455fd10d38faf75",
+                          "2248826d95a8e47debcc378d0235aeb85426b8e8332b63adc4e87e04ae4d7da2",
+                          "886ce80667915958b6bd08c07130168b3d9abfca86b9fe604dded07fef0046ac"}
     if saved and saved.get("runner_sha256") in compatible_runners:
         source_settings = runner.read_json(source / "settings.json")
         if any(hashlib.sha256((json.dumps(dict(source_settings, runner_sha256=old), indent=2) + "\n").encode()).hexdigest()
