@@ -375,7 +375,7 @@ def claude_command(executable, model, schema, effort="low"):
                 "network": {"allowedDomains": [], "deniedDomains": ["*"]}}}
     return [executable, "-p", "--model", model, "--effort", effort,
             "--output-format", "stream-json", "--verbose", "--json-schema", json.dumps(schema),
-            "--safe-mode", "--disable-slash-commands", "--setting-sources", "", "--settings", json.dumps(settings),
+            "--disable-slash-commands", "--setting-sources", "", "--settings", json.dumps(settings),
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
             "--tools", "Bash,Read,Edit,Write,Glob,Grep", "--dangerously-skip-permissions",
             "--no-session-persistence"]

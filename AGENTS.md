@@ -14,7 +14,7 @@ Iterative specification refinement on FEA-Bench PRs. Each revision of a feature'
 | `view_experiment.py` | evaluation viewer (HTML file, or live with `--serve PORT`) |
 | `retire_workspaces.py` | turns judged runs into `patch.diff` (or `generated.tar.gz`) to free disk |
 | `experiments/build_windows_100.py` | builds `experiments/windows-100/` (the Windows PRs) |
-| `ghc-health-check.sh`, `windows-watch.sh` | deterministic hourly health check (OK or PROBLEM); the watcher wakes an LLM fixer only on PROBLEM |
+| `ghc-health-check.sh`, `windows-watch.sh` | deterministic hourly health check (OK or PROBLEM); the Windows watcher notifies the existing supervisor only on PROBLEM |
 
 ## Machines and task lists
 
@@ -88,11 +88,11 @@ The code is Unix-only; run it in WSL2, in the Linux filesystem (`~`), not `/mnt/
 3. uv and Python: `curl -LsSf https://astral.sh/uv/install.sh | sh`, open a new shell, `uv python install 3.12` and put it on PATH as `python3.12` (`ln -s "$(uv python find 3.12)" ~/.local/bin/python3.12`).
 4. Codex CLI (as GHC pins it): `curl -fsSL https://github.com/openai/codex/releases/download/rust-v0.169.0/codex-x86_64-unknown-linux-musl.tar.gz | tar -xz -C ~/.local/bin && mv ~/.local/bin/codex-x86_64-unknown-linux-musl ~/.local/bin/codex`, then `codex login` (ChatGPT login; no API key). Optional Claude: `curl -fsSL https://claude.ai/install.sh | bash && claude auth login`.
 5. `git clone https://github.com/AndrewChang-cpu/llm-improvement-loop.git ~/llm-improvement-loop && cd ~/llm-improvement-loop`, then `python3 run_experiment.py smoke --backend codex --output .experiments/codex-smoke-windows`.
-6. After the user confirms, start the Codex queue in tmux (the same command the watcher's fixer restarts):
+6. After the user confirms, start the Codex queue in tmux:
    `mkdir -p ~/llm-watch && tmux new-session -d -s queue "BASE=$HOME/llm-watch GHC_TASKS=tasks/windows.txt GHC_OUTPUT=.experiments/codex-low-windows BACKEND=codex MANIFEST=experiments/windows-100/runner-manifest.json ./ghc-run.sh claude 2>&1 | tee -a $PWD/queue.log; exec bash"`
 7. Hourly watcher: `sudo apt install -y cron && sudo systemctl enable --now cron`, then add with `crontab -e`:
    `5 * * * * $HOME/llm-improvement-loop/windows-watch.sh >> $HOME/llm-watch/watch.log 2>&1`.
-   Each run executes `ghc-health-check.sh` on the Windows queue (no tokens). Only on PROBLEM (queue stopped unfinished, a `failed` task, or a feature with no file changed in 60 minutes) it runs a headless `codex exec` fixer, at most one per hour. Test the fixer path once with `FIXER_TEST=1 ./windows-watch.sh`. Log: `~/llm-watch/watch.log`.
+   Set the existing supervising Orca terminal handle in `~/llm-watch/supervisor-terminal` (one line; discover with `orca terminal list --json`). Each run executes `ghc-health-check.sh` without tokens. On PROBLEM (queue stopped unfinished, a failed task, or no feature file changed in 60 minutes), it sends a prompt to that existing session through `orca terminal send`, at most once per hour. It never launches a separate fixer. The supervising session and Orca must remain available; update the handle if the session is replaced. Test delivery with `NOTIFY_TEST=1 ./windows-watch.sh`. Log: `~/llm-watch/watch.log`.
 
 - Tasks: `tasks/windows.txt` = `experiments/windows-100/`, a seeded uniform random sample of the 1,299 FEA-Bench PRs outside batch-100 and the two pilots (the study's goal is all 1,401). Each PR is installed the way FEA-Bench's harness does it: batch-100's validated install lists for repositories batch-100 covers, otherwise the install table FEA-Bench inherits from SWE-bench (converted to pip; sympy tests selected by name with `pytest -k`). These environments are unvalidated; a task whose reference checks fail ends `failed` during preparation (see its log) and needs a manifest fix, not a rerun.
 - Sync results back: commit `.experiments/codex-low-windows` (`.gitignore` drops workspaces) on a branch and push, or `rsync -a --exclude tasks/ .experiments/codex-low-windows/ <mac>:<repo>/.experiments/codex-low-windows/`.
