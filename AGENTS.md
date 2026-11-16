@@ -18,7 +18,7 @@ Iterative specification refinement on FEA-Bench PRs. Each revision of a feature'
 
 ## Machines and task lists
 
-Machines run disjoint tasks, listed in `tasks/<machine>.txt` (one task per line, `#` comments). Never move a task another machine has started; move only unstarted ones.
+All 1,401 FEA-Bench PRs are split across the five `tasks/*.txt` lists (`experiments/build_feabench_1401.py`; union is all of FEA-Bench, no overlap). Use `--manifest experiments/feabench-1401/runner-manifest.json` for every list: it holds every PR, with earlier manifests' entries unchanged so started features resume. Machines run disjoint tasks, listed in `tasks/<machine>.txt` (one task per line, `#` comments). Never move a task another machine has started; move only unstarted ones.
 
 | Machine | Tasks | Backend | Manifest | Output |
 |---|---|---|---|---|

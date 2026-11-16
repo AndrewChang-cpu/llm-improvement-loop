@@ -78,15 +78,13 @@ class PathTests(unittest.TestCase):
         self.assertEqual(queue.task_list(str(self.root / "tasks.txt")), {"a", "b"})
         self.assertEqual(queue.task_list("a,b"), {"a", "b"})
 
-    def test_machine_task_lists_are_disjoint_claude_tasks(self):
-        lists = {name: queue.task_list(str(runner.ROOT / f"tasks/{name}.txt")) for name in ("mac", "ghc", "windows")}
-        self.assertEqual(sum(map(len, lists.values())), len(set().union(*lists.values())))
-        self.assertLessEqual(lists["mac"] | lists["ghc"], set(queue.claude_tasks()))
-        windows = runner.read_json(runner.ROOT / "experiments/windows-100/runner-manifest.json")
-        self.assertEqual(lists["windows"], {task["id"] for task in windows})
-        batch = runner.read_json(runner.ROOT / ".experiments/batch-100/runner-manifest.json")
-        self.assertFalse(lists["windows"] & {task["id"] for task in batch})
-
+    def test_task_lists_partition_feabench(self):
+        names = ("ghc", "mac", "mac-100", "windows", "windows-200")
+        lists = [queue.task_list(str(runner.ROOT / f"tasks/{name}.txt")) for name in names]
+        manifest = runner.read_json(runner.ROOT / "experiments/feabench-1401/runner-manifest.json")
+        self.assertEqual(sum(map(len, lists)), len(set().union(*lists)))
+        self.assertEqual(set().union(*lists), {task["id"] for task in manifest})
+        self.assertEqual(len(manifest), 1401)
 
 if __name__ == "__main__":
     unittest.main()

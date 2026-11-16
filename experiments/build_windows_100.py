@@ -61,6 +61,50 @@ def pytest_id(test):
     return test.split("[")[0] if " " in test or test.count("[") != test.count("]") else test
 
 
+def entry(row, templates, manifest):
+    """The runner-manifest task and environment spec for one FEA-Bench row."""
+    tests = list(dict.fromkeys(row["FAIL_TO_PASS"] + row["PASS_TO_PASS"]))
+    if any(repo == row["repo"] for repo, _ in templates):
+        versions = [version for repo, version in templates if repo == row["repo"]]
+        exact = row["version"] in versions
+        version = row["version"] if exact else min(versions, key=lambda v: abs(number(v) - number(row["version"])))
+        template = templates[(row["repo"], version)]
+        prefix, official = template["candidate_check_prefix"], template["official_environment"]
+        install, python = template["install"], template["python_version"]
+        note = None if exact else f"install list of version {version} (no batch-100 task has {row['version']})"
+    else:
+        install, prefix, official = swebench_environment(row)
+        python = official["python"]
+        note = "SWE-bench environment converted to pip" + ("; pre_install steps skipped" if official.get("pre_install") else "")
+    if row["repo"] == "django/django":
+        labels = [django_label(t) for t in tests]
+    elif row["repo"] == "sympy/sympy":
+        labels = []
+    else:
+        # FEA-Bench lists a few malformed entries (e.g. "[") among pytest IDs.
+        labels = [pytest_id(t) for t in tests if "::" in t]
+    # FEA-Bench names some Django tests by their docstring, which runtests.py cannot select.
+    dropped = [label for label in labels if " " in label]
+    if dropped:
+        labels = [label for label in labels if " " not in label]
+        note = "; ".join(filter(None, [note, f"{len(dropped)} docstring-named tests not run"]))
+    task = {"id": row["instance_id"], "repo": row["repo"], "pr": row["pull_number"],
+            "base_commit": row["base_commit"], "install": install,
+            "checks": [prefix + (["-k", " or ".join(tests), "sympy"] if row["repo"] == "sympy/sympy"
+                                 else list(dict.fromkeys(labels)))], "test_files": [],
+            "python_version": python, "official_test_command": official["test_cmd"],
+            "official_environment": official, "environment_setup_commit": row["environment_setup_commit"],
+            "feabench_tests": {"FAIL_TO_PASS": row["FAIL_TO_PASS"], "PASS_TO_PASS": row["PASS_TO_PASS"]},
+            "candidate_check_prefix": prefix, "requirements": manifest[0]["requirements"]}
+    if row["repo"] == "sympy/sympy":
+        note += "; tests selected by name with pytest -k (substring match) instead of bin/test"
+    if note:
+        task["environment_note"] = note
+    return task, {"id": row["instance_id"], "repo": row["repo"], "version": row["version"],
+                  "environment_setup_commit": row["environment_setup_commit"],
+                  "official_spec": dict(official, python=python)}
+
+
 def main():
     rows = json.loads((BATCH / "source/manifest-rows.json").read_text())
     manifest = json.loads((BATCH / "runner-manifest.json").read_text())
@@ -73,49 +117,7 @@ def main():
     chosen = {row["instance_id"] for row in random.Random(SEED).sample(pool, 100)}
     selected = [row for row in rows if row["instance_id"] in chosen]   # official dataset order
 
-    tasks, environments = [], []
-    for row in selected:
-        tests = list(dict.fromkeys(row["FAIL_TO_PASS"] + row["PASS_TO_PASS"]))
-        if any(repo == row["repo"] for repo, _ in templates):
-            versions = [version for repo, version in templates if repo == row["repo"]]
-            exact = row["version"] in versions
-            version = row["version"] if exact else min(versions, key=lambda v: abs(number(v) - number(row["version"])))
-            template = templates[(row["repo"], version)]
-            prefix, official = template["candidate_check_prefix"], template["official_environment"]
-            install, python = template["install"], template["python_version"]
-            note = None if exact else f"install list of version {version} (no batch-100 task has {row['version']})"
-        else:
-            install, prefix, official = swebench_environment(row)
-            python = official["python"]
-            note = "SWE-bench environment converted to pip" + ("; pre_install steps skipped" if official.get("pre_install") else "")
-        if row["repo"] == "django/django":
-            labels = [django_label(t) for t in tests]
-        elif row["repo"] == "sympy/sympy":
-            labels = []
-        else:
-            # FEA-Bench lists a few malformed entries (e.g. "[") among pytest IDs.
-            labels = [pytest_id(t) for t in tests if "::" in t]
-        # FEA-Bench names some Django tests by their docstring, which runtests.py cannot select.
-        dropped = [label for label in labels if " " in label]
-        if dropped:
-            labels = [label for label in labels if " " not in label]
-            note = "; ".join(filter(None, [note, f"{len(dropped)} docstring-named tests not run"]))
-        task = {"id": row["instance_id"], "repo": row["repo"], "pr": row["pull_number"],
-                "base_commit": row["base_commit"], "install": install,
-                "checks": [prefix + (["-k", " or ".join(tests), "sympy"] if row["repo"] == "sympy/sympy"
-                                     else list(dict.fromkeys(labels)))], "test_files": [],
-                "python_version": python, "official_test_command": official["test_cmd"],
-                "official_environment": official, "environment_setup_commit": row["environment_setup_commit"],
-                "feabench_tests": {"FAIL_TO_PASS": row["FAIL_TO_PASS"], "PASS_TO_PASS": row["PASS_TO_PASS"]},
-                "candidate_check_prefix": prefix, "requirements": manifest[0]["requirements"]}
-        if row["repo"] == "sympy/sympy":
-            note += "; tests selected by name with pytest -k (substring match) instead of bin/test"
-        if note:
-            task["environment_note"] = note
-        tasks.append(task)
-        environments.append({"id": row["instance_id"], "repo": row["repo"], "version": row["version"],
-                             "environment_setup_commit": row["environment_setup_commit"],
-                             "official_spec": dict(official, python=python)})
+    tasks, environments = map(list, zip(*(entry(row, templates, manifest) for row in selected)))
     OUTPUT.mkdir(parents=True, exist_ok=True)
     (OUTPUT / "selection.json").write_text(json.dumps(
         {"seed": SEED, "method": __doc__.split("\n\n")[1], "dataset_revision": "55ee2f78126a3ecdeac6f595fa1ba6ae5c600bad",
