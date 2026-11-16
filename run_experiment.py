@@ -435,6 +435,7 @@ def resume_settings(output, settings):
             "886ce80667915958b6bd08c07130168b3d9abfca86b9fe604dded07fef0046ac",
             "fd35024c5aea9ab4dfccb7c472c7ae9d623d8240269ee02d2b27db998bac551f",
             "8d4d22864e05d03664312c0c77b4e5c9964a4704efc94e19e790666ab04e5002",
+            "8673fe0f1a479fdbbe38680e3e19cf2ce2c44b4224d2bd85eb145fc5ff86168a",
         }
         if old.get("runner_sha256") in compatible:
             if "judge_effort" in current:
@@ -453,6 +454,8 @@ def resume_settings(output, settings):
 
 def request_without_effort(request):
     request = dict(request)
+    # Calls saved while --safe-mode was briefly dropped ran the same task; ignore that flag.
+    request["command"] = [arg for arg in request["command"] if arg != "--safe-mode"]
     request["command"] = [re.sub(r'model_reasoning_effort="[^"]+"',
                                  'model_reasoning_effort="*"', arg)
                           if index == 0 or request["command"][index - 1] != "--effort" else "*"
