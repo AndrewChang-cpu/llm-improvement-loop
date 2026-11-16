@@ -114,7 +114,7 @@ def load_experiment(value):
     # Reuse the original environments and snapshots; never expose reference paths to generation.
     task = runner.local_task(settings["task"], source.parent.parent)
     for key in ("base", "reference", "generator_python"):
-        if not Path(task[key]).exists():
+        if key in task and not Path(task[key]).exists():
             raise ValueError(f"Missing prepared input: {task[key]}")
     return directory, source, settings, specification, counts(saved)
 
