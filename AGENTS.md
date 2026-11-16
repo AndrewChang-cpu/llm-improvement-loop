@@ -32,9 +32,9 @@ Before starting or restarting any run, ask the user to confirm the task list, ba
 
 ```sh
 # Claude (Mac shown; GHC uses ghc-run.sh)
-python3.12 claude_low_queue.py --workers 3 --retry-failed --no-tests --tasks tasks/mac.txt --output .experiments/manual-claude-low-v2 2>&1 | tee -a queue.log
+python3.12 claude_low_queue.py --workers 3 --retry-failed --tasks tasks/mac.txt --output .experiments/manual-claude-low-v2 2>&1 | tee -a queue.log
 # Codex (Windows)
-python3.12 claude_low_queue.py --backend codex --workers 3 --retry-failed --no-tests \
+python3.12 claude_low_queue.py --backend codex --workers 3 --retry-failed \
     --manifest experiments/windows-100/runner-manifest.json --tasks tasks/windows.txt \
     --output .experiments/codex-low-windows 2>&1 | tee -a queue.log
 ```
@@ -50,7 +50,7 @@ python3.12 claude_low_queue.py --backend codex --workers 3 --retry-failed --no-t
 
 - Never correct judgments by hand or ask for replacement judgments. Keep the original model outputs.
 - Simplify only when `results/<task>/result.json` has `"status": "converged"`.
-- No tests (decided 2026-11-15): features started from then on run with `--no-tests` (no environments, generators may not run repo code, no post-run checks; criterion 1 is patch application only). Features started earlier keep their tests; `settings.json` records `no_tests` and the queue keeps each feature on its own setting. `ghc-run.sh` passes `--no-tests` by default.
+- No tests by default (decided 2026-11-15): features started from then on install no environments, generators may not run repository code, and no post-run checks run; criterion 1 is patch application only. `--tests` (runner and queue) opts new features into tests. A started feature keeps the setting it began with (`no_tests` in `results/<task>/settings.json`).
 - Generators and editors run at `--effort low`; judges always run at high effort (the runner enforces this). Codex uses GPT-6 Luna and Claude uses Haiku, each judging its own runs.
 - Existing result and simplification folders reject changed settings. When you edit `run_experiment.py` or `simplify_specifications.py`, add the old `runner_sha256` (and old `simplifier_sha256`) to the compatibility lists in `resume_settings` (`run_experiment.py`) and `simplify_specifications.py`, so running experiments keep resuming.
 - Result files record paths relative to their experiment folder or the repo; readers remap old absolute paths (e.g. from GHC's `/tmp/aechang`). Never pass machine-specific paths in code; use arguments or environment variables.

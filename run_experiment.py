@@ -375,7 +375,7 @@ def claude_command(executable, model, schema, effort="low"):
                 "network": {"allowedDomains": [], "deniedDomains": ["*"]}}}
     return [executable, "-p", "--model", model, "--effort", effort,
             "--output-format", "stream-json", "--verbose", "--json-schema", json.dumps(schema),
-            "--disable-slash-commands", "--setting-sources", "", "--settings", json.dumps(settings),
+            "--safe-mode", "--disable-slash-commands", "--setting-sources", "", "--settings", json.dumps(settings),
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
             "--tools", "Bash,Read,Edit,Write,Glob,Grep", "--dangerously-skip-permissions",
             "--no-session-persistence"]
@@ -1078,8 +1078,9 @@ def main():
     parser.add_argument("--judge-backend", choices=["codex", "ollama", "claude"],
                         help="Judge with a different backend than generators and editors")
     parser.add_argument("--judge-model", help="Judge model; defaults as for --model")
-    parser.add_argument("--no-tests", action="store_true",
-                        help="Install no environments and run no tests (generators and checks)")
+    parser.add_argument("--tests", action="store_true",
+                        help="Install environments and run tests (generators and checks) for features "
+                             "not started yet; by default no tests run")
     args = parser.parse_args()
     args.model = args.model or {"codex": "gpt-6-luna", "claude": "haiku", "ollama": "qwen3-experiment:4b"}[args.backend]
     args.codex = args.codex or Codex(args.model, backend=args.backend).executable
@@ -1127,8 +1128,11 @@ def main():
         tasks = [task for task in tasks if task["id"] == args.task]
         if not tasks:
             parser.error("Unknown task ID")
-    if args.no_tests:
-        tasks = [dict(task, no_tests=True) for task in tasks]
+    # A started feature keeps the test setting it began with; new ones run without tests unless --tests.
+    def without_tests(task):
+        saved = storage / "results" / task["id"] / "settings.json"
+        return read_json(saved)["task"].get("no_tests", False) if saved.exists() else not args.tests
+    tasks = [dict(task, no_tests=True) if without_tests(task) else task for task in tasks]
     for task in tasks:
         print(f"Preparing {task['id']}", flush=True)
         prepared = prepare_task(task, storage)
