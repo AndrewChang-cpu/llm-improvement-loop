@@ -1,0 +1,169 @@
+diff --git a/.changes/next-release/enhancement-S3-expires.json b/.changes/next-release/enhancement-S3-expires.json
+new file mode 100644
+index 0000000..3a8428e
+--- /dev/null
++++ b/.changes/next-release/enhancement-S3-expires.json
+@@ -0,0 +1,7 @@
++[
++  {
++    "type": "enhancement",
++    "category": "``s3``",
++    "description": "Customize the ``Expires`` timestamp in S3 operation outputs. Unparseable ``Expires`` headers now omit the member and log a warning instead of failing the operation. Added the synthetic ``ExpiresString`` member, which retains the raw header value. ``Expires`` is deprecated in favor of ``ExpiresString``."
++  }
++]
+diff --git a/botocore/client.py b/botocore/client.py
+index ab1be75..dce7e1f 100644
+--- a/botocore/client.py
++++ b/botocore/client.py
+@@ -48,6 +48,7 @@ from botocore.utils import (
+     S3ControlArnParamHandlerv2,
+     S3ExpressIdentityResolver,
+     S3RegionRedirectorv2,
++    customize_expires_shapes,
+     ensure_boolean,
+     get_service_module_name,
+ )
+@@ -239,6 +240,7 @@ class ClientCreator:
+         json_model = self._loader.load_service_model(
+             service_name, 'service-2', api_version=api_version
+         )
++        customize_expires_shapes(json_model)
+         service_model = ServiceModel(json_model, service_name=service_name)
+         return service_model
+ 
+diff --git a/botocore/parsers.py b/botocore/parsers.py
+index 0c7a34f..2bfd685 100644
+--- a/botocore/parsers.py
++++ b/botocore/parsers.py
+@@ -134,6 +134,9 @@ LOG = logging.getLogger(__name__)
+ 
+ DEFAULT_TIMESTAMP_PARSER = parse_timestamp
+ 
++def _is_expires_timestamp_shape(shape):
++    return shape.type_name == 'timestamp' and shape.name == 'Expires'
++
+ 
+ class ResponseParserFactory:
+     def __init__(self):
+@@ -966,9 +969,34 @@ class BaseRestParser(ResponseParser):
+             elif location == 'header':
+                 header_name = member_shape.serialization.get('name', name)
+                 if header_name in headers:
+-                    final_parsed[name] = self._parse_shape(
+-                        member_shape, headers[header_name]
+-                    )
++                    if _is_expires_timestamp_shape(member_shape):
++                        # The Expires header is commonly malformed in the
++                        # wild. Rather than failing the whole operation, omit
++                        # the member and warn. The raw value remains available
++                        # through the ExpiresString member.
++                        try:
++                            final_parsed[name] = self._parse_shape(
++                                member_shape, headers[header_name]
++                            )
++                        except (
++                            ValueError,
++                            TypeError,
++                            RuntimeError,
++                            OverflowError,
++                            OSError,
++                        ):
++                            LOG.warning(
++                                'Unable to parse the %s header value %r as a '
++                                'timestamp; omitting the %s member. Use '
++                                'ExpiresString to access the raw value.',
++                                header_name,
++                                headers[header_name],
++                                name,
++                            )
++                    else:
++                        final_parsed[name] = self._parse_shape(
++                            member_shape, headers[header_name]
++                        )
+ 
+     def _parse_header_map(self, shape, headers):
+         # Note that headers are case insensitive, so we .lower()
+diff --git a/botocore/session.py b/botocore/session.py
+index 93d0207..14fdf22 100644
+--- a/botocore/session.py
++++ b/botocore/session.py
+@@ -69,6 +69,7 @@ from botocore.useragent import UserAgentString
+ from botocore.utils import (
+     EVENT_ALIASES,
+     IMDSRegionProvider,
++    customize_expires_shapes,
+     validate_region_name,
+ )
+ 
+@@ -613,6 +614,7 @@ class Session:
+         service_data = self.get_component('data_loader').load_service_model(
+             data_path, type_name='service-2', api_version=api_version
+         )
++        customize_expires_shapes(service_data)
+         service_id = EVENT_ALIASES.get(service_name, service_name)
+         self._events.emit(
+             f'service-data-loaded.{service_id}',
+diff --git a/botocore/utils.py b/botocore/utils.py
+index 0efd7ef..18b0510 100644
+--- a/botocore/utils.py
++++ b/botocore/utils.py
+@@ -3620,3 +3620,59 @@ CLIENT_NAME_TO_HYPHENIZED_SERVICE_ID_OVERRIDES = {
+     'stepfunctions': 'sfn',
+     'storagegateway': 'storage-gateway',
+ }
++
++
++EXPIRES_STRING_DOCUMENTATION = (
++    '<p>The raw value of the <code>Expires</code> header. Use this member '
++    'instead of <code>Expires</code>.</p>'
++)
++EXPIRES_DEPRECATION_NOTE = (
++    '<p><b>Deprecated:</b> This member is deprecated and may be omitted if the '
++    'value cannot be parsed as a timestamp. Use <code>ExpiresString</code> '
++    'to retrieve the raw value.</p>'
++)
++
++
++def customize_expires_shapes(service_data):
++    """Customize operation output shapes that contain an ``Expires`` timestamp.
++
++    For each output shape with an ``Expires`` member, this adds a synthetic
++    ``ExpiresString`` member that is populated from the same header but
++    retains the raw string value. The ``Expires`` member is marked as
++    deprecated in its documentation.
++
++    The model is modified in place. The operation is idempotent, so it is
++    safe to call on data that has already been customized.
++
++    :param service_data: The loaded service-2 model dictionary.
++    """
++    shapes = service_data.get('shapes', {})
++    if 'ExpiresString' in shapes:
++        return
++    touched = False
++    for operation in service_data.get('operations', {}).values():
++        output = operation.get('output')
++        if not output:
++            continue
++        output_shape = shapes.get(output['shape'], {})
++        members = output_shape.get('members', {})
++        expires = members.get('Expires')
++        if not expires or expires.get('shape') != 'Expires':
++            continue
++        if 'ExpiresString' in members:
++            continue
++        if not touched:
++            shapes['ExpiresString'] = {
++                'type': 'string',
++                'documentation': EXPIRES_STRING_DOCUMENTATION,
++            }
++            touched = True
++        expires['documentation'] = (
++            EXPIRES_DEPRECATION_NOTE + expires.get('documentation', '')
++        )
++        members['ExpiresString'] = {
++            'shape': 'ExpiresString',
++            'documentation': EXPIRES_STRING_DOCUMENTATION,
++            'location': 'header',
++            'locationName': 'Expires',
++        }

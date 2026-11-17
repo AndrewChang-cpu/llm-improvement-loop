@@ -1,0 +1,937 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 596bd99..11817c7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ ### Added
+ 
+ - SVG export functionality https://github.com/Textualize/rich/pull/2101
++- Added `rich.progress.open` and `rich.progress.wrap_file` to show progress while reading a file
+ 
+ ### Fixed
+ 
+diff --git a/docs/source/progress.rst b/docs/source/progress.rst
+index 4ce3588..4715eb1 100644
+--- a/docs/source/progress.rst
++++ b/docs/source/progress.rst
+@@ -199,6 +199,42 @@ If the :class:`~rich.progress.Progress` class doesn't offer exactly what you nee
+         def get_renderables(self):
+             yield Panel(self.make_tasks_table(self.tasks))
+ 
++Reading from a file
++-------------------
++
++:func:`~rich.progress.open` reads a file and shows a progress bar for the bytes consumed. This is useful for a long parser, such as JSON or CSV, that reads a large file. The total defaults to the size of the file in bytes. The function returns a context manager, and the display runs for the duration of the ``with`` block::
++
++    import json
++    from rich.progress import open
++
++    with open("data.json") as file:
++        data = json.load(file)
++
++By default the file is opened in text mode, so ``read()`` returns a ``str``. Pass ``'rb'`` as the mode to read bytes instead::
++
++    with open("data.bin", "rb") as file:
++        payload = file.read()
++
++To attach a reader to a :class:`~rich.progress.Progress` you already have, use :meth:`~rich.progress.Progress.open`. It does not start the display, so use the ``Progress`` as a context manager around it. The method returns the reader directly, and you close it with a ``with`` block::
++
++    from rich.progress import Progress
++
++    with Progress() as progress:
++        with progress.open("data.csv", "rb") as file:
++            for line in file:
++                ...
++
++Reading from a file-like object
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++If you already have an open binary file, use :func:`~rich.progress.wrap_file`, or :meth:`~rich.progress.Progress.wrap_file` on an existing ``Progress``. These accept binary files only, and they require the total in bytes, because the size of a file-like object cannot be inferred. If you pass ``task_id`` to :meth:`~rich.progress.Progress.wrap_file` and the task already has a total, that total is used and you may omit ``total``. The reader does not close the wrapped file, so the file stays open after the reader exits::
++
++    from rich.progress import wrap_file
++
++    with open("data.bin", "rb") as raw:
++        with wrap_file(raw, total=1024) as file:
++            payload = file.read()
++
+ Multiple Progress
+ -----------------
+ 
+diff --git a/rich/progress.py b/rich/progress.py
+index e4abbdb..b21e7a1 100644
+--- a/rich/progress.py
++++ b/rich/progress.py
+@@ -1,3 +1,7 @@
++import io
++import os
++import sys
++import warnings
+ from abc import ABC, abstractmethod
+ from collections import deque
+ from collections.abc import Sized
+@@ -8,21 +12,31 @@ from threading import Event, RLock, Thread
+ from types import TracebackType
+ from typing import (
+     Any,
++    BinaryIO,
+     Callable,
++    ContextManager,
+     Deque,
+     Dict,
++    Generic,
+     Iterable,
+     List,
+     NamedTuple,
+     NewType,
+     Optional,
+     Sequence,
++    TextIO,
+     Tuple,
+     Type,
+     TypeVar,
+     Union,
++    overload,
+ )
+ 
++if sys.version_info >= (3, 8):
++    from typing import Literal
++else:
++    from typing_extensions import Literal  # pragma: no cover
++
+ from . import filesize, get_console
+ from .console import Console, JustifyMethod, RenderableType, Group
+ from .highlighter import Highlighter
+@@ -37,6 +51,7 @@ from .text import Text, TextType
+ TaskID = NewType("TaskID", int)
+ 
+ ProgressType = TypeVar("ProgressType")
++_ReaderT = TypeVar("_ReaderT")
+ 
+ GetTimeCallable = Callable[[], float]
+ 
+@@ -149,6 +164,425 @@ def track(
+         )
+ 
+ 
++class _ProgressReader(io.RawIOBase):
++    """A binary reader that advances a progress task by the bytes it returns.
++
++    Instances are created by :meth:`Progress.open` and :meth:`Progress.wrap_file`.
++
++    Args:
++        handle (BinaryIO): The binary file object to read from.
++        progress (Progress): The Progress instance that holds the task.
++        task_id (TaskID): The task to advance as bytes are consumed.
++        owns_handle (bool): True if closing the reader should close ``handle``.
++    """
++
++    def __init__(
++        self,
++        handle: BinaryIO,
++        progress: "Progress",
++        task_id: TaskID,
++        owns_handle: bool,
++    ) -> None:
++        super().__init__()
++        self.handle = handle
++        self._progress = progress
++        self._task_id = task_id
++        self._owns_handle = owns_handle
++        self._is_closed = False
++
++    def _advance(self, size: int) -> None:
++        """Advance the task by a number of bytes, if any were consumed."""
++        if size:
++            self._progress.advance(self._task_id, size)
++
++    def read(self, size: int = -1) -> bytes:
++        """Read up to ``size`` bytes and advance the task by the bytes returned.
++
++        Args:
++            size (int, optional): Maximum number of bytes to read, or -1 for all. Defaults to -1.
++
++        Returns:
++            bytes: The bytes read.
++        """
++        data = self.handle.read(size)
++        self._advance(len(data))
++        return data
++
++    def readline(self, size: int = -1) -> bytes:
++        """Read one line and advance the task by the bytes returned.
++
++        Args:
++            size (int, optional): Maximum number of bytes to read, or -1 for no limit. Defaults to -1.
++
++        Returns:
++            bytes: The line read, including its line ending.
++        """
++        line = self.handle.readline(size)
++        self._advance(len(line))
++        return line
++
++    def readinto(self, buffer: Any) -> int:
++        """Read bytes into a writable buffer and advance the task.
++
++        Args:
++            buffer (Any): A writable bytes-like object.
++
++        Returns:
++            int: The number of bytes written into ``buffer``.
++        """
++        view = memoryview(buffer).cast("B")
++        data = self.handle.read(len(view))
++        count = len(data)
++        view[:count] = data
++        self._advance(count)
++        return count
++
++    def readlines(self, hint: int = -1) -> List[bytes]:
++        """Read all remaining lines and advance the task by their total length.
++
++        Args:
++            hint (int, optional): Approximate number of bytes to read, or -1 for all. Defaults to -1.
++
++        Returns:
++            List[bytes]: The lines read.
++        """
++        lines = self.handle.readlines(hint)
++        self._advance(sum(len(line) for line in lines))
++        return lines
++
++    def __iter__(self) -> "_ProgressReader":
++        return self
++
++    def __next__(self) -> bytes:
++        line = self.handle.readline()
++        if not line:
++            raise StopIteration
++        self._advance(len(line))
++        return line
++
++    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
++        """Seek in the underlying handle and set the task's completed value to the new position.
++
++        Args:
++            offset (int): Offset in bytes.
++            whence (int, optional): Reference point, as for ``io`` seek. Defaults to io.SEEK_SET.
++
++        Returns:
++            int: The new absolute position in bytes.
++        """
++        position = self.handle.seek(offset, whence)
++        self._progress.update(self._task_id, completed=position)
++        return position
++
++    def tell(self) -> int:
++        """Return the position of the underlying handle."""
++        return self.handle.tell()
++
++    def readable(self) -> bool:
++        return self.handle.readable()
++
++    def seekable(self) -> bool:
++        return self.handle.seekable()
++
++    def writable(self) -> bool:
++        return False
++
++    def write(self, data: Any) -> int:
++        """Writing is not supported by a reader.
++
++        Raises:
++            io.UnsupportedOperation: Always.
++        """
++        raise io.UnsupportedOperation("write")
++
++    def fileno(self) -> int:
++        return self.handle.fileno()
++
++    def isatty(self) -> bool:
++        return self.handle.isatty()
++
++    @property
++    def closed(self) -> bool:
++        """bool: True once the reader has been closed."""
++        return self._is_closed
++
++    def close(self) -> None:
++        """Close the reader, and the handle if the reader owns it."""
++        if not self._is_closed:
++            self._is_closed = True
++            if self._owns_handle:
++                self.handle.close()
++        super().close()
++
++    def __enter__(self) -> "_ProgressReader":
++        self.handle.__enter__()
++        return self
++
++    def __exit__(
++        self,
++        exc_type: Optional[Type[BaseException]],
++        exc_val: Optional[BaseException],
++        exc_tb: Optional[TracebackType],
++    ) -> None:
++        self.close()
++
++
++class _ProgressContext(Generic[_ReaderT]):
++    """Starts a Progress display and enters a reader; on exit, stops the display first, then exits the reader.
++
++    Args:
++        progress (Progress): The Progress instance to start and stop.
++        reader (ContextManager): The reader to enter and exit.
++    """
++
++    def __init__(self, progress: "Progress", reader: ContextManager[_ReaderT]) -> None:
++        self._progress = progress
++        self._reader = reader
++
++    def __enter__(self) -> _ReaderT:
++        self._progress.start()
++        try:
++            return self._reader.__enter__()
++        except BaseException:
++            self._progress.stop()
++            raise
++
++    def __exit__(
++        self,
++        exc_type: Optional[Type[BaseException]],
++        exc_val: Optional[BaseException],
++        exc_tb: Optional[TracebackType],
++    ) -> None:
++        try:
++            self._progress.stop()
++        finally:
++            self._reader.__exit__(exc_type, exc_val, exc_tb)
++
++
++def _make_reader_progress(
++    description: str,
++    auto_refresh: bool,
++    console: Optional[Console],
++    transient: bool,
++    get_time: Optional[GetTimeCallable],
++    refresh_per_second: float,
++    style: StyleType,
++    complete_style: StyleType,
++    finished_style: StyleType,
++    pulse_style: StyleType,
++    disable: bool,
++) -> "Progress":
++    """Build a Progress display with the columns used by the file readers."""
++    columns: List["ProgressColumn"] = (
++        [TextColumn("[progress.description]{task.description}")] if description else []
++    )
++    columns.extend(
++        (
++            BarColumn(
++                style=style,
++                complete_style=complete_style,
++                finished_style=finished_style,
++                pulse_style=pulse_style,
++            ),
++            DownloadColumn(),
++            TimeRemainingColumn(),
++        )
++    )
++    return Progress(
++        *columns,
++        auto_refresh=auto_refresh,
++        console=console,
++        transient=transient,
++        get_time=get_time,
++        refresh_per_second=refresh_per_second or 10,
++        disable=disable,
++    )
++
++
++@overload
++def open(
++    file: Union[str, bytes, os.PathLike],
++    mode: Literal["r", "rt"] = "r",
++    buffering: int = -1,
++    encoding: Optional[str] = None,
++    errors: Optional[str] = None,
++    newline: Optional[str] = None,
++    *,
++    total: Optional[int] = None,
++    description: str = "Reading...",
++    auto_refresh: bool = True,
++    console: Optional[Console] = None,
++    transient: bool = False,
++    get_time: Optional[GetTimeCallable] = None,
++    refresh_per_second: float = 10,
++    style: StyleType = "bar.back",
++    complete_style: StyleType = "bar.complete",
++    finished_style: StyleType = "bar.finished",
++    pulse_style: StyleType = "bar.pulse",
++    disable: bool = False,
++) -> ContextManager[TextIO]:
++    ...
++
++
++@overload
++def open(
++    file: Union[str, bytes, os.PathLike],
++    mode: Literal["rb", "br"],
++    buffering: int = -1,
++    encoding: Optional[str] = None,
++    errors: Optional[str] = None,
++    newline: Optional[str] = None,
++    *,
++    total: Optional[int] = None,
++    description: str = "Reading...",
++    auto_refresh: bool = True,
++    console: Optional[Console] = None,
++    transient: bool = False,
++    get_time: Optional[GetTimeCallable] = None,
++    refresh_per_second: float = 10,
++    style: StyleType = "bar.back",
++    complete_style: StyleType = "bar.complete",
++    finished_style: StyleType = "bar.finished",
++    pulse_style: StyleType = "bar.pulse",
++    disable: bool = False,
++) -> ContextManager[_ProgressReader]:
++    ...
++
++
++def open(
++    file: Union[str, bytes, os.PathLike],
++    mode: str = "r",
++    buffering: int = -1,
++    encoding: Optional[str] = None,
++    errors: Optional[str] = None,
++    newline: Optional[str] = None,
++    *,
++    total: Optional[int] = None,
++    description: str = "Reading...",
++    auto_refresh: bool = True,
++    console: Optional[Console] = None,
++    transient: bool = False,
++    get_time: Optional[GetTimeCallable] = None,
++    refresh_per_second: float = 10,
++    style: StyleType = "bar.back",
++    complete_style: StyleType = "bar.complete",
++    finished_style: StyleType = "bar.finished",
++    pulse_style: StyleType = "bar.pulse",
++    disable: bool = False,
++) -> Any:
++    """Read a file while displaying progress of the bytes consumed.
++
++    The file is read with a display created for this call. The display starts when
++    the returned context is entered and stops when it exits.
++
++    Args:
++        file (Union[str, bytes, os.PathLike]): Path of the file to open.
++        mode (str, optional): 'r' or 'rt' for text, 'rb' for binary. Defaults to 'r'.
++        buffering (int, optional): Buffering policy, as for the built-in open. Defaults to -1.
++        encoding (str, optional): Text encoding for text mode. Defaults to None.
++        errors (str, optional): Error handling for text mode. Defaults to None.
++        newline (str, optional): Newline handling for text mode. Defaults to None.
++        total (int, optional): Total size in bytes. Defaults to the size of the file.
++        description (str, optional): Description shown next to the bar. Defaults to "Reading...".
++        auto_refresh (bool, optional): Automatic refresh. Defaults to True.
++        console (Console, optional): Console to write to. Default creates internal Console instance.
++        transient (bool, optional): Clear the progress on exit. Defaults to False.
++        get_time (Callable, optional): Callable that gets the current time. Defaults to None.
++        refresh_per_second (float, optional): Number of times per second to refresh the display. Defaults to 10.
++        style (StyleType, optional): Style for the bar background. Defaults to "bar.back".
++        complete_style (StyleType, optional): Style for the completed bar. Defaults to "bar.complete".
++        finished_style (StyleType, optional): Style for a finished bar. Defaults to "bar.finished".
++        pulse_style (StyleType, optional): Style for pulsing bars. Defaults to "bar.pulse".
++        disable (bool, optional): Disable display of progress. Defaults to False.
++
++    Returns:
++        ContextManager: A context manager yielding a text reader for 'r' and 'rt', or a binary reader for 'rb'.
++
++    Raises:
++        ValueError: If the mode is invalid, or buffering is 0 in text mode.
++    """
++    progress = _make_reader_progress(
++        description,
++        auto_refresh,
++        console,
++        transient,
++        get_time,
++        refresh_per_second,
++        style,
++        complete_style,
++        finished_style,
++        pulse_style,
++        disable,
++    )
++    reader = progress.open(
++        file,
++        mode,
++        buffering,
++        encoding,
++        errors,
++        newline,
++        total=total,
++        description=description,
++    )
++    return _ProgressContext(progress, reader)
++
++
++def wrap_file(
++    file: BinaryIO,
++    total: int,
++    *,
++    description: str = "Reading...",
++    auto_refresh: bool = True,
++    console: Optional[Console] = None,
++    transient: bool = False,
++    get_time: Optional[GetTimeCallable] = None,
++    refresh_per_second: float = 10,
++    style: StyleType = "bar.back",
++    complete_style: StyleType = "bar.complete",
++    finished_style: StyleType = "bar.finished",
++    pulse_style: StyleType = "bar.pulse",
++    disable: bool = False,
++) -> ContextManager[_ProgressReader]:
++    """Read an open binary file while displaying progress of the bytes consumed.
++
++    The file is not closed by the returned reader or its context. The display starts
++    when the returned context is entered and stops when it exits.
++
++    Args:
++        file (BinaryIO): An open binary file-like object.
++        total (int): Total size in bytes. Required, because the size of a file-like object is not inferred.
++        description (str, optional): Description shown next to the bar. Defaults to "Reading...".
++        auto_refresh (bool, optional): Automatic refresh. Defaults to True.
++        console (Console, optional): Console to write to. Default creates internal Console instance.
++        transient (bool, optional): Clear the progress on exit. Defaults to False.
++        get_time (Callable, optional): Callable that gets the current time. Defaults to None.
++        refresh_per_second (float, optional): Number of times per second to refresh the display. Defaults to 10.
++        style (StyleType, optional): Style for the bar background. Defaults to "bar.back".
++        complete_style (StyleType, optional): Style for the completed bar. Defaults to "bar.complete".
++        finished_style (StyleType, optional): Style for a finished bar. Defaults to "bar.finished".
++        pulse_style (StyleType, optional): Style for pulsing bars. Defaults to "bar.pulse".
++        disable (bool, optional): Disable display of progress. Defaults to False.
++
++    Returns:
++        ContextManager: A context manager yielding a binary reader.
++    """
++    progress = _make_reader_progress(
++        description,
++        auto_refresh,
++        console,
++        transient,
++        get_time,
++        refresh_per_second,
++        style,
++        complete_style,
++        finished_style,
++        pulse_style,
++        disable,
++    )
++    reader = progress.wrap_file(file, total, description=description)
++    return _ProgressContext(progress, reader)
++
++
+ class ProgressColumn(ABC):
+     """Base class for a widget to use in progress display."""
+ 
+@@ -794,6 +1228,176 @@ class Progress(JupyterMixin):
+                 advance(task_id, 1)
+                 refresh()
+ 
++    @overload
++    def open(
++        self,
++        file: Union[str, bytes, os.PathLike],
++        mode: Literal["r", "rt"] = "r",
++        buffering: int = -1,
++        encoding: Optional[str] = None,
++        errors: Optional[str] = None,
++        newline: Optional[str] = None,
++        *,
++        total: Optional[int] = None,
++        task_id: Optional[TaskID] = None,
++        description: str = "Reading...",
++    ) -> TextIO:
++        ...
++
++    @overload
++    def open(
++        self,
++        file: Union[str, bytes, os.PathLike],
++        mode: Literal["rb", "br"],
++        buffering: int = -1,
++        encoding: Optional[str] = None,
++        errors: Optional[str] = None,
++        newline: Optional[str] = None,
++        *,
++        total: Optional[int] = None,
++        task_id: Optional[TaskID] = None,
++        description: str = "Reading...",
++    ) -> _ProgressReader:
++        ...
++
++    @overload
++    def open(
++        self,
++        file: Union[str, bytes, os.PathLike],
++        mode: str,
++        buffering: int = -1,
++        encoding: Optional[str] = None,
++        errors: Optional[str] = None,
++        newline: Optional[str] = None,
++        *,
++        total: Optional[int] = None,
++        task_id: Optional[TaskID] = None,
++        description: str = "Reading...",
++    ) -> Union[TextIO, _ProgressReader]:
++        ...
++
++    def open(
++        self,
++        file: Union[str, bytes, os.PathLike],
++        mode: str = "r",
++        buffering: int = -1,
++        encoding: Optional[str] = None,
++        errors: Optional[str] = None,
++        newline: Optional[str] = None,
++        *,
++        total: Optional[int] = None,
++        task_id: Optional[TaskID] = None,
++        description: str = "Reading...",
++    ) -> Union[TextIO, _ProgressReader]:
++        """Open a file for reading, advancing a task by the bytes consumed.
++
++        This does not start the display. Use the Progress as a context manager, or call
++        start(), to show it.
++
++        Args:
++            file (Union[str, bytes, os.PathLike]): Path of the file to open.
++            mode (str, optional): 'r' or 'rt' for text, 'rb' for binary. Defaults to 'r'.
++            buffering (int, optional): Buffering policy, as for the built-in open. Line buffering
++                (1) applies to text mode only. Defaults to -1.
++            encoding (str, optional): Text encoding for text mode. Defaults to None.
++            errors (str, optional): Error handling for text mode. Defaults to None.
++            newline (str, optional): Newline handling for text mode. Defaults to None.
++            total (int, optional): Total size in bytes. Defaults to the size of the file.
++            task_id (TaskID, optional): Existing task to advance. Defaults to a new task.
++            description (str, optional): Description of a new task. Defaults to "Reading...".
++
++        Returns:
++            Union[TextIO, _ProgressReader]: A text wrapper for 'r' and 'rt', or a binary reader for 'rb'.
++
++        Raises:
++            ValueError: If the mode is invalid, buffering is 0 in text mode, or the total cannot be determined.
++        """
++        normalized_mode = "".join(sorted(mode))
++        if normalized_mode not in ("r", "rt", "br"):
++            raise ValueError(f"invalid mode {mode!r}; expected 'r', 'rt' or 'rb'")
++        binary = "b" in normalized_mode
++
++        line_buffering = False
++        if binary:
++            if buffering == 1:
++                warnings.warn(
++                    "line buffering is not supported in binary mode; the default buffer size is used",
++                    RuntimeWarning,
++                    stacklevel=2,
++                )
++                buffering = -1
++        elif buffering == 0:
++            raise ValueError("can't have unbuffered text I/O")
++        elif buffering == 1:
++            line_buffering = True
++            buffering = -1
++
++        if total is None:
++            try:
++                total = os.stat(file).st_size
++            except OSError as error:
++                raise ValueError(
++                    f"could not determine the number of bytes in {file!r}; total must be specified"
++                ) from error
++
++        if task_id is None:
++            task_id = self.add_task(description, total=total)
++        else:
++            self.update(task_id, total=total)
++
++        handle = io.open(file, "rb", buffering)
++        reader = _ProgressReader(handle, self, task_id, owns_handle=True)
++        if binary:
++            return reader
++        return io.TextIOWrapper(
++            reader,
++            encoding=encoding,
++            errors=errors,
++            newline=newline,
++            line_buffering=line_buffering,
++        )
++
++    def wrap_file(
++        self,
++        file: BinaryIO,
++        total: Optional[int] = None,
++        *,
++        task_id: Optional[TaskID] = None,
++        description: str = "Reading...",
++    ) -> _ProgressReader:
++        """Wrap an open binary file, advancing a task by the bytes consumed.
++
++        The wrapped file is not closed by the returned reader. This does not start the display.
++
++        Args:
++            file (BinaryIO): An open binary file-like object.
++            total (int, optional): Total size in bytes. Defaults to the total of ``task_id``, if given.
++            task_id (TaskID, optional): Existing task to advance. Defaults to a new task.
++            description (str, optional): Description of a new task. Defaults to "Reading...".
++
++        Returns:
++            _ProgressReader: A binary reader over ``file``.
++
++        Raises:
++            ValueError: If neither ``total`` nor the total of ``task_id`` is available.
++        """
++        resolved_total = total
++        if resolved_total is None and task_id is not None:
++            with self._lock:
++                task_total: Optional[float] = self._tasks[task_id].total
++            if task_total is not None:
++                resolved_total = int(task_total)
++        if resolved_total is None:
++            raise ValueError(
++                "could not determine the number of bytes to read; total must be specified"
++            )
++
++        if task_id is None:
++            task_id = self.add_task(description, total=resolved_total)
++        else:
++            self.update(task_id, total=resolved_total)
++        return _ProgressReader(file, self, task_id, owns_handle=False)
++
+     def start_task(self, task_id: TaskID) -> None:
+         """Start a task.
+ 
+diff --git a/tests/test_progress.py b/tests/test_progress.py
+index db2e825..cf86d5b 100644
+--- a/tests/test_progress.py
++++ b/tests/test_progress.py
+@@ -1,6 +1,8 @@
+ # encoding=utf-8
+ 
+ import io
++import os
++import tempfile
+ from time import sleep
+ from types import SimpleNamespace
+ 
+@@ -24,6 +26,8 @@ from rich.progress import (
+     TimeElapsedColumn,
+     TimeRemainingColumn,
+     track,
++    open as progress_open,
++    wrap_file as progress_wrap_file,
+     _TrackThread,
+     TaskID,
+ )
+@@ -549,6 +553,200 @@ def test_no_output_if_progress_is_disabled() -> None:
+     assert result == expected
+ 
+ 
++def _make_console() -> Console:
++    return Console(
++        file=io.StringIO(),
++        force_terminal=True,
++        color_system="truecolor",
++        width=80,
++        legacy_windows=False,
++        _environ={},
++    )
++
++
++def _write_temp(content: bytes) -> str:
++    fd, path = tempfile.mkstemp()
++    with os.fdopen(fd, "wb") as temp_file:
++        temp_file.write(content)
++    return path
++
++
++def test_progress_module_open_default_mode_reads_text() -> None:
++    path = _write_temp(b"hello world")
++    try:
++        with progress_open(path, auto_refresh=False, console=_make_console()) as reader:
++            assert reader.read() == "hello world"
++        assert reader.closed
++    finally:
++        os.remove(path)
++
++
++def test_progress_module_open_explicit_text_mode() -> None:
++    path = _write_temp(b"hello world")
++    try:
++        with progress_open(
++            path, "r", auto_refresh=False, console=_make_console()
++        ) as reader:
++            assert reader.read() == "hello world"
++        assert reader.closed
++    finally:
++        os.remove(path)
++
++
++def test_progress_module_open_binary_mode_reads_bytes() -> None:
++    path = _write_temp(b"hello world")
++    try:
++        with progress_open(
++            path, "rb", auto_refresh=False, console=_make_console()
++        ) as reader:
++            assert reader.read() == b"hello world"
++        assert reader.closed
++    finally:
++        os.remove(path)
++
++
++def test_progress_module_wrap_file_keeps_caller_file_open() -> None:
++    path = _write_temp(b"abcdef")
++    try:
++        with open(path, "rb") as caller_file:
++            with progress_wrap_file(
++                caller_file, 6, auto_refresh=False, console=_make_console()
++            ) as reader:
++                assert reader.read() == b"abcdef"
++            assert reader.closed
++            assert not caller_file.closed
++        assert caller_file.closed
++    finally:
++        os.remove(path)
++
++
++def test_progress_open_path_defaults_total_to_file_size() -> None:
++    path = _write_temp(b"hello world")
++    try:
++        progress = Progress(console=_make_console(), auto_refresh=False)
++        with progress.open(path, "rb") as reader:
++            assert reader.read() == b"hello world"
++        assert progress.tasks[0].total == 11
++        assert progress.tasks[0].completed == 11
++        assert not progress.live.is_started
++    finally:
++        os.remove(path)
++
++
++def test_progress_wrap_file_reuses_task_total() -> None:
++    path = _write_temp(b"abcdef")
++    try:
++        progress = Progress(console=_make_console(), auto_refresh=False)
++        task_id = progress.add_task("reading", total=6)
++        with open(path, "rb") as caller_file:
++            with progress.wrap_file(caller_file, task_id=task_id) as reader:
++                data = reader.read()
++        assert data == b"abcdef"
++        assert progress.tasks[0].total == 6
++        assert progress.tasks[0].completed == 6
++    finally:
++        os.remove(path)
++
++
++def test_progress_wrap_file_without_total_or_task_total_raises() -> None:
++    path = _write_temp(b"abcdef")
++    try:
++        progress = Progress(console=_make_console(), auto_refresh=False)
++        task_id = progress.add_task("reading", total=None)
++        with open(path, "rb") as caller_file:
++            with pytest.raises(ValueError):
++                progress.wrap_file(caller_file, task_id=task_id)
++        assert not progress.live.is_started
++    finally:
++        os.remove(path)
++
++
++def test_progress_reader_read_paths_advance_completed() -> None:
++    content = b"line one\nline two\nline three\n"
++    path = _write_temp(content)
++    try:
++        progress = Progress(console=_make_console(), auto_refresh=False)
++        reader = progress.open(path, "rb")
++        with reader:
++            assert reader.readline() == b"line one\n"
++            assert progress.tasks[0].completed == 9
++            assert reader.read(4) == b"line"
++            assert progress.tasks[0].completed == 13
++            buffer = bytearray(3)
++            assert reader.readinto(buffer) == 3
++            assert bytes(buffer) == b" tw"
++            assert progress.tasks[0].completed == 16
++            assert reader.readlines() == [b"o\n", b"line three\n"]
++            assert progress.tasks[0].completed == len(content)
++
++            reader.seek(0)
++            assert progress.tasks[0].completed == 0
++            lines = list(reader)
++            assert lines == [b"line one\n", b"line two\n", b"line three\n"]
++            assert progress.tasks[0].completed == len(content)
++    finally:
++        os.remove(path)
++
++
++def test_progress_reader_seek_and_tell() -> None:
++    path = _write_temp(b"0123456789")
++    try:
++        progress = Progress(console=_make_console(), auto_refresh=False)
++        with progress.open(path, "rb") as reader:
++            assert reader.seek(5) == 5
++            assert progress.tasks[0].completed == 5
++            assert reader.tell() == 5
++            assert reader.read(2) == b"56"
++            assert progress.tasks[0].completed == 7
++    finally:
++        os.remove(path)
++
++
++def test_progress_reader_write_is_unsupported() -> None:
++    path = _write_temp(b"abc")
++    try:
++        progress = Progress(console=_make_console(), auto_refresh=False)
++        with progress.open(path, "rb") as reader:
++            assert not reader.writable()
++            with pytest.raises(io.UnsupportedOperation):
++                reader.write(b"x")
++    finally:
++        os.remove(path)
++
++
++def test_progress_open_invalid_mode_raises() -> None:
++    path = _write_temp(b"abc")
++    try:
++        progress = Progress(console=_make_console(), auto_refresh=False)
++        with pytest.raises(ValueError, match="'w'"):
++            progress.open(path, "w")
++        assert progress.task_ids == []
++    finally:
++        os.remove(path)
++
++
++def test_progress_open_text_mode_unbuffered_raises() -> None:
++    path = _write_temp(b"abc")
++    try:
++        progress = Progress(console=_make_console(), auto_refresh=False)
++        with pytest.raises(ValueError):
++            progress.open(path, "r", buffering=0)
++    finally:
++        os.remove(path)
++
++
++def test_progress_open_binary_line_buffering_warns_and_reads() -> None:
++    path = _write_temp(b"abc")
++    try:
++        progress = Progress(console=_make_console(), auto_refresh=False)
++        with pytest.warns(RuntimeWarning):
++            reader = progress.open(path, "rb", buffering=1)
++        with reader:
++            assert reader.read() == b"abc"
++    finally:
++        os.remove(path)
++
++
+ if __name__ == "__main__":
+     _render = render_progress()
+     print(_render)

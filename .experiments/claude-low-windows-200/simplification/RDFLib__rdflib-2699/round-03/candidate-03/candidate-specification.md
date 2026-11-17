@@ -1,0 +1,116 @@
+# SHACL path parsing utility
+
+## Goals
+- Convert the object of a SHACL `sh:path` triple into an RDFLib object usable as a predicate: a URIRef for a plain predicate, or a Path object for a complex path.
+- Reject malformed path structures with a domain-specific exception, and Literal path nodes with TypeError. Every other unusable input, including None and plain strings, also gets the domain-specific exception, so callers can tell SHACL path failures apart.
+- The result must work with Graph methods (for example as a predicate to triples or value), and its n3 output must serve as a SPARQL property path.
+
+## Scope
+In scope: one new SHACL utilities module in the existing rdflib extras package, with one public parsing function and one public exception class; tests for that module in the extras test directory.
+Out of scope: changes to the core SPARQL path module or any other existing rdflib module, including package `__init__` files; evaluating paths; validating whole shapes graphs; pyshacl integration; writing to the shapes graph.
+
+## Assumptions
+- The caller owns a fully loaded Graph holding the shapes; the parser only reads it.
+- The caller passes the object node of a `sh:path` triple, not the shape subject.
+- Sequence paths are RDF lists. No SHACL term named sequencePath exists; do not invent one.
+- The existing rdflib Path classes are used unchanged.
+
+## Terminology
+- Path node: the node passed to the parser as the value of `sh:path`.
+- RDF list: a chain of rdf:first and rdf:rest links ending in rdf:nil. rdf:nil alone denotes an empty list.
+- Modifier path: the result of sh:zeroOrMorePath, sh:oneOrMorePath, or sh:zeroOrOnePath, mapped to "*", "+", and "?" respectively.
+
+## Workflows
+Apply this procedure recursively to any path node, in order. The first matching step decides the result. Errors from nested parses propagate unchanged.
+1. If the node is a Literal, raise the literal type error.
+2. If the node is an IRI: if it is rdf:nil, raise the SHACL path error; otherwise return the IRI itself.
+3. If the node has an rdf:first link, iterate it as an RDF list with the graph's existing list-iteration method. If it has fewer than two items, raise the SHACL path error. Otherwise parse each item in order and return a sequence path of the results.
+4. Otherwise, if the node has sh:inversePath, parse its value and return an inverse path of the result.
+5. Otherwise, if the node has sh:alternativePath, apply the list rule from step 3 to the list named by its value, returning an alternative path of the results.
+6. Otherwise, if the node has sh:zeroOrMorePath, sh:oneOrMorePath, or sh:zeroOrOnePath, parse that predicate's value and return a modifier path with "*", "+", or "?" respectively.
+7. Otherwise, raise the SHACL path error naming the node.
+
+Non-node inputs need no separate type check. A plain string or None has no triples in the graph, so it reaches step 7. Do not treat None as a wildcard.
+
+## Data model
+- Input: a Graph and one path node, which is an IRI, a blank node, or a Literal.
+- Output: either the IRI itself (a URIRef) or a Path instance from the core path module.
+- The parser keeps no state between calls, and it never changes the graph, even when parsing fails.
+
+## API contracts
+- Public function parse_shacl_path in module rdflib.extras.shacl, with two positional parameters in this order: shapes_graph and path_identifier.
+- Returns a URIRef or a Path; the return annotation is the union of those two types.
+- Public exception SHACLPathError in the same module: a direct subclass of Exception with no added behavior. It must not subclass ValueError.
+- A Literal path node raises TypeError. Every other failure, including non-node input, raises SHACLPathError.
+- No new names are exported from the core path module or the top-level rdflib package.
+
+## Module architecture
+- Add exactly one new file, rdflib/extras/shacl.py, containing the exception class and the parsing function.
+- Dependencies point one way: extras depends on core, and core never imports extras. rdflib/paths.py stays free of SHACL vocabulary, error types, and parsing logic.
+
+## Implementation constraints
+- Read SH and RDF vocabulary from the rdflib.namespace objects. Do not hard-code IRIs as strings.
+- No function-local imports. Use only read operations on the graph: value lookups, membership checks, and list iteration.
+- Do not write a separate list-walking helper or second traversal loop; use the graph's existing list-iteration method.
+- Use the postponed annotation evaluation style of sibling extras modules.
+- Recognize only the SHACL path predicates listed in Workflows, plus rdf:first and rdf:nil.
+- Narrow every shapes-graph value lookup to a non-None result before passing it onward: bind the result, check for absence, and pass only the narrowed value.
+- Build each modifier path by calling the modifier path class from the paths module directly, with the parsed inner path and the modifier text. Do not apply the multiplication operator to a parsed result, since the type checker rejects string multiplication on an IRI result.
+
+## Dependencies
+- Allowed rdflib imports: the top-level Graph, Literal, and URIRef names; the paths module; the RDF and SH namespace objects; the Path class; and the Node type from the term module.
+- Standard library typing names are allowed. No new third-party dependency; pyproject.toml and the lock file stay unchanged.
+
+## Naming
+- Module: shacl, inside the extras package. Function: parse_shacl_path. Exception: SHACLPathError. Test module: test_shacl_extras, under the extras test directory.
+
+## Validation
+- For an RDF list used as a sequence or as alternatives, walk the whole list and count its items before parsing any item. Lists with fewer than two items, including empty ones, are invalid.
+- A list whose final cell has rdf:first but no rdf:rest ends at that cell, and that cell's item counts.
+- rdf:nil is invalid wherever a path is expected: as the whole path, as a sequence item, and as the value of sh:alternativePath (where it is an empty list).
+- Reject any blank node matching none of the recognized forms.
+
+## Error handling
+- A Literal path node raises TypeError with a message saying literals are not valid SHACL paths.
+- Each SHACLPathError carries a message naming the problem: rdf:nil used as a path, a sequence or alternative with fewer than two items, a non-node input, or an unrecognized node.
+- Do not wrap or re-raise errors from nested parses. Errors from list iteration propagate unchanged; a cyclic rdf:rest chain makes list iteration raise ValueError, which must not be caught or converted.
+
+## Logging
+- The module emits no log output; errors are reported only by exceptions.
+
+## Documentation
+- Module docstring: one line stating it contains utilities for working with SHACL shapes graphs.
+- Function docstring: what a valid SHACL path is, what the parameters mean, and what is returned, in the same reST field style as sibling docstrings, cross-referencing Graph, URIRef, and Path.
+- A comment near the function credits pyshacl's SHACL-to-SPARQL path conversion as the basis. Each recognized path form has a short comment naming its SHACL predicate.
+
+## Maintainability
+- Keep lines within 88 columns (exactly 88 is allowed). Format as black 23 would, and order imports per the repository's isort rules.
+- Put the parse function's parameters one per line with a trailing comma.
+- Pass modifier values as the literal text asterisk, plus, or question mark at the call site, not through variables or constants.
+- Both new modules must pass the repository's type-check configuration, including the unused type-ignore warning. If the checker is not installed, apply these rules by reading the code.
+
+## Compatibility
+- No behavior of any existing rdflib module changes.
+- Existing tests in test/test_path.py must pass unmodified. Add no SHACL tests there.
+
+## Behavioral acceptance criteria
+- An IRI path node returns that IRI unchanged.
+- A three-item RDF list of predicates returns a sequence path in order; a nested list inside a sequence parses recursively into a nested sequence.
+- A blank node with sh:inversePath returns an inverse path of the parsed value.
+- A blank node with sh:alternativePath whose list has three or more items returns an alternative path; nested alternatives and sequences parse correctly.
+- Blank nodes with sh:zeroOrMorePath, sh:oneOrMorePath, or sh:zeroOrOnePath return modifier paths with "*", "+", or "?".
+- Combined forms (for example a modifier wrapping an inverse) parse to the structure the nested forms describe.
+- An RDF list whose final cell has rdf:first but no rdf:rest is read as ending at that cell, and its items are parsed.
+- The IRI rdf:nil as a path raises SHACLPathError. A one-item or empty list used as a sequence raises SHACLPathError. An alternative whose list is empty or has one item raises SHACLPathError.
+- A blank node with no recognized path predicate raises SHACLPathError.
+- None or a plain string raises SHACLPathError, not TypeError. A Literal path node raises TypeError.
+- After any call, including a failing one, the shapes graph has the same triples as before.
+
+## Test requirements
+- One new test module under the extras test directory, beginning with the postponed annotation import used by sibling test modules, and importing only the names it uses, ordered per isort.
+- Annotate with precise types: Graph, URIRef, the union of URIRef and Path for expected values, or the exception class type. Do not use Any where the type is known.
+- Build the test graph from Turtle data in a module-scoped fixture, using an example namespace for shape IRIs and giving every shape a sh:path triple whose object is the path under test. Look up each shape's path with the SH path predicate.
+- Build expected values with rdflib's operators: slash for sequences, pipe for alternatives, tilde for inverses, and multiplication with the literal text for modifiers.
+- Type-ignore comments: a modifier literal applied directly to a bare IRI needs a type-ignore naming the operator error code; a modifier applied to an inverse expression needs none; a line needing both carries one comment for the reported term. Each line calling the parser with an optional lookup result, the line opening the expected-exception context, and any line passing a plain string or None needs a type-ignore naming the argument-type error code. Add none to lines the checker accepts, because warn_unused_ignores fails them.
+- One parametrized test covers valid and invalid shapes. Valid cases compare the result with the expected path; invalid cases assert the expected exception type.
+- Invalid cases cover each error branch: rdf:nil as a path, an empty sequence list, a one-item sequence, an empty alternative, a one-item alternative, an unrecognized blank node, and a Literal. In Turtle the empty list is an empty pair of parentheses, which is rdf:nil, so one case covers both the rdf:nil-as-path and empty-sequence branches.

@@ -1,0 +1,137 @@
+diff --git a/src/textual/app.py b/src/textual/app.py
+index b207bbd..d668bac 100644
+--- a/src/textual/app.py
++++ b/src/textual/app.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import concurrent.futures
+ import inspect
+ import io
+ import os
+@@ -11,6 +12,7 @@ import unicodedata
+ import warnings
+ from asyncio import Task
+ from contextlib import asynccontextmanager, redirect_stderr, redirect_stdout
++from functools import partial
+ from datetime import datetime
+ from pathlib import Path, PurePath
+ from queue import Queue
+@@ -18,6 +20,7 @@ from time import perf_counter
+ from typing import (
+     TYPE_CHECKING,
+     Any,
++    Awaitable,
+     Callable,
+     Generic,
+     Iterable,
+@@ -130,6 +133,7 @@ class CssPathError(Exception):
+ 
+ 
+ ReturnType = TypeVar("ReturnType")
++CallThreadReturnType = TypeVar("CallThreadReturnType")
+ 
+ 
+ class _NullFile:
+@@ -355,6 +359,9 @@ class App(Generic[ReturnType], DOMNode):
+ 
+         self._return_value: ReturnType | None = None
+         self._exit = False
++        # Thread-entry state, set by `run` while the app is running.
++        self._loop: asyncio.AbstractEventLoop | None = None
++        self._thread_id: int | None = None
+ 
+         self.css_monitor = (
+             FileMonitor(self.css_path, self._on_css_change)
+@@ -874,21 +881,83 @@ class App(Generic[ReturnType], DOMNode):
+ 
+         async def run_app() -> None:
+             """Run the app."""
++            self._loop = asyncio.get_running_loop()
+             await self.run_async(
+                 headless=headless,
+                 size=size,
+                 auto_pilot=auto_pilot,
+             )
+ 
+-        if _ASYNCIO_GET_EVENT_LOOP_IS_DEPRECATED:
+-            # N.B. This doesn't work with Python<3.10, as we end up with 2 event loops:
+-            asyncio.run(run_app())
+-        else:
+-            # However, this works with Python<3.10:
+-            event_loop = asyncio.get_event_loop()
+-            event_loop.run_until_complete(run_app())
++        self._thread_id = threading.get_ident()
++        try:
++            if _ASYNCIO_GET_EVENT_LOOP_IS_DEPRECATED:
++                # N.B. This doesn't work with Python<3.10, as we end up with 2 event loops:
++                asyncio.run(run_app())
++            else:
++                # However, this works with Python<3.10:
++                event_loop = asyncio.get_event_loop()
++                event_loop.run_until_complete(run_app())
++        finally:
++            # Clear thread-entry state on every exit path so later calls to
++            # `call_from_thread` report that the app is not running.
++            self._loop = None
++            self._thread_id = None
+         return self.return_value
+ 
++    def call_from_thread(
++        self,
++        callback: Callable[..., CallThreadReturnType | Awaitable[CallThreadReturnType]],
++        *args: Any,
++        **kwargs: Any,
++    ) -> CallThreadReturnType:
++        """Run a callable in the app's context from a different thread, and return its result.
++
++        Textual objects are not thread-safe. This method ensures the callable runs
++        in the correct context (with the app as the active app) on the app's event loop.
++        The call blocks until the callable has returned, and if the callable returns
++        an awaitable, it is awaited before returning.
++
++        Args:
++            callback (Callable[..., CallThreadReturnType | Awaitable[CallThreadReturnType]]):
++                The callable to run in the app's context. It may be a regular function
++                or a coroutine function, or return an awaitable.
++            *args: Positional arguments forwarded to the callable.
++            **kwargs: Keyword arguments forwarded to the callable.
++
++        Raises:
++            RuntimeError: If the app is not running (before it has started, or after it has stopped).
++            RuntimeError: If called from the app thread; this method must run in a different thread from the app.
++
++        Returns:
++            CallThreadReturnType: The result of the callable.
++        """
++        loop = self._loop
++        if loop is None:
++            raise RuntimeError("App is not running")
++        if threading.get_ident() == self._thread_id:
++            raise RuntimeError(
++                "The call_from_thread method must run in a different thread from the app"
++            )
++
++        callback_with_args = partial(callback, *args, **kwargs)
++
++        async def run_callback() -> CallThreadReturnType:
++            """Run the callback in the app's context, on the app's event loop."""
++            self._set_active()
++            return await invoke(callback_with_args)
++
++        future = asyncio.run_coroutine_threadsafe(run_callback(), loop)
++        while True:
++            done, _ = concurrent.futures.wait((future,), timeout=0.1)
++            if done:
++                # Re-raises any exception from the callable, unchanged.
++                return future.result()
++            # If the app has stopped while we were waiting, the scheduled work
++            # may never run, so stop waiting rather than block indefinitely.
++            if self._loop is None:
++                future.cancel()
++                raise RuntimeError("App is not running")
++
+     async def _on_css_change(self) -> None:
+         """Called when the CSS changes (if watch_css is True)."""
+         css_paths = self.css_path

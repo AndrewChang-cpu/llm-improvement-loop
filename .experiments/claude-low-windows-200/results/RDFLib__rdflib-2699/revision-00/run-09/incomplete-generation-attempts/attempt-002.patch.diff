@@ -1,0 +1,184 @@
+diff --git a/rdflib/paths.py b/rdflib/paths.py
+index 6d70ee1..5837bc3 100644
+--- a/rdflib/paths.py
++++ b/rdflib/paths.py
+@@ -197,7 +197,7 @@ from typing import (
+     Union,
+ )
+ 
+-from rdflib.term import Node, URIRef
++from rdflib.term import BNode, Node, URIRef
+ 
+ if TYPE_CHECKING:
+     from rdflib._type_checking import _MulPathMod
+@@ -588,6 +588,75 @@ def neg_path(p: Union[URIRef, AlternativePath, InvPath]) -> NegatedPath:
+     return NegatedPath(p)
+ 
+ 
++def parse_shacl_path(graph: Graph, node: Node) -> Union[URIRef, Path]:
++    """
++    Parse a SHACL property path, as found in the object of a ``sh:path``
++    triple, into an RDFLib-friendly path object.
++
++    A plain IRI is returned as-is (a path of length one). Complex SHACL
++    paths are returned as :class:`Path` instances, as described in
++    https://www.w3.org/TR/shacl/#property-paths
++
++    >>> from rdflib import BNode, Graph
++    >>> from rdflib.namespace import SH, SKOS
++    >>> g = Graph()
++    >>> p = BNode()
++    >>> _ = g.add((p, SH.inversePath, SKOS.broader))
++    >>> parse_shacl_path(g, p)
++    Path(~http://www.w3.org/2004/02/skos/core#broader)
++
++    :param graph: the graph containing the SHACL path description.
++    :param node: the node that is the object of the ``sh:path`` triple.
++    :raises ValueError: if the node does not describe a valid SHACL path.
++    """
++    from rdflib.namespace import RDF, SH
++
++    if isinstance(node, URIRef):
++        return node
++    if not isinstance(node, Node):
++        raise ValueError(f"Invalid SHACL path node: {node!r}")
++
++    def _list_items(head: Node) -> List[Union[URIRef, Path]]:
++        items: List[Union[URIRef, Path]] = []
++        current: Node = head
++        seen: Set[Node] = set()
++        while current != RDF.nil:
++            if current in seen:
++                raise ValueError("Cyclic RDF list in SHACL path")
++            seen.add(current)
++            first = graph.value(current, RDF.first)
++            rest = graph.value(current, RDF.rest)
++            if first is None or rest is None:
++                raise ValueError(f"Malformed RDF list in SHACL path: {current!r}")
++            items.append(parse_shacl_path(graph, first))
++            current = rest
++        if not items:
++            raise ValueError("Empty RDF list in SHACL path")
++        return items
++
++    inverse = graph.value(node, SH.inversePath)
++    if inverse is not None:
++        return InvPath(parse_shacl_path(graph, inverse))
++
++    alternative = graph.value(node, SH.alternativePath)
++    if alternative is not None:
++        return AlternativePath(*_list_items(alternative))
++
++    for pred, mod in (
++        (SH.zeroOrMorePath, ZeroOrMore),
++        (SH.oneOrMorePath, OneOrMore),
++        (SH.zeroOrOnePath, ZeroOrOne),
++    ):
++        arg = graph.value(node, pred)
++        if arg is not None:
++            return MulPath(parse_shacl_path(graph, arg), mod)
++
++    if isinstance(node, BNode) and (node, RDF.first, None) in graph:
++        return SequencePath(*_list_items(node))
++
++    raise ValueError(f"Not a valid SHACL path: {node!r}")
++
++
+ if __name__ == "__main__":
+     pass
+ else:
+diff --git a/test/test_path.py b/test/test_path.py
+index 1af0227..2b358d5 100644
+--- a/test/test_path.py
++++ b/test/test_path.py
+@@ -6,7 +6,7 @@ from typing import Union
+ import pytest
+ 
+ from rdflib import RDF, RDFS, Graph, URIRef
+-from rdflib.namespace import DCAT, DCTERMS
++from rdflib.namespace import DCAT, DCTERMS, SH
+ from rdflib.paths import (
+     AlternativePath,
+     InvPath,
+@@ -142,3 +142,81 @@ def test_hash(lhs: Path, rhs: Path) -> None:
+ def test_dict_key(insert_path: Path, check_path: Path) -> None:
+     d = {insert_path: "foo"}
+     assert d[check_path] == "foo"
++
++
++def test_parse_shacl_path_iri() -> None:
++    from rdflib.namespace import SH, SKOS
++    from rdflib.paths import parse_shacl_path
++
++    g = Graph()
++    assert parse_shacl_path(g, SKOS.broader) == SKOS.broader
++
++
++def test_parse_shacl_path_inverse() -> None:
++    from rdflib import BNode
++    from rdflib.namespace import SH, SKOS
++    from rdflib.paths import parse_shacl_path
++
++    g = Graph()
++    p = BNode()
++    g.add((p, SH.inversePath, SKOS.broader))
++    assert parse_shacl_path(g, p) == InvPath(SKOS.broader)
++
++
++def test_parse_shacl_path_sequence_and_alternative() -> None:
++    from rdflib import BNode
++    from rdflib.collection import Collection
++    from rdflib.namespace import SH, SKOS
++    from rdflib.paths import parse_shacl_path
++
++    g = Graph()
++    seq = BNode()
++    Collection(g, seq, [SKOS.broader, SKOS.narrower])
++    assert parse_shacl_path(g, seq) == SequencePath(SKOS.broader, SKOS.narrower)
++
++    alt_list = BNode()
++    Collection(g, alt_list, [SKOS.broader, SKOS.narrower])
++    alt = BNode()
++    g.add((alt, SH.alternativePath, alt_list))
++    assert parse_shacl_path(g, alt) == AlternativePath(SKOS.broader, SKOS.narrower)
++
++
++@pytest.mark.parametrize(
++    "predicate, mod",
++    [
++        (SH.zeroOrMorePath, ZeroOrMore),
++        (SH.oneOrMorePath, OneOrMore),
++        (SH.zeroOrOnePath, ZeroOrOne),
++    ],
++)
++def test_parse_shacl_path_modifiers(predicate: URIRef, mod: str) -> None:
++    from rdflib import BNode
++    from rdflib.namespace import SKOS
++    from rdflib.paths import MulPath, parse_shacl_path
++
++    g = Graph()
++    p = BNode()
++    g.add((p, predicate, SKOS.broader))
++    assert parse_shacl_path(g, p) == MulPath(SKOS.broader, mod)
++
++
++def test_parse_shacl_path_nested() -> None:
++    from rdflib import BNode
++    from rdflib.namespace import SH, SKOS
++    from rdflib.paths import parse_shacl_path
++
++    g = Graph()
++    inv = BNode()
++    g.add((inv, SH.inversePath, SKOS.broader))
++    star = BNode()
++    g.add((star, SH.zeroOrMorePath, inv))
++    assert parse_shacl_path(g, star) == MulPath(InvPath(SKOS.broader), ZeroOrMore)
++
++
++def test_parse_shacl_path_invalid() -> None:
++    from rdflib import BNode
++    from rdflib.paths import parse_shacl_path
++
++    g = Graph()
++    with pytest.raises(ValueError):
++        parse_shacl_path(g, BNode())

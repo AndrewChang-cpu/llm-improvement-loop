@@ -1,0 +1,235 @@
+diff --git a/rdflib/paths.py b/rdflib/paths.py
+index 6d70ee1..b4ade26 100644
+--- a/rdflib/paths.py
++++ b/rdflib/paths.py
+@@ -197,7 +197,7 @@ from typing import (
+     Union,
+ )
+ 
+-from rdflib.term import Node, URIRef
++from rdflib.term import BNode, Node, URIRef
+ 
+ if TYPE_CHECKING:
+     from rdflib._type_checking import _MulPathMod
+@@ -588,6 +588,82 @@ def neg_path(p: Union[URIRef, AlternativePath, InvPath]) -> NegatedPath:
+     return NegatedPath(p)
+ 
+ 
++def parse_shacl_path(graph: Graph, shacl_path: Node) -> Union[URIRef, Path]:
++    """
++    Parse a SHACL path (the object of a ``sh:path`` triple) into an
++    RDFLib-friendly predicate.
++
++    Returns a :class:`~rdflib.term.URIRef` when the SHACL path is a plain
++    predicate, and a :class:`Path` for complex paths such as
++    ``[sh:inversePath skos:broader]``.
++
++    See https://www.w3.org/TR/shacl/#property-paths
++
++    :param graph: The graph containing the SHACL path description.
++    :param shacl_path: The node describing the path (a URIRef or blank node).
++    :raises ValueError: If the node does not describe a valid SHACL path.
++
++    >>> from rdflib import Graph, Namespace, BNode
++    >>> from rdflib.namespace import SH, SKOS
++    >>> g = Graph()
++    >>> b = BNode()
++    >>> _ = g.add((b, SH.inversePath, SKOS.broader))
++    >>> parse_shacl_path(g, b)
++    Path(~http://www.w3.org/2004/02/skos/core#broader)
++    >>> parse_shacl_path(g, SKOS.broader)
++    rdflib.term.URIRef('http://www.w3.org/2004/02/skos/core#broader')
++    """
++    # local imports to avoid circular imports with rdflib.namespace/collection
++    from rdflib.collection import Collection
++    from rdflib.namespace._SH import SH
++
++    # sh:sequencePath is not present in the generated SH namespace
++    sh_sequence_path = URIRef("http://www.w3.org/ns/shacl#sequencePath")
++
++    if isinstance(shacl_path, URIRef):
++        return shacl_path
++
++    if not isinstance(shacl_path, BNode):
++        raise ValueError(f"Not a valid SHACL path: {shacl_path!r}")
++
++    def _list_items(list_node: Node) -> List[Union[URIRef, Path]]:
++        items = list(Collection(graph, list_node))
++        if not items:
++            raise ValueError(f"Empty SHACL path list: {list_node!r}")
++        return [parse_shacl_path(graph, item) for item in items]
++
++    def _single(predicate: URIRef) -> Optional[Node]:
++        values = list(graph.objects(shacl_path, predicate))
++        if len(values) > 1:
++            raise ValueError(
++                f"Multiple {predicate} values for SHACL path {shacl_path!r}"
++            )
++        return values[0] if values else None
++
++    inverse = _single(SH.inversePath)
++    if inverse is not None:
++        return InvPath(parse_shacl_path(graph, inverse))
++
++    alternative = _single(SH.alternativePath)
++    if alternative is not None:
++        return AlternativePath(*_list_items(alternative))
++
++    sequence = _single(sh_sequence_path)
++    if sequence is not None:
++        return SequencePath(*_list_items(sequence))
++
++    for predicate, modifier in (
++        (SH.zeroOrMorePath, ZeroOrMore),
++        (SH.oneOrMorePath, OneOrMore),
++        (SH.zeroOrOnePath, ZeroOrOne),
++    ):
++        inner = _single(predicate)
++        if inner is not None:
++            return MulPath(parse_shacl_path(graph, inner), modifier)
++
++    raise ValueError(f"Not a valid SHACL path: {shacl_path!r}")
++
++
+ if __name__ == "__main__":
+     pass
+ else:
+diff --git a/test/test_path.py b/test/test_path.py
+index 1af0227..a076417 100644
+--- a/test/test_path.py
++++ b/test/test_path.py
+@@ -5,7 +5,7 @@ from typing import Union
+ 
+ import pytest
+ 
+-from rdflib import RDF, RDFS, Graph, URIRef
++from rdflib import RDF, RDFS, Graph, Literal, URIRef
+ from rdflib.namespace import DCAT, DCTERMS
+ from rdflib.paths import (
+     AlternativePath,
+@@ -142,3 +142,125 @@ def test_hash(lhs: Path, rhs: Path) -> None:
+ def test_dict_key(insert_path: Path, check_path: Path) -> None:
+     d = {insert_path: "foo"}
+     assert d[check_path] == "foo"
++
++
++def test_parse_shacl_path_predicate() -> None:
++    from rdflib.paths import parse_shacl_path
++
++    g = Graph()
++    assert parse_shacl_path(g, RDF.type) == RDF.type
++
++
++def test_parse_shacl_path_inverse() -> None:
++    from rdflib import BNode
++    from rdflib.namespace import SH, SKOS
++    from rdflib.paths import parse_shacl_path
++
++    g = Graph()
++    b = BNode()
++    g.add((b, SH.inversePath, SKOS.broader))
++    path = parse_shacl_path(g, b)
++    assert isinstance(path, InvPath)
++    assert path == ~SKOS.broader
++    assert path.n3(nsm) == "^skos:broader"
++
++
++def test_parse_shacl_path_sequence() -> None:
++    from rdflib import BNode
++    from rdflib.collection import Collection
++    from rdflib.namespace import SH, SKOS
++    from rdflib.paths import parse_shacl_path
++
++    g = Graph()
++    b = BNode()
++    lst = BNode()
++    Collection(g, lst, [SKOS.broader, SKOS.narrower])
++    g.add((b, URIRef("http://www.w3.org/ns/shacl#sequencePath"), lst))
++    path = parse_shacl_path(g, b)
++    assert isinstance(path, SequencePath)
++    assert path == SKOS.broader / SKOS.narrower
++
++
++def test_parse_shacl_path_alternative() -> None:
++    from rdflib import BNode
++    from rdflib.collection import Collection
++    from rdflib.namespace import SH, SKOS
++    from rdflib.paths import parse_shacl_path
++
++    g = Graph()
++    b = BNode()
++    lst = BNode()
++    Collection(g, lst, [SKOS.broader, SKOS.narrower])
++    g.add((b, SH.alternativePath, lst))
++    path = parse_shacl_path(g, b)
++    assert isinstance(path, AlternativePath)
++    assert path == SKOS.broader | SKOS.narrower
++
++
++@pytest.mark.parametrize(
++    ["predicate", "modifier"],
++    [
++        ("zeroOrMorePath", ZeroOrMore),
++        ("oneOrMorePath", OneOrMore),
++        ("zeroOrOnePath", ZeroOrOne),
++    ],
++)
++def test_parse_shacl_path_modifiers(predicate: str, modifier: str) -> None:
++    from rdflib import BNode
++    from rdflib.namespace import SH, SKOS
++    from rdflib.paths import parse_shacl_path
++
++    g = Graph()
++    b = BNode()
++    g.add((b, getattr(SH, predicate), SKOS.broader))
++    path = parse_shacl_path(g, b)
++    assert isinstance(path, MulPath)
++    assert path.mod == modifier
++    assert path.path == SKOS.broader
++
++
++def test_parse_shacl_path_nested() -> None:
++    from rdflib import BNode
++    from rdflib.collection import Collection
++    from rdflib.namespace import SH, SKOS
++    from rdflib.paths import parse_shacl_path
++
++    # ( ^skos:broader / skos:narrower* )
++    g = Graph()
++    inv = BNode()
++    star = BNode()
++    seq_list = BNode()
++    root = BNode()
++    g.add((inv, SH.inversePath, SKOS.broader))
++    g.add((star, SH.zeroOrMorePath, SKOS.narrower))
++    Collection(g, seq_list, [inv, star])
++    g.add((root, URIRef("http://www.w3.org/ns/shacl#sequencePath"), seq_list))
++    path = parse_shacl_path(g, root)
++    assert path.n3(nsm) == "^skos:broader/skos:narrower*"
++
++
++@pytest.mark.parametrize(
++    "build",
++    [
++        lambda g, b: None,  # blank node with no SHACL path description
++        lambda g, b: g.add((b, SH.inversePath, Literal("x"))),
++    ],
++)
++def test_parse_shacl_path_invalid(build) -> None:
++    from rdflib import BNode, Literal
++    from rdflib.namespace import SH
++    from rdflib.paths import parse_shacl_path
++
++    g = Graph()
++    b = BNode()
++    build(g, b)
++    with pytest.raises(ValueError):
++        parse_shacl_path(g, b)
++
++
++def test_parse_shacl_path_literal_rejected() -> None:
++    from rdflib import Literal
++    from rdflib.paths import parse_shacl_path
++
++    with pytest.raises(ValueError):
++        parse_shacl_path(Graph(), Literal("foo"))

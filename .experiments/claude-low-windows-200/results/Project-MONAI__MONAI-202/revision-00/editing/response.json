@@ -1,0 +1,187 @@
+{
+  "specification": "## Goals\n- Make the feature's file-writing and image-plotting logic usable without an ignite engine. Provide an engine-free CSV saver and an engine-free NIfTI saver in the data package, and an engine-free 2D/3D image plotting function in the visualization package.\n- Keep the three ignite-facing components (segmentation saver handler, classification saver handler, TensorBoard image handler) as thin adapters. Each reads engine state through its transforms, then delegates to a saver or the plotting function in a single call.\n- Support single-item and batch saving on the savers, with optional metadata-driven naming, and expose the constructor options listed under API contracts.\n- Keep the file outputs that the reference defines, including the dtype rule for NIfTI output.\n\n## Scope\nIn scope:\n- New module monai/data/csv_saver.py holding the CSV saver.\n- New module monai/data/nifti_saver.py holding the NIfTI saver.\n- A new plotting function added to the existing module monai/visualize/img2tensorboard.py.\n- Changes to monai/handlers/segmentation_saver.py, monai/handlers/classification_saver.py, and monai/handlers/tensorboard_handlers.py.\n- Changing the default dtype argument of the NIfTI writer in monai/data/nifti_writer.py from the string form to the numpy float32 type. This is the same value and is not a behavior change.\n- Updating in-repo callers of the renamed parameter: examples/segmentation_3d/unet_evaluation_array.py, examples/segmentation_3d/unet_evaluation_dict.py, and tests/integration_sliding_window.py.\n- The tests listed under Test requirements.\nOut of scope:\n- Changes to the transforms package, other handlers, or the ignite attach and event-registration mechanics beyond what is described here.\n- New package dependencies, and any new module beyond the two data modules. Documentation pages are optional.\n\n## Terminology\n- Item: one entry along the first (batch) dimension of a data array or tensor. The data of one item is channel-first (channels, then spatial dimensions).\n- Batch: data whose first dimension indexes items. The save_batch operations iterate over it.\n- Meta data mapping: a mapping whose keys hold per-item values. The keys used are filename_or_obj, affine, and original_affine. In batch calls each value is a per-item sequence, indexed in parallel with the batch.\n- Item index: a running counter, starting at zero, kept by each saver. It increments on every single-item save, including each item within a batch. It is used as the name only when no meta data is given.\n- Ignite-free: the module imports neither ignite nor the monai handlers package, and does not take an engine object.\n- Data root: an optional root directory used to preserve relative folder structure. This feature never supplies one, so it is treated as empty.\n\n## Workflows\n1. Classification (CSV) through the handler: when each iteration completes, the classification handler gets meta data from its batch transform, gets model output from its output transform, and calls the CSV saver's batch save once with both. On the completion event, the handler calls the saver's finalize, which writes the CSV file. The handler does not loop over items itself.\n2. Segmentation (NIfTI) through the handler: when each iteration completes, the segmentation handler gets meta data and output the same way and calls the NIfTI saver's batch save once. It then logs one info message.\n3. Standalone use without ignite: a caller constructs the CSV or NIfTI saver directly and calls single-item save or batch save. The NIfTI saver writes each item immediately. The CSV saver writes its file only when finalize is called.\n4. TensorBoard image handler: on each call, compute the step from the global iteration transform. Then, for three sources in this order, skip the source if it is None; otherwise convert a tensor to numpy, require an array, and plot with the handler's index, max channels, and max frames:\n   - the first element of the batch transform output, tag 'input_0';\n   - the second element of the batch transform output, tag 'input_1';\n   - the output transform result, tag 'output'.\n   Flush the writer at the end.\n5. Plot function:\n   - Assert that the writer is a SummaryWriter.\n   - Select the item at the index.\n   - Convert a tensor to numpy.\n   - Branch on the dimensionality of the selected item:\n     - Two dimensions: rescale values to 0 to 1 and write one image with the tag suffix 'HW'.\n     - Three dimensions: if the first dimension is 3 and max channels is 3, write one RGB image with the suffix 'CHW'. Otherwise write only the first channel, rescaled to 0 to 1, with the suffix 'HW_0'. Write nothing else.\n     - Four or more dimensions: flatten the leading dimensions into a list of 3D volumes. For each of the first max-channels volumes, rescale to 0 to 255 and write one animated GIF with the suffix 'HWD_j', where j is the volume index. Use max frames as the frame count and a scale of 1.0, at the given step.\n     - Any other dimensionality: write nothing and raise no error.\n\n## Data model\nCSV cache:\n- The CSV saver holds an insertion-ordered mapping from a string key to a float32 array of values. A key is the filename_or_obj value when meta data is given, otherwise the string form of the item index.\n- Saving with an existing key replaces its values and keeps the key's original position.\n- Finalize writes one line per key, in insertion order. Each line is the key, then for each flattened value a comma followed by the value's text, then a newline. There is no header row.\n- With overwrite false and an existing file, finalize first reads each existing row: the first column is the key and the remaining columns are parsed as float32. These rows are stored into the cache, replacing any in-memory values with the same key. Then the merged cache is written.\n- Finalize creates the output directory if it is missing.\n\nNIfTI output layout and dtype:\n- For each input filename, remove the directory part and repeatedly strip extensions until none remain, to get a base name. The output path is the output directory, then the base name as a folder, then the base name joined with an underscore and the output postfix, then the output extension. The input's directory part is not preserved, because no data root is supplied.\n- Without meta data, the item index string is used as the base name.\n- Before writing, move the channel axis of each item to the last position. Write using the affine from meta data and the original affine from meta data, both optional and absent when not given.\n- The written dtype is the saver's dtype when it is set, otherwise the data's own dtype. The default is none for the NIfTI saver and the segmentation handler. This keeps the model output dtype by default.\n\n## API contracts\nCSV saver (class CSVSaver in monai/data/csv_saver.py):\n- Constructor parameters, in order: output directory (default the current directory), filename (default 'predictions.csv'), overwrite (default true). The filename must be a string whose last four characters are '.csv'. The file path is the output directory joined with the filename.\n- save: takes one item and an optional meta data mapping (default none). With meta data, the key comes from filename_or_obj. Without it, the key is the string form of the item index. A tensor is detached, moved to CPU, and converted to numpy. Values are stored as float32. The item index advances by one.\n- save_batch: takes a batch and an optional meta data mapping (default none). For each item along the first dimension, it calls save with that item. When meta data is given, the per-item mapping holds each key's value at the item's position. When it is none, each item uses none.\n- finalize: takes no required argument. It writes the file as described under Data model.\n- No engine parameter.\n\nNIfTI saver (class NiftiSaver in monai/data/nifti_saver.py):\n- Constructor parameters, in order: output directory (default the current directory), output postfix (default 'seg'), output extension (default '.nii.gz'), dtype (default none, meaning keep the data's dtype).\n- save: takes one item and an optional meta data mapping (default none), with the naming, affine, and dtype rules above. It writes through the existing NIfTI writer function in monai/data/nifti_writer.py.\n- save_batch: takes a batch and an optional meta data mapping (default none), with the same per-item rules as the CSV saver.\n- The file-name helper is a private static method with the parameters postfix, input filename, output folder, and an optional data root (default empty).\n\nPlot function (monai/visualize/img2tensorboard.py, function name plot_2d_or_3d_image):\n- Parameters, in order: data (tensor or array in NCHW[D] layout; one item is plotted), step, writer, index (default 0), max channels (default 1), max frames (default 64), tag (default 'output').\n- Accepts a tensor or a numpy array. Returns nothing.\n\nTensorBoard image handler (class TensorBoardImageHandler in monai/handlers/tensorboard_handlers.py):\n- Constructor parameters, in order: summary writer (optional; a new writer is created if none), batch transform, output transform, global iteration transform, index (default 0), max channels (default 1), max frames (default 64). The index parameter is new and sits before max channels.\n- Per-call behavior is as in Workflows. The index is passed to the plot function for all three sources.\n- It is callable with the engine. Plotting is delegated to the plot function, not implemented in the handler.\n\nSegmentation saver handler (class SegmentationSaver in monai/handlers/segmentation_saver.py):\n- Constructor parameters, in order: output directory (default the current directory), output postfix (default 'seg'), output extension (default '.nii.gz'), dtype (default none), batch transform (default identity), output transform (default identity), name (optional). The former output path parameter is replaced by the output directory parameter.\n- attach: sets the logger if none is set, from name or from the engine's logger. Registers the per-iteration hook if it is not already registered.\n- Call: gets meta data and output, calls the NIfTI saver's batch save once, then logs.\n- Holds one NIfTI saver created from the output directory, postfix, extension, and dtype.\n\nClassification saver handler (class ClassificationSaver in monai/handlers/classification_saver.py):\n- Constructor parameters, in order: output directory (default the current directory), filename (default 'predictions.csv'), overwrite (default true), batch transform, output transform, name. The filename parameter is new and sits before overwrite.\n- attach: sets the logger as above, registers the per-iteration hook, and registers a completion hook that calls the CSV saver's finalize.\n- Call: gets meta data and output, and calls the CSV saver's batch save once.\n\n## Module architecture\n- monai/data/csv_saver.py (new): CSV saver only. Imports standard-library file and csv modules, numpy, and torch. No ignite and no monai handlers import.\n- monai/data/nifti_saver.py (new): NIfTI saver. Imports numpy, torch, and the NIfTI writer in monai/data. No ignite.\n- monai/visualize/img2tensorboard.py: holds the plot function next to the existing animated-GIF helpers. It uses the existing rescale helper in monai/transforms/utils. No new visualize module is created.\n- monai/handlers/segmentation_saver.py and classification_saver.py: keep the ignite imports. They hold a saver instance and delegate. They contain no file-writing loops and no file-name construction.\n- monai/handlers/tensorboard_handlers.py: imports the plot function from monai/visualize/img2tensorboard and calls it directly.\n- Batch iteration belongs to the savers' batch operations. Handlers make one delegating call.\n- Dependency layering: handlers depend on data and visualize. Data and visualize do not import handlers or ignite.\n\n## Implementation constraints\n- Savers and the plot function take no engine object. Their inputs are plain data, paths, and a SummaryWriter.\n- Convert tensors to numpy (detach, move to CPU) before any numpy operation, including inside the plot function, so tensor input works for direct calls. The rescale helper requires numpy input.\n- Write NIfTI files only through the existing NIfTI writer.\n- The plot function must not construct its own SummaryWriter.\n- Leave the existing animated-GIF helpers unchanged.\n- Add no new dependencies.\n\n## Dependencies\n- Allowed: numpy, torch, the standard-library csv and os modules, the NIfTI writer in monai/data, the rescale helper in monai/transforms/utils, the existing tensorboard SummaryWriter, and ignite inside handler modules only.\n- No new packages and no requirements or setup-file changes.\n- Tests may use parameterized and the existing ignite engine.\n\n## Naming\n- The output directory parameter is named output_dir in the CSV saver, the NIfTI saver, the segmentation handler, and the classification handler. The name output_path is not used.\n- CSV parameter: filename. NIfTI parameters: output postfix, output extension, dtype.\n- The NIfTI file-name helper is private (leading underscore) and static.\n- TensorBoard tags: input_0, input_1, output. Plot suffixes: HW, CHW, HW_j, HWD_j.\n- Test files: tests/test_csv_saver.py, tests/test_nifti_saver.py, tests/test_handler_segmentation_saver.py, tests/test_handler_classification_saver.py (updated), tests/test_plot_2d_or_3d_image.py. Handler tests use the test_handler_ prefix.\n\n## Validation\n- CSV filename: must be a string ending in '.csv'. Checked by assertion.\n- Plot function: the writer must be a SummaryWriter. Checked by assertion.\n- TensorBoard handler: after tensor conversion, each non-None input, label, and output must be an array. Otherwise raise ValueError, using the original handler's wording for each of the three messages.\n- Add no further validation (no checks on meta keys or data shape).\n\n## Error handling\n- A missing filename_or_obj key in meta data: let the natural key lookup failure propagate as KeyError. Do not wrap it or convert it to ValueError.\n- Meta data of none: fall back to the item index. Raise nothing.\n- Plot with an unsupported dimensionality: write nothing and raise nothing.\n- Non-array values in the TensorBoard handler: raise ValueError as in Validation.\n\n## Logging\n- The segmentation handler logs one info message after each batch save, with the text 'saved all the model outputs as nifti files.'.\n- Handler logger: a plain assignable attribute, not a computed property. Set in attach to the engine's logger when none is set, or from the name argument.\n- The savers and the classification handler do not log.\n\n## Documentation\n- Use Google-style docstrings with Args blocks, following the repository convention.\n- The segmentation handler's call docstring keeps the sentence that the output file datatype is determined from the engine output dtype.\n- Saver docstrings describe the meta data keys and the none fallback to the item index.\n- Docstrings must not cite export paths that the package does not provide. Classes are referenced by their module.\n- Documentation pages are optional.\n\n## Compatibility\n- Intended breaking changes, per the reference:\n  - SegmentationSaver: the output path parameter is renamed to output_dir. The positional order becomes output directory, postfix, extension, dtype, transforms, name. The default dtype changes from the string float32 to none.\n  - ClassificationSaver: a filename parameter is inserted before overwrite.\n  - TensorBoardImageHandler: an index parameter is inserted before max channels.\n  - The handler attributes output_dir, overwrite, output_path, output_postfix, output_ext, and dtype need not be retained.\n- In-repo callers are updated: examples/segmentation_3d/unet_evaluation_array.py, examples/segmentation_3d/unet_evaluation_dict.py, and tests/integration_sliding_window.py use output_dir. No output_path alias is required.\n- The default dtype of none keeps the model output dtype, matching the original behavior, which ignored the dtype argument.\n- The default file layout and the CSV contents for the default path are unchanged.\n\n## Behavioral acceptance criteria\n- CSV: save_batch of eight zero values with names testfile0 through testfile7, then finalize, writes predictions.csv with eight rows in order. Each row starts with its name, and the values are 0.\n- NIfTI: save_batch of zeros with shape eight by one by two by two, with names testfile0 through testfile7, creates output/testfileN/testfileN_seg.nii.gz for each N.\n- NIfTI without meta data: items are named by their index.\n- NIfTI path layout: input 'sub/case0.nii.gz' produces output/case0/case0_seg.nii.gz. The directory part is dropped.\n- Dtype: a NIfTI saver with no dtype writes the data's own dtype. With a dtype set, it writes that dtype. The segmentation handler's default keeps an integer output as an integer.\n- Segmentation handler: attaches to an ignite engine and writes files with the layout above, using the output_dir keyword.\n- Classification handler: accepts filename and writes predictions.csv with the rows.\n- CSV with overwrite false: rows already in the file are retained, and file values replace in-memory values with the same key.\n- Plot: torch zero tensors with shapes (1,1,10,10), (1,3,10,10), (1,4,10,10), (1,1,10,10,10), and (1,3,10,10,10) each plot without error and create the run output. Tensor input is accepted.\n- Plot, three-dimensional non-RGB item: exactly one image is written, for channel 0.\n- TensorBoard handler: the index selects which batch element is plotted.\n\n## Test requirements\n- Each of the five test files listed under Naming exists and follows the repository style: unittest, parameterized for shape cases, and temporary directories removed after each test.\n- Expected paths must match the layout rules under Data model. Tests must not assert specific pixel values for constant input; they check that output exists.\n- The updated classification handler test passes filename.\n- The integration sliding-window test uses output_dir.\n- Tests describe behavior and are not claimed to pass unless executed.",
+  "edits": [
+    {
+      "category": "Purpose",
+      "subsection": "Goals",
+      "operation": "remove",
+      "change": "Remove the pull-request template content from the draft: the issue reference line, the Status line, the change-type checkbox list, and the 'Implemented' list. Replace them with the goals list in the new specification.",
+      "hypothesis": "The draft is a PR description, not a behavioral specification. Its checkbox and status lines carry no requirements. This addresses requirement_intent, since the intent of the feature was never stated as goals."
+    },
+    {
+      "category": "Purpose",
+      "subsection": "Goals",
+      "operation": "add",
+      "change": "Add four goals: engine-free savers and plot function, thin ignite adapters that delegate in one call, single and batch saving with metadata-driven naming, and the reference dtype rule.",
+      "hypothesis": "requirement_intent and architectural_fit failed in most runs because the draft never said that batch iteration belongs in the savers and that handlers only delegate. The goals state this directly."
+    },
+    {
+      "category": "Purpose",
+      "subsection": "Scope",
+      "operation": "add",
+      "change": "Add the in-scope file list: the two new data modules, the plot function in the existing img2tensorboard module, the three handler modules, the NIfTI writer default-type change, the three in-repo call sites that use the renamed parameter, and the listed tests. Add out-of-scope items.",
+      "hypothesis": "api_contract failed because the draft did not name the call sites that the renamed parameter affects (examples and the sliding-window integration test). file_location failed because the draft did not fix the plot function's module. Scope fixes both."
+    },
+    {
+      "category": "Purpose",
+      "subsection": "Terminology",
+      "operation": "add",
+      "change": "Define item, batch, meta data mapping, item index, ignite-free, and data root.",
+      "hypothesis": "convention_fit and api_contract failed on the meta-data-none case. Runs raised TypeError on None meta data and misused the index counter. Precise definitions remove that ambiguity."
+    },
+    {
+      "category": "Behavior",
+      "subsection": "Workflows",
+      "operation": "add",
+      "change": "Add the classification handler, segmentation handler, and standalone-use flows. Each handler flow makes one call to the saver's batch operation. The classification completion hook calls the CSV saver's finalize.",
+      "hypothesis": "architectural_fit failed in runs 00, 05, and 09 because the candidates kept the per-item batch loop in the handler layer. The workflows state that the handler does one delegating call and that the batch loop lives in the saver."
+    },
+    {
+      "category": "Behavior",
+      "subsection": "Workflows",
+      "operation": "add",
+      "change": "Add the TensorBoard image handler flow (sources input_0, input_1, output, each with the index passed through) and the plot function's branches. The three-dimensional non-RGB case writes one image for channel 0 only. Four-or-more dimensions write up to max channels GIFs.",
+      "hypothesis": "requirement_intent failed in runs 01, 04, and 07 because the candidate's plot wrote up to max channels images for 3D non-RGB input, while the reference returns after channel 0. Also, api_contract and requirement_intent failed because the handler always passed index 0. Both are now stated as behavior."
+    },
+    {
+      "category": "Data",
+      "subsection": "Data model",
+      "operation": "add",
+      "change": "Specify the CSV cache: insertion-ordered keys, replace-in-place on repeated keys, line format with no header, the overwrite-false load that replaces in-memory values at finalize, and directory creation at finalize.",
+      "hypothesis": "This preserves the CSV contract that the judge found correct (save, finalize, overwrite semantics) and states it explicitly, so the CSV path is not regressed. It also replaces the sorted-output choice that the candidates made with the reference's insertion order."
+    },
+    {
+      "category": "Data",
+      "subsection": "Data model",
+      "operation": "add",
+      "change": "Specify the NIfTI output layout: strip the directory part and all extensions from the input filename, then output directory, base name folder, base name plus postfix plus extension. Also specify the item-index fallback, channel-axis move, optional affine handling, and the dtype rule (saver dtype if set, else data dtype; default none).",
+      "hypothesis": "convention_fit failed in run 00 because the candidate's test asserted a 'sub' directory that the implementation drops. requirement_intent failed in runs 01, 03 through 09 because the candidate defaulted to float32 and so changed the output dtype, and in runs 02 and 09 because the dtype option had no effect. The rule states the reference behavior."
+    },
+    {
+      "category": "Interfaces",
+      "subsection": "API contracts",
+      "operation": "add",
+      "change": "Specify the CSV saver contract: constructor parameters with defaults and filename assertion; save with optional meta data and the index fallback; save_batch with per-item meta mapping; finalize with no required argument; no engine parameter.",
+      "hypothesis": "api_contract failed in every run. The candidates lacked save_batch, required meta data on save, and had no filename parameter. Reference tests call save_batch and pass filename, so those calls raised AttributeError or TypeError."
+    },
+    {
+      "category": "Interfaces",
+      "subsection": "API contracts",
+      "operation": "add",
+      "change": "Specify the NIfTI saver contract: constructor parameters including dtype (default none), save with optional meta data, save_batch with the same per-item rules, and the private name helper.",
+      "hypothesis": "api_contract failed in runs 03, 04, 06, 07, 08, and 09. The candidates had no dtype constructor parameter, no save_batch, and a save with a different signature. Also requirement_intent failed in run 09 because the dtype option was stored but never applied."
+    },
+    {
+      "category": "Interfaces",
+      "subsection": "API contracts",
+      "operation": "add",
+      "change": "Specify the segmentation saver handler contract: parameter named output_dir (replacing output_path), positional order output directory, postfix, extension, dtype, transforms, name; dtype default none; attach and call behavior.",
+      "hypothesis": "api_contract failed in every run because the candidates kept output_path, and the reference test calls the handler with output_dir and raises TypeError. requirement_intent failed in runs 00 through 09 because the dtype default changed to float32. This contract fixes both."
+    },
+    {
+      "category": "Interfaces",
+      "subsection": "API contracts",
+      "operation": "add",
+      "change": "Specify the classification saver handler contract: a filename parameter inserted before overwrite with default predictions.csv, and the attach hooks, including the completion hook that calls the CSV saver's finalize.",
+      "hypothesis": "api_contract failed in all runs because the candidates had no filename parameter and the reference test passes filename, which raised TypeError. The spec makes the parameter explicit."
+    },
+    {
+      "category": "Interfaces",
+      "subsection": "API contracts",
+      "operation": "add",
+      "change": "Specify the TensorBoard image handler constructor: index (default 0) inserted before max channels, stored and passed to plotting for all three sources.",
+      "hypothesis": "api_contract and requirement_intent failed in every run because the candidates hard-coded index 0 and gave the handler no index parameter. The reference adds the parameter and uses it for all three plots."
+    },
+    {
+      "category": "Interfaces",
+      "subsection": "API contracts",
+      "operation": "add",
+      "change": "Specify the plot function contract: parameter order and defaults (data, step, writer, index 0, max channels 1, max frames 64, tag 'output'), acceptance of tensor and array input, and that it returns nothing.",
+      "hypothesis": "Run 09 showed a runtime failure. The plot function passed a torch tensor into the rescale helper, which calls astype on its input, and torch tensors do not have astype, so the call raised AttributeError. The cause is that the candidate did not convert tensors to numpy before the rescale call. The contract requires tensor input to be accepted. The signature itself already matched the reference."
+    },
+    {
+      "category": "Architecture",
+      "subsection": "Module architecture",
+      "operation": "clarify",
+      "change": "State that the plot function lives in the existing monai/visualize/img2tensorboard.py module beside the animated-GIF helpers. Forbid a new visualize module and forbid placing the function in the handler package.",
+      "hypothesis": "file_location and architectural_fit failed in runs 01, 02, 04, 05, 06, 08, and 09 because the candidates created monai/visualize/visualizer.py or placed the function in the handler module. Reference-style imports from img2tensorboard raised ImportError."
+    },
+    {
+      "category": "Architecture",
+      "subsection": "Module architecture",
+      "operation": "add",
+      "change": "State that batch iteration belongs to the savers' batch operations and that handlers make one delegating call. Declare the data modules csv_saver and nifti_saver as the only new modules, located in monai/data.",
+      "hypothesis": "architectural_fit failed in runs 00, 05, and 09 because the candidates kept the per-item loop and metadata extraction in the handlers, so a non-ignite caller had to reimplement it. file_location failed in runs 01, 02, and 08 because the savers were placed in monai/handlers. This fixes both."
+    },
+    {
+      "category": "Architecture",
+      "subsection": "Implementation constraints",
+      "operation": "add",
+      "change": "Add constraints: savers and the plot function take no engine; convert tensors to numpy (detach, move to CPU) before any numpy-only operation, including inside the plot function; write NIfTI only through the existing writer; the plot function does not construct a writer; leave the GIF helpers unchanged; add no dependencies.",
+      "hypothesis": "This addresses the tensor-input runtime failure in run 09 by naming the failing operation and its cause. It also keeps the abstraction_integrity and approved_dependencies criteria that already passed."
+    },
+    {
+      "category": "Architecture",
+      "subsection": "Dependencies",
+      "operation": "clarify",
+      "change": "List the allowed dependencies explicitly. Note that the NIfTI writer's default dtype argument changes to the numpy float32 type, with the same value. Confirm that ignite is allowed only in handler modules.",
+      "hypothesis": "approved_dependencies and dependency_direction passed in all runs, so this edit preserves that correct constraint. Stating the writer default change prevents reviewers from treating it as an unexplained change to a shared module."
+    },
+    {
+      "category": "Conventions",
+      "subsection": "Naming",
+      "operation": "add",
+      "change": "Require the parameter name output_dir in all four savers and handlers, forbid output_path, make the NIfTI name helper private and static, and list the five test file names with the test_handler_ prefix for handler tests.",
+      "hypothesis": "convention_fit failed in runs 01, 06, and 08. The candidates mixed output_path and output_dir, made the name helper public, and named a handler test file test_segmentation_saver.py, which broke the repository's test_handler_ prefix convention."
+    },
+    {
+      "category": "Conventions",
+      "subsection": "Validation",
+      "operation": "add",
+      "change": "Specify the validation rules: CSV filename must end in .csv (assertion); plot writer must be a SummaryWriter (assertion); TensorBoard handler non-array values raise ValueError with the original handler's per-source wording. Add no further validation.",
+      "hypothesis": "convention_fit failed in runs 03 and 05. The candidates used a generic error message and omitted the writer validation that the reference and repository use. Listing the rules explicitly restores those checks."
+    },
+    {
+      "category": "Conventions",
+      "subsection": "Error handling",
+      "operation": "add",
+      "change": "State that a missing filename_or_obj key propagates as the natural KeyError and is not wrapped. Meta data of none falls back to the item index without raising. Unsupported plot dimensionality raises nothing.",
+      "hypothesis": "convention_fit and requirement_intent failed in run 03 because the candidate changed KeyError to ValueError for a missing key. Run 00 raised TypeError when meta data was None. The reference behavior is stated explicitly here."
+    },
+    {
+      "category": "Conventions",
+      "subsection": "Logging",
+      "operation": "add",
+      "change": "Specify that the segmentation handler logs one info message after each batch save. Require the handler logger to be a plain assignable attribute set in attach. State that the savers and the classification handler do not log.",
+      "hypothesis": "convention_fit and requirement_intent failed in run 09 because the candidate made logger a read-only property, so assigning handler.logger raised AttributeError. The reference keeps a plain attribute."
+    },
+    {
+      "category": "Conventions",
+      "subsection": "Documentation",
+      "operation": "add",
+      "change": "Require Google-style Args docstrings. Keep the segmentation call docstring sentence on the output datatype. Describe the meta data keys and the index fallback in saver docstrings. Forbid docstrings that cite export paths the package does not provide.",
+      "hypothesis": "convention_fit failed in runs 02, 05, 06, 07, and 08. The candidates removed the dtype sentence, cited non-exported paths such as monai.data.CSVSaver, and left a stale prediction_dict reference. These rules prevent each of those defects."
+    },
+    {
+      "category": "Compatibility",
+      "subsection": "Compatibility",
+      "operation": "add",
+      "change": "List the intended breaking changes from the reference: the output_path to output_dir rename and positional reorder on the segmentation handler, the default dtype change to none, the filename parameter on the classification handler, and the index parameter on the TensorBoard handler. State that output_path needs no alias and that handler attributes need not be retained. Require in-repo callers to be updated.",
+      "hypothesis": "api_contract failed in runs 00 through 09 partly because the candidates kept output_path as a compatibility alias, which the judge recorded as a contract divergence. Stating the reference contract as intentionally breaking, with callers updated, makes the required change explicit."
+    },
+    {
+      "category": "Acceptance",
+      "subsection": "Behavioral acceptance criteria",
+      "operation": "add",
+      "change": "Add the acceptance criteria for the CSV save and finalize, NIfTI batch save and layout, index-based naming, dtype behavior, segmentation and classification handler behavior with the new keywords, CSV overwrite false, plot shapes with tensor input, the single-image rule for three-dimensional non-RGB input, and the TensorBoard index selection.",
+      "hypothesis": "requirement_intent failed in every run. The judge's reference-based tests exercise these behaviors, and writing them as explicit criteria makes each one checkable."
+    },
+    {
+      "category": "Acceptance",
+      "subsection": "Test requirements",
+      "operation": "add",
+      "change": "Specify the five test files and their content. Expected paths must follow the Data model layout rules. Do not assert specific pixel values for constant input. The updated classification handler test passes filename. The sliding-window integration test uses output_dir.",
+      "hypothesis": "patch_and_checks and convention_fit failed in run 00 because the candidate's NIfTI test asserted a path that the implementation does not produce, and in run 08 because a test asserted pixel values that rescaling a constant input does not produce. These rules prevent test expectations that contradict the implementation."
+    }
+  ]
+}

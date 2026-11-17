@@ -1,0 +1,787 @@
+diff --git a/docs/source/data.rst b/docs/source/data.rst
+index 8cd41dc..ee3b12c 100644
+--- a/docs/source/data.rst
++++ b/docs/source/data.rst
+@@ -41,6 +41,17 @@ Writing
+ .. automodule:: monai.data.nifti_writer
+   :members:
+ 
++Saving
++~~~~~~
++.. automodule:: monai.data.nifti_saver
++  :members:
++
++
++CSV saving
++----------
++.. automodule:: monai.data.csv_saver
++  :members:
++
+ 
+ Synthetic
+ ---------
+diff --git a/monai/data/csv_saver.py b/monai/data/csv_saver.py
+new file mode 100644
+index 0000000..b8bd788
+--- /dev/null
++++ b/monai/data/csv_saver.py
+@@ -0,0 +1,77 @@
++# Copyright 2020 MONAI Consortium
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#     http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import os
++import csv
++import numpy as np
++import torch
++
++
++class CSVSaver:
++    """
++    Save the data in a dictionary format cache, and write into a CSV file when finalized.
++    Each row is ``filename, value_0, value_1, ...``. This class has no dependency on ignite,
++    so it can be used directly or wrapped by an event handler.
++    """
++
++    def __init__(self, output_dir='./', filename='predictions.csv', overwrite=True):
++        """
++        Args:
++            output_dir (str): output CSV file directory.
++            filename (str): name of the output CSV file.
++            overwrite (bool): whether to overwrite existing CSV file content. If we are not overwriting,
++                then we check if the results have been previously saved, and load them to the cache.
++        """
++        self.output_dir = output_dir
++        self.filepath = os.path.join(output_dir, filename)
++        self.overwrite = overwrite
++        self._cache_dict = {}
++
++    def save(self, data, meta_data=None):
++        """
++        Cache the values of every item in the batch `data`, keyed by the file name in `meta_data`.
++
++        Args:
++            data (numpy.ndarray or torch.Tensor): batch of predictions, the first dimension is the batch dimension.
++            meta_data (dict): dictionary of per-item lists with the key ``'filename_or_obj'`` (required).
++        """
++        if meta_data is None or 'filename_or_obj' not in meta_data:
++            raise ValueError("meta_data must contain the 'filename_or_obj' key to save CSV rows.")
++        filenames = meta_data['filename_or_obj']
++
++        for batch_id, filename in enumerate(filenames):  # save a batch of files
++            output = data[batch_id]
++            if isinstance(output, torch.Tensor):
++                output = output.detach().cpu().numpy()
++            self._cache_dict[filename] = np.asarray(output).astype(np.float32)
++
++    def finalize(self):
++        """
++        Write the cached values to the CSV file.
++
++        Returns:
++            str: path of the written CSV file.
++        """
++        if not self.overwrite and os.path.exists(self.filepath):
++            with open(self.filepath, 'r') as f:
++                reader = csv.reader(f)
++                for row in reader:
++                    self._cache_dict[row[0]] = np.array(row[1:]).astype(np.float32)
++
++        if not os.path.exists(self.output_dir):
++            os.makedirs(self.output_dir)
++        with open(self.filepath, 'w') as f:
++            for k, v in sorted(self._cache_dict.items()):
++                f.write(k)
++                for result in v.flatten():
++                    f.write("," + str(result))
++                f.write("\n")
++        return self.filepath
+diff --git a/monai/data/nifti_saver.py b/monai/data/nifti_saver.py
+new file mode 100644
+index 0000000..5532a9f
+--- /dev/null
++++ b/monai/data/nifti_saver.py
+@@ -0,0 +1,109 @@
++# Copyright 2020 MONAI Consortium
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#     http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import os
++import numpy as np
++import torch
++from monai.data.nifti_writer import write_nifti
++
++
++class NiftiSaver:
++    """
++    Save data (a batch of images) to NIfTI files. This class has no dependency on ignite,
++    so it can be used directly or wrapped by an event handler.
++    """
++
++    def __init__(self, output_dir='./', output_postfix='seg', output_ext='.nii.gz'):
++        """
++        Args:
++            output_dir (str): output image directory.
++            output_postfix (str): a string appended to all output file names.
++            output_ext (str): output file extension name.
++        """
++        self.output_dir = output_dir
++        self.output_postfix = output_postfix
++        self.output_ext = output_ext
++
++    @staticmethod
++    def _create_file_basename(postfix, input_file_name, folder_path, data_root_dir=""):
++        """
++        Utility function to create the path to the output file based on the input
++        filename (extension is added by lib level writer before writing the file)
++
++        Args:
++            postfix (str): output name's postfix
++            input_file_name (str): path to the input image file
++            folder_path (str): path for the output file
++            data_root_dir (str): if not empty, it specifies the beginning parts of the input file's
++          absolute path. This is used to compute `input_file_rel_path`, the relative path to the file from
++          `data_root_dir` to preserve folder structure when saving in case there are files in different
++          folders with the same file names.
++        """
++
++        # get the filename and directory
++        filedir, filename = os.path.split(input_file_name)
++
++        # jettison the extension to have just filename
++        filename, ext = os.path.splitext(filename)
++        while ext != "":
++            filename, ext = os.path.splitext(filename)
++
++        # use data_root_dir to find relative path to file
++        filedir_rel_path = ""
++        if data_root_dir:
++            filedir_rel_path = os.path.relpath(filedir, data_root_dir)
++
++        # sub-folder path will be original name without the extension
++        subfolder_path = os.path.join(folder_path, filedir_rel_path, filename)
++        if not os.path.exists(subfolder_path):
++            os.makedirs(subfolder_path)
++
++        # add the sub-folder plus the postfix name to become the file basename in the output path
++        return os.path.join(subfolder_path, filename + "_" + postfix)
++
++    def save(self, data, meta_data=None):
++        """
++        Save every item of the batch `data` into an individual NIfTI file.
++
++        Args:
++            data (numpy.ndarray or torch.Tensor): batch of data, the first dimension is the batch dimension.
++                Each item is expected in "channel first" format, it is moved to "channel last" before writing.
++            meta_data (dict): optional dictionary of per-item lists (one entry per batch item), with keys:
++
++                - ``'filename_or_obj'`` -- used to create the output file name (required).
++                - ``'original_affine'`` (optional) for data orientation handling.
++                - ``'affine'`` (optional) for data output affine.
++
++        Returns:
++            list: paths of the written files, one per batch item.
++        """
++        if meta_data is None or 'filename_or_obj' not in meta_data:
++            raise ValueError("meta_data must contain the 'filename_or_obj' key to create output file names.")
++        filenames = meta_data['filename_or_obj']
++        original_affine = meta_data.get('original_affine', None)
++        affine = meta_data.get('affine', None)
++
++        if isinstance(data, torch.Tensor):
++            data = data.detach().cpu().numpy()
++        saved_files = []
++        for batch_id, filename in enumerate(filenames):  # save a batch of files
++            seg_output = data[batch_id]
++            affine_ = None if affine is None else affine[batch_id]
++            original_affine_ = None if original_affine is None else original_affine[batch_id]
++            if isinstance(seg_output, torch.Tensor):
++                seg_output = seg_output.detach().cpu().numpy()
++            output_filename = self._create_file_basename(self.output_postfix, filename, self.output_dir)
++            output_filename = '{}{}'.format(output_filename, self.output_ext)
++            # change output to "channel last" format and write to nifti format file
++            to_save = np.moveaxis(seg_output, 0, -1)
++            write_nifti(to_save, affine_, output_filename, original_affine_, dtype=seg_output.dtype)
++            saved_files.append(output_filename)
++        return saved_files
+diff --git a/monai/handlers/classification_saver.py b/monai/handlers/classification_saver.py
+index 501dce8..38db6c2 100644
+--- a/monai/handlers/classification_saver.py
++++ b/monai/handlers/classification_saver.py
+@@ -9,17 +9,15 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-import os
+-import csv
+-import numpy as np
+-import torch
+-from ignite.engine import Events
+ import logging
++from ignite.engine import Events
++from monai.data.csv_saver import CSVSaver
+ 
+ 
+ class ClassificationSaver:
+     """
+     Event handler triggered on completing every iteration to save the classification predictions as CSV file.
++    The file writing is done by ``monai.data.csv_saver.CSVSaver``, which can also be used without ignite.
+     """
+ 
+     def __init__(self, output_dir='./', overwrite=True,
+@@ -39,11 +37,10 @@ class ClassificationSaver:
+ 
+         """
+         self.output_dir = output_dir
+-        self._prediction_dict = {}
+-        self._preds_filepath = os.path.join(output_dir, 'predictions.csv')
+         self.overwrite = overwrite
+         self.batch_transform = batch_transform
+         self.output_transform = output_transform
++        self.saver = CSVSaver(output_dir=output_dir, filename='predictions.csv', overwrite=overwrite)
+ 
+         self.logger = None if name is None else logging.getLogger(name)
+ 
+@@ -60,21 +57,8 @@ class ClassificationSaver:
+         Writes the prediction dict to a csv
+ 
+         """
+-        if not self.overwrite and os.path.exists(self._preds_filepath):
+-            with open(self._preds_filepath, 'r') as f:
+-                reader = csv.reader(f)
+-                for row in reader:
+-                    self._prediction_dict[row[0]] = np.array(row[1:]).astype(np.float32)
+-
+-        if not os.path.exists(self.output_dir):
+-            os.makedirs(self.output_dir)
+-        with open(self._preds_filepath, 'w') as f:
+-            for k, v in sorted(self._prediction_dict.items()):
+-                f.write(k)
+-                for result in v.flatten():
+-                    f.write("," + str(result))
+-                f.write("\n")
+-        self.logger.info('saved classification predictions into: {}'.format(self._preds_filepath))
++        filepath = self.saver.finalize()
++        self.logger.info('saved classification predictions into: {}'.format(filepath))
+ 
+     def __call__(self, engine):
+         """
+@@ -85,11 +69,5 @@ class ClassificationSaver:
+ 
+         """
+         meta_data = self.batch_transform(engine.state.batch)
+-        filenames = meta_data['filename_or_obj']
+-
+         engine_output = self.output_transform(engine.state.output)
+-        for batch_id, filename in enumerate(filenames):  # save a batch of files
+-            output = engine_output[batch_id]
+-            if isinstance(output, torch.Tensor):
+-                output = output.detach().cpu().numpy()
+-            self._prediction_dict[filename] = output.astype(np.float32)
++        self.saver.save(engine_output, meta_data)
+diff --git a/monai/handlers/segmentation_saver.py b/monai/handlers/segmentation_saver.py
+index 98eb972..5261dc7 100644
+--- a/monai/handlers/segmentation_saver.py
++++ b/monai/handlers/segmentation_saver.py
+@@ -9,17 +9,15 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-import os
+-import numpy as np
+-import torch
+-from ignite.engine import Events
+ import logging
+-from monai.data.nifti_writer import write_nifti
++from ignite.engine import Events
++from monai.data.nifti_saver import NiftiSaver
+ 
+ 
+ class SegmentationSaver:
+     """
+     Event handler triggered on completing every iteration to save the segmentation predictions as nifti files.
++    The file writing is done by ``monai.data.nifti_saver.NiftiSaver``, which can also be used without ignite.
+     """
+ 
+     def __init__(self, output_path='./', dtype='float32', output_postfix='seg', output_ext='.nii.gz',
+@@ -27,7 +25,8 @@ class SegmentationSaver:
+         """
+         Args:
+             output_path (str): output image directory.
+-            dtype (str): to convert the image to save to this datatype.
++            dtype (str): kept for backward compatibility; the output file datatype is determined
++                from the data being saved, as before.
+             output_postfix (str): a string appended to all output file names.
+             output_ext (str): output file extension name.
+             batch_transform (Callable): a callable that is used to transform the
+@@ -44,6 +43,7 @@ class SegmentationSaver:
+         self.output_ext = output_ext
+         self.batch_transform = batch_transform
+         self.output_transform = output_transform
++        self.saver = NiftiSaver(output_dir=output_path, output_postfix=output_postfix, output_ext=output_ext)
+ 
+         self.logger = None if name is None else logging.getLogger(name)
+ 
+@@ -55,40 +55,8 @@ class SegmentationSaver:
+ 
+     @staticmethod
+     def _create_file_basename(postfix, input_file_name, folder_path, data_root_dir=""):
+-        """
+-        Utility function to create the path to the output file based on the input
+-        filename (extension is added by lib level writer before writing the file)
+-
+-        Args:
+-            postfix (str): output name's postfix
+-            input_file_name (str): path to the input image file
+-            folder_path (str): path for the output file
+-            data_root_dir (str): if not empty, it specifies the beginning parts of the input file's
+-          absolute path. This is used to compute `input_file_rel_path`, the relative path to the file from
+-          `data_root_dir` to preserve folder structure when saving in case there are files in different
+-          folders with the same file names.
+-        """
+-
+-        # get the filename and directory
+-        filedir, filename = os.path.split(input_file_name)
+-
+-        # jettison the extension to have just filename
+-        filename, ext = os.path.splitext(filename)
+-        while ext != "":
+-            filename, ext = os.path.splitext(filename)
+-
+-        # use data_root_dir to find relative path to file
+-        filedir_rel_path = ""
+-        if data_root_dir:
+-            filedir_rel_path = os.path.relpath(filedir, data_root_dir)
+-
+-        # sub-folder path will be original name without the extension
+-        subfolder_path = os.path.join(folder_path, filedir_rel_path, filename)
+-        if not os.path.exists(subfolder_path):
+-            os.makedirs(subfolder_path)
+-
+-        # add the sub-folder plus the postfix name to become the file basename in the output path
+-        return os.path.join(subfolder_path, filename + "_" + postfix)
++        """Kept for backward compatibility, see ``NiftiSaver._create_file_basename``."""
++        return NiftiSaver._create_file_basename(postfix, input_file_name, folder_path, data_root_dir)
+ 
+     def __call__(self, engine):
+         """
+@@ -102,20 +70,6 @@ class SegmentationSaver:
+         output file datatype is determined from ``engine.state.output.dtype``.
+         """
+         meta_data = self.batch_transform(engine.state.batch)
+-        filenames = meta_data['filename_or_obj']
+-        original_affine = meta_data.get('original_affine', None)
+-        affine = meta_data.get('affine', None)
+-
+         engine_output = self.output_transform(engine.state.output)
+-        for batch_id, filename in enumerate(filenames):  # save a batch of files
+-            seg_output = engine_output[batch_id]
+-            affine_ = affine[batch_id]
+-            original_affine_ = original_affine[batch_id]
+-            if isinstance(seg_output, torch.Tensor):
+-                seg_output = seg_output.detach().cpu().numpy()
+-            output_filename = self._create_file_basename(self.output_postfix, filename, self.output_path)
+-            output_filename = '{}{}'.format(output_filename, self.output_ext)
+-            # change output to "channel last" format and write to nifti format file
+-            to_save = np.moveaxis(seg_output, 0, -1)
+-            write_nifti(to_save, affine_, output_filename, original_affine_, dtype=seg_output.dtype)
++        for output_filename in self.saver.save(engine_output, meta_data):
+             self.logger.info('saved: {}'.format(output_filename))
+diff --git a/monai/handlers/tensorboard_handlers.py b/monai/handlers/tensorboard_handlers.py
+index fb5eb34..61649af 100644
+--- a/monai/handlers/tensorboard_handlers.py
++++ b/monai/handlers/tensorboard_handlers.py
+@@ -21,6 +21,56 @@ from monai.transforms.utils import rescale_array
+ DEFAULT_TAG = 'Loss'
+ 
+ 
++def plot_2d_or_3d_image(data, step, writer, index=0, max_channels=1, max_frames=64, tag='output'):
++    """Plot 2D or 3D image on the TensorBoard. This function has no dependency on ignite,
++    so it can be called directly or from an event handler.
++
++    2D data (shape ``[N, C, H, W]`` or ``[C, H, W]``) is written as a simple image, 3D data
++    (``[N, C, H, W, D]``) is written as an animated GIF along the last axis.
++
++    Args:
++        data (numpy.ndarray or torch.Tensor): batch of images, the first dimension is the batch dimension.
++            Only the element at ``index`` of the batch is plotted.
++        step (int): global step value to record.
++        writer (SummaryWriter): TensorBoard SummaryWriter to write to.
++        index (int): which element of the batch to plot, default is the first one.
++        max_channels (int): number of channels to plot.
++        max_frames (int): number of frames for 2D-t plot.
++        tag (str): tag name of the plotted image.
++    """
++    if torch.is_tensor(data):
++        data = data.detach().cpu().numpy()
++    if not isinstance(data, np.ndarray):
++        raise ValueError('data must be an ndarray or tensor.')
++
++    d = data[index]  # show the element at `index` in a batch
++
++    if d.ndim == 2:
++        d = rescale_array(d, 0, 1)
++        dataformats = 'HW'
++        writer.add_image('{}_{}'.format(tag, dataformats), d, step, dataformats=dataformats)
++        return
++
++    if d.ndim == 3:
++        if d.shape[0] == 3 and max_channels == 3:  # RGB
++            dataformats = 'CHW'
++            writer.add_image('{}_{}'.format(tag, dataformats), d, step, dataformats=dataformats)
++            return
++        for j, d2 in enumerate(d[:max_channels]):
++            d2 = rescale_array(d2, 0, 1)
++            dataformats = 'HW'
++            writer.add_image('{}_{}_{}'.format(tag, dataformats, j), d2, step, dataformats=dataformats)
++            return
++
++    if d.ndim >= 4:
++        spatial = d.shape[-3:]
++        for j, d3 in enumerate(d.reshape([-1] + list(spatial))[:max_channels]):
++            d3 = rescale_array(d3, 0, 255)
++            img2tensorboard.add_animated_gif(
++                writer, '{}_HWD_{}'.format(tag, j), d3[None], max_frames, 1.0, step)
++        return
++
++
+ class TensorBoardStatsHandler(object):
+     """TensorBoardStatsHandler defines a set of Ignite Event-handlers for all the TensorBoard logics.
+     It's can be used for any Ignite Engine(trainer, validator and evaluator).
+@@ -203,56 +253,18 @@ class TensorBoardImageHandler(object):
+         step = self.global_iter_transform(engine.state.iteration)
+ 
+         show_images = self.batch_transform(engine.state.batch)[0]
+-        if torch.is_tensor(show_images):
+-            show_images = show_images.detach().cpu().numpy()
+         if show_images is not None:
+-            if not isinstance(show_images, np.ndarray):
+-                raise ValueError('output_transform(engine.state.output)[0] must be an ndarray or tensor.')
+             self._add_2_or_3_d(show_images, step, 'input_0')
+ 
+         show_labels = self.batch_transform(engine.state.batch)[1]
+-        if torch.is_tensor(show_labels):
+-            show_labels = show_labels.detach().cpu().numpy()
+         if show_labels is not None:
+-            if not isinstance(show_labels, np.ndarray):
+-                raise ValueError('batch_transform(engine.state.batch)[1] must be an ndarray or tensor.')
+             self._add_2_or_3_d(show_labels, step, 'input_1')
+ 
+         show_outputs = self.output_transform(engine.state.output)
+-        if torch.is_tensor(show_outputs):
+-            show_outputs = show_outputs.detach().cpu().numpy()
+         if show_outputs is not None:
+-            if not isinstance(show_outputs, np.ndarray):
+-                raise ValueError('output_transform(engine.state.output) must be an ndarray or tensor.')
+             self._add_2_or_3_d(show_outputs, step, 'output')
+ 
+         self._writer.flush()
+ 
+     def _add_2_or_3_d(self, data, step, tag='output'):
+-        # for i, d in enumerate(data):  # go through a batch of images
+-        d = data[0]  # show the first element in a batch
+-
+-        if d.ndim == 2:
+-            d = rescale_array(d, 0, 1)
+-            dataformats = 'HW'
+-            self._writer.add_image('{}_{}'.format(tag, dataformats), d, step, dataformats=dataformats)
+-            return
+-
+-        if d.ndim == 3:
+-            if d.shape[0] == 3 and self.max_channels == 3:  # RGB
+-                dataformats = 'CHW'
+-                self._writer.add_image('{}_{}'.format(tag, dataformats), d, step, dataformats=dataformats)
+-                return
+-            for j, d2 in enumerate(d[:self.max_channels]):
+-                d2 = rescale_array(d2, 0, 1)
+-                dataformats = 'HW'
+-                self._writer.add_image('{}_{}_{}'.format(tag, dataformats, j), d2, step, dataformats=dataformats)
+-                return
+-
+-        if d.ndim >= 4:
+-            spatial = d.shape[-3:]
+-            for j, d3 in enumerate(d.reshape([-1] + list(spatial))[:self.max_channels]):
+-                d3 = rescale_array(d3, 0, 255)
+-                img2tensorboard.add_animated_gif(
+-                    self._writer, '{}_HWD_{}'.format(tag, j), d3[None], self.max_frames, 1.0, step)
+-            return
++        plot_2d_or_3d_image(data, step, self._writer, 0, self.max_channels, self.max_frames, tag)
+diff --git a/tests/test_csv_saver.py b/tests/test_csv_saver.py
+new file mode 100644
+index 0000000..b7cbad5
+--- /dev/null
++++ b/tests/test_csv_saver.py
+@@ -0,0 +1,65 @@
++# Copyright 2020 MONAI Consortium
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#     http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import csv
++import os
++import shutil
++import tempfile
++import unittest
++
++import numpy as np
++import torch
++
++from monai.data.csv_saver import CSVSaver
++
++
++class TestCSVSaver(unittest.TestCase):
++
++    def test_saved_content(self):
++        tempdir = tempfile.mkdtemp()
++        try:
++            saver = CSVSaver(output_dir=tempdir)
++            saver.save(torch.zeros(8, 2), {'filename_or_obj': ['testfile' + str(i) for i in range(8)]})
++            filepath = saver.finalize()
++            self.assertEqual(filepath, os.path.join(tempdir, 'predictions.csv'))
++            with open(filepath, 'r') as f:
++                rows = list(csv.reader(f))
++            self.assertEqual(len(rows), 8)
++            for i, row in enumerate(rows):
++                self.assertEqual(row[0], 'testfile' + str(i))
++                np.testing.assert_allclose(np.array(row[1:]).astype(np.float32), np.zeros(2))
++        finally:
++            shutil.rmtree(tempdir, ignore_errors=True)
++
++    def test_no_overwrite_keeps_previous_rows(self):
++        tempdir = tempfile.mkdtemp()
++        try:
++            first = CSVSaver(output_dir=tempdir, overwrite=True)
++            first.save(np.ones((1, 3)), {'filename_or_obj': ['old']})
++            first.finalize()
++
++            second = CSVSaver(output_dir=tempdir, overwrite=False)
++            second.save(np.zeros((1, 3)), {'filename_or_obj': ['new']})
++            filepath = second.finalize()
++            with open(filepath, 'r') as f:
++                names = [row[0] for row in csv.reader(f)]
++            self.assertEqual(names, ['new', 'old'])
++        finally:
++            shutil.rmtree(tempdir, ignore_errors=True)
++
++    def test_missing_filename_raises(self):
++        saver = CSVSaver(output_dir=tempfile.gettempdir())
++        with self.assertRaises(ValueError):
++            saver.save(np.zeros((1, 3)), None)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/test_handler_segmentation_saver.py b/tests/test_handler_segmentation_saver.py
+new file mode 100644
+index 0000000..f8c4a9d
+--- /dev/null
++++ b/tests/test_handler_segmentation_saver.py
+@@ -0,0 +1,49 @@
++# Copyright 2020 MONAI Consortium
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#     http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import os
++import shutil
++import tempfile
++import unittest
++
++import nibabel as nib
++import numpy as np
++import torch
++from ignite.engine import Engine
++
++from monai.handlers.segmentation_saver import SegmentationSaver
++
++
++class TestHandlerSegmentationSaver(unittest.TestCase):
++
++    def test_saved_content(self):
++        tempdir = tempfile.mkdtemp()
++        try:
++            engine = Engine(lambda engine, batch: torch.zeros(2, 1, 6, 6, 6))
++            saver = SegmentationSaver(output_path=tempdir, output_ext='.nii.gz', output_postfix='seg',
++                                      batch_transform=lambda x: x[2])
++            saver.attach(engine)
++
++            data = [(None, None, {'filename_or_obj': ['/root/a.nii.gz', '/root/b.nii.gz'],
++                                  'affine': [np.eye(4), np.eye(4)],
++                                  'original_affine': [np.eye(4), np.eye(4)]})]
++            engine.run(data, epoch_length=1, max_epochs=1)
++
++            for name in ['a', 'b']:
++                filepath = os.path.join(tempdir, name, '{}_seg.nii.gz'.format(name))
++                self.assertTrue(os.path.exists(filepath))
++                self.assertEqual(nib.load(filepath).shape, (6, 6, 6, 1))
++        finally:
++            shutil.rmtree(tempdir, ignore_errors=True)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/test_nifti_saver.py b/tests/test_nifti_saver.py
+new file mode 100644
+index 0000000..03339c7
+--- /dev/null
++++ b/tests/test_nifti_saver.py
+@@ -0,0 +1,62 @@
++# Copyright 2020 MONAI Consortium
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#     http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import os
++import shutil
++import tempfile
++import unittest
++
++import nibabel as nib
++import numpy as np
++import torch
++
++from monai.data.nifti_saver import NiftiSaver
++
++
++class TestNiftiSaver(unittest.TestCase):
++
++    def test_saved_content(self):
++        tempdir = tempfile.mkdtemp()
++        try:
++            saver = NiftiSaver(output_dir=tempdir, output_postfix='seg', output_ext='.nii.gz')
++            data = torch.zeros(2, 1, 8, 8, 8)
++            meta_data = {'filename_or_obj': ['/data/case_0.nii.gz', '/data/case_1.nii.gz'],
++                         'affine': [np.eye(4), np.eye(4)], 'original_affine': [np.eye(4), np.eye(4)]}
++            saved = saver.save(data, meta_data)
++
++            self.assertEqual(len(saved), 2)
++            for i in range(2):
++                filepath = os.path.join(tempdir, 'case_{}'.format(i), 'case_{}_seg.nii.gz'.format(i))
++                self.assertTrue(os.path.exists(filepath))
++                self.assertEqual(saved[i], filepath)
++                img = nib.load(filepath)
++                self.assertEqual(img.shape, (8, 8, 8, 1))
++        finally:
++            shutil.rmtree(tempdir, ignore_errors=True)
++
++    def test_create_file_basename_with_root_dir(self):
++        tempdir = tempfile.mkdtemp()
++        try:
++            name = NiftiSaver._create_file_basename('seg', os.path.join('/root', 'sub', 'img.nii.gz'),
++                                                    tempdir, data_root_dir='/root')
++            self.assertEqual(name, os.path.join(tempdir, 'sub', 'img', 'img_seg'))
++            self.assertTrue(os.path.isdir(os.path.join(tempdir, 'sub', 'img')))
++        finally:
++            shutil.rmtree(tempdir, ignore_errors=True)
++
++    def test_missing_filename_raises(self):
++        saver = NiftiSaver(output_dir=tempfile.gettempdir())
++        with self.assertRaises(ValueError):
++            saver.save(np.zeros((1, 1, 4, 4)), {})
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/test_plot_2d_or_3d_image.py b/tests/test_plot_2d_or_3d_image.py
+new file mode 100644
+index 0000000..df2ac0f
+--- /dev/null
++++ b/tests/test_plot_2d_or_3d_image.py
+@@ -0,0 +1,65 @@
++# Copyright 2020 MONAI Consortium
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#     http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import glob
++import os
++import shutil
++import tempfile
++import unittest
++
++import numpy as np
++import torch
++from parameterized import parameterized
++from torch.utils.tensorboard import SummaryWriter
++
++from monai.handlers.tensorboard_handlers import plot_2d_or_3d_image
++
++TEST_CASES = [
++    [[2, 20, 20]],
++    [[3, 20, 20]],
++    [[20, 20, 20]],
++    [[2, 20, 20, 20]],
++    [[2, 2, 20, 20, 20]],
++]
++
++
++class TestPlot2DOr3DImage(unittest.TestCase):
++
++    @parameterized.expand(TEST_CASES)
++    def test_plot_shape(self, shape):
++        tempdir = tempfile.mkdtemp()
++        try:
++            writer = SummaryWriter(log_dir=tempdir)
++            plot_2d_or_3d_image(np.random.normal(size=(2, *shape)), 1, writer, index=0, max_channels=2)
++            writer.close()
++            self.assertTrue(len(glob.glob(os.path.join(tempdir, '*'))) > 0)
++        finally:
++            shutil.rmtree(tempdir, ignore_errors=True)
++
++    def test_accepts_tensor(self):
++        tempdir = tempfile.mkdtemp()
++        try:
++            writer = SummaryWriter(log_dir=tempdir)
++            plot_2d_or_3d_image(torch.rand(1, 20, 20), 0, writer, tag='tensor_input')
++            writer.close()
++            self.assertTrue(len(glob.glob(os.path.join(tempdir, '*'))) > 0)
++        finally:
++            shutil.rmtree(tempdir, ignore_errors=True)
++
++    def test_invalid_input_raises(self):
++        writer = SummaryWriter(log_dir=tempfile.gettempdir())
++        with self.assertRaises(ValueError):
++            plot_2d_or_3d_image([[1, 2]], 0, writer)
++        writer.close()
++
++
++if __name__ == '__main__':
++    unittest.main()

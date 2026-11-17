@@ -1,0 +1,207 @@
+diff --git a/docs/utilities.rst b/docs/utilities.rst
+index 3074af7..7528319 100644
+--- a/docs/utilities.rst
++++ b/docs/utilities.rst
+@@ -112,6 +112,34 @@ You can parse data from a string with the ``data`` param::
+ 
+     graph.parse(data = '<urn:a> <urn:p> <urn:b>.', format='n3')
+ 
++Concise Bounded Description
++---------------------------
++
++The Concise Bounded Description (CBD) of a resource is the subgraph that
++describes it: all triples with the resource as subject, plus, recursively,
++the CBD of every blank node reached as an object, and any reification
++statements about those triples. See the `W3C member submission
++<https://www.w3.org/Submission/CBD/>`_ for the full definition.
++
++Use :meth:`~rdflib.graph.Graph.cbd` to extract it. It returns a new
++:class:`~rdflib.graph.Graph` and leaves the source graph unchanged::
++
++    >>> from rdflib import Graph, URIRef, BNode, Literal
++    >>> from rdflib.namespace import FOAF
++    >>> g = Graph()
++    >>> alice = URIRef("http://example.org/alice")
++    >>> addr = BNode()
++    >>> g.add((alice, FOAF.name, Literal("Alice")))
++    >>> g.add((alice, FOAF.based_near, addr))
++    >>> g.add((addr, FOAF.name, Literal("Somewhere")))
++    >>> len(g.cbd(alice))
++    3
++
++Blank nodes reachable from the resource are followed, and cycles between
++blank nodes are handled, so the traversal always terminates.
++
++This is also the building block for SPARQL ``DESCRIBE`` queries.
++
+ Commandline-tools
+ -----------------
+ 
+diff --git a/rdflib/graph.py b/rdflib/graph.py
+index 4a27e6d..10127df 100644
+--- a/rdflib/graph.py
++++ b/rdflib/graph.py
+@@ -1170,6 +1170,79 @@ class Graph(Node):
+         res.update(self.subjects())
+         return res
+ 
++    def cbd(self, resource):
++        """Retrieves the Concise Bounded Description of a Resource from a Graph
++
++        Concise Bounded Description (CBD) is defined in [1] as:
++
++            Given a particular node (the subject) in a particular graph
++            (the context), a concise bounded description (CBD) of the
++            subject in the context is made up of the union of:
++
++            1. the set of triples in the context, with the subject as their
++               subject
++            2. recursively, for all blank node objects in the set of triples
++               from (1), the CBD of each such blank node, including the
++               reification triples of any such triples
++
++        [1] https://www.w3.org/Submission/CBD/
++
++        Parameters:
++
++        - ``resource``: the subject (URIRef or BNode) to describe.
++
++        Returns a new ``Graph`` containing the CBD triples. The triples are
++        copied, so the source graph is not modified.
++
++        Example::
++
++            >>> from rdflib import Graph, URIRef, BNode, Literal
++            >>> from rdflib.namespace import FOAF
++            >>> g = Graph()
++            >>> alice = URIRef("http://example.org/alice")
++            >>> addr = BNode()
++            >>> g.add((alice, FOAF.name, Literal("Alice")))
++            >>> g.add((alice, FOAF.knows, URIRef("http://example.org/bob")))
++            >>> g.add((alice, FOAF.based_near, addr))
++            >>> g.add((addr, FOAF.name, Literal("Somewhere")))
++            >>> g.add((URIRef("http://example.org/bob"), FOAF.name,
++            ...        Literal("Bob")))
++            >>> cbd = g.cbd(alice)
++            >>> len(cbd)
++            4
++            >>> (alice, FOAF.name, Literal("Alice")) in cbd
++            True
++            >>> bob = URIRef("http://example.org/bob")
++            >>> (bob, FOAF.name, Literal("Bob")) in cbd
++            False
++
++        """
++        subgraph = Graph()
++        seen = set()
++        to_visit = [resource]
++
++        while to_visit:
++            subject = to_visit.pop()
++            if subject in seen:
++                continue
++            seen.add(subject)
++
++            for s, p, o in self.triples((subject, None, None)):
++                subgraph.add((s, p, o))
++                if isinstance(o, BNode) and o not in seen:
++                    to_visit.append(o)
++
++                # Reification: any reified statement (?stmt rdf:subject s,
++                # rdf:predicate p, rdf:object o) is part of the description
++                # of the triple, so include its triples too.
++                for stmt in self.subjects(RDF.subject, s):
++                    if ((stmt, RDF.predicate, p) in self and
++                            (stmt, RDF.object, o) in self and
++                            stmt not in seen):
++                        to_visit.append(stmt)
++
++        return subgraph
++
+     def collection(self, identifier):
+         """Create a new ``Collection`` instance.
+ 
+diff --git a/test/test_graph.py b/test/test_graph.py
+index 228550e..01a8b66 100644
+--- a/test/test_graph.py
++++ b/test/test_graph.py
+@@ -5,7 +5,7 @@ import unittest
+ from tempfile import mkdtemp, mkstemp
+ import shutil
+ 
+-from rdflib import URIRef, RDF, Graph, plugin
++from rdflib import URIRef, RDF, Graph, plugin, BNode, Literal
+ 
+ from nose.exc import SkipTest
+ 
+@@ -146,6 +146,70 @@ class GraphTestCase(unittest.TestCase):
+ 
+         self.assertEqual(False, graph.connected())
+ 
++    def testCBD(self):
++        graph = self.graph
++        alice = URIRef("alice")
++        bob = URIRef("bob")
++        name = URIRef("name")
++        knows = URIRef("knows")
++        based_near = URIRef("based_near")
++        addr = BNode()
++        street = URIRef("street")
++
++        graph.add((alice, name, Literal("Alice")))
++        graph.add((alice, knows, bob))
++        graph.add((alice, based_near, addr))
++        graph.add((addr, street, Literal("Main St")))
++        # Not reachable from alice: must not be in the CBD.
++        graph.add((bob, name, Literal("Bob")))
++
++        cbd = graph.cbd(alice)
++
++        self.assertTrue(isinstance(cbd, Graph))
++        self.assertEqual(4, len(cbd))
++        self.assertTrue((alice, name, Literal("Alice")) in cbd)
++        self.assertTrue((alice, knows, bob) in cbd)
++        self.assertTrue((alice, based_near, addr) in cbd)
++        self.assertTrue((addr, street, Literal("Main St")) in cbd)
++        self.assertFalse((bob, name, Literal("Bob")) in cbd)
++
++        # the source graph is left untouched
++        self.assertEqual(5, len(graph))
++
++    def testCBDReification(self):
++        graph = self.graph
++        alice = URIRef("alice")
++        bob = URIRef("bob")
++        knows = URIRef("knows")
++        confidence = URIRef("confidence")
++        stmt = BNode()
++
++        graph.add((alice, knows, bob))
++        graph.add((stmt, RDF.type, RDF.Statement))
++        graph.add((stmt, RDF.subject, alice))
++        graph.add((stmt, RDF.predicate, knows))
++        graph.add((stmt, RDF.object, bob))
++        graph.add((stmt, confidence, Literal(0.9)))
++
++        cbd = graph.cbd(alice)
++
++        self.assertTrue((alice, knows, bob) in cbd)
++        self.assertTrue((stmt, confidence, Literal(0.9)) in cbd)
++        self.assertTrue((stmt, RDF.subject, alice) in cbd)
++
++    def testCBDCycle(self):
++        graph = self.graph
++        a = BNode()
++        b = BNode()
++        p = URIRef("p")
++
++        graph.add((a, p, b))
++        graph.add((b, p, a))
++
++        # Must terminate even though the blank nodes refer to each other.
++        cbd = graph.cbd(a)
++        self.assertEqual(2, len(cbd))
++
+     def testSub(self):
+         g1 = self.graph
+         g2 = Graph(store=g1.store)

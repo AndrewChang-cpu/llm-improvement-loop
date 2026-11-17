@@ -1,0 +1,178 @@
+diff --git a/monai/data/grid_dataset.py b/monai/data/grid_dataset.py
+index f85569d..fe334b5 100644
+--- a/monai/data/grid_dataset.py
++++ b/monai/data/grid_dataset.py
+@@ -10,22 +10,52 @@
+ # limitations under the License.
+ 
+ import math
+-from typing import Callable, Dict, Optional, Sequence, Union
++from typing import Callable, Dict, Generator, Optional, Sequence, Tuple, Union
+ 
++import numpy as np
+ import torch
+ from torch.utils.data import IterableDataset
+ 
+ from monai.data.dataset import Dataset
+-from monai.data.utils import iter_patch
++from monai.data.utils import get_valid_patch_size, iter_patch_slices
+ from monai.transforms import apply_transform
+-from monai.utils import NumpyPadMode, ensure_tuple
++from monai.utils import NumpyPadMode, ensure_tuple, ensure_tuple_size
+ 
+ __all__ = ["PatchDataset", "GridPatchDataset"]
+ 
+ 
++def _iter_grid_patches(
++    arr: np.ndarray, patch_size: Sequence[int], start_pos: Sequence[int], mode: NumpyPadMode, pad_opts: Dict
++) -> Generator[Tuple[np.ndarray, Tuple[slice, ...]], None, None]:
++    """
++    Yield `(patch, coords)` pairs for a grid sampling of `arr`, where `coords` are the slices of the patch in the
++    coordinate frame of the unpadded `arr` (may be negative or exceed the array shape where the patch overlaps padding).
++    """
++    patch_size_ = get_valid_patch_size(arr.shape, patch_size)
++    start_pos = ensure_tuple_size(start_pos, arr.ndim)
++
++    # pad as in `iter_patch` so patches can be drawn from the border regions
++    pad_width = tuple((p, p) for p in patch_size_)
++    arrpad = np.pad(arr, pad_width, mode.value, **pad_opts)
++
++    start_pos_padded = tuple(s + p for s, p in zip(start_pos, patch_size_))
++    iter_size = tuple(s + p for s, p in zip(arr.shape, patch_size_))
++
++    for slices in iter_patch_slices(iter_size, patch_size_, start_pos_padded):
++        # map the padded slices back to the unpadded array coordinates
++        coords = tuple(slice(sl.start - p[0], sl.stop - p[0]) for sl, p in zip(slices, pad_width))
++        yield arrpad[slices], coords
++
++
+ class GridPatchDataset(IterableDataset):
+     """
+     Yields patches from arrays read from an input dataset. The patches are chosen in a contiguous grid sampling scheme.
++
++    Each item of the input dataset is a sequence of arrays (e.g. image and label). For each grid position, one patch
++    is extracted from every array and the yielded item is a tuple with one patch per array. If `transform` is given it
++    is applied to each patch individually. If `with_coordinates` is True, each yielded item is instead a tuple
++    ``(patches, coordinates)``, where ``coordinates`` is a tuple with one tuple of slices per array giving the location
++    of the patch in the original (unpadded) array.
+     """
+ 
+     def __init__(
+@@ -34,6 +64,8 @@ class GridPatchDataset(IterableDataset):
+         patch_size: Sequence[int],
+         start_pos: Sequence[int] = (),
+         mode: Union[NumpyPadMode, str] = NumpyPadMode.WRAP,
++        transform: Optional[Callable] = None,
++        with_coordinates: bool = False,
+         **pad_opts: Dict,
+     ) -> None:
+         """
+@@ -51,6 +83,9 @@ class GridPatchDataset(IterableDataset):
+                 ``"median"``, ``"minimum"``, ``"reflect"``, ``"symmetric"``, ``"wrap"``, ``"empty"``}
+                 One of the listed string values or a user supplied function. Defaults to ``"wrap"``.
+                 See also: https://numpy.org/doc/1.18/reference/generated/numpy.pad.html
++            transform: transform applied to each patch (each array patch of an item) after it is extracted.
++            with_coordinates: if True, yield ``(patches, coordinates)`` instead of only ``patches``, where
++                ``coordinates`` holds, for each array, the tuple of slices locating the patch in the original array.
+             pad_opts: padding options, see numpy.pad
+         """
+ 
+@@ -59,6 +94,8 @@ class GridPatchDataset(IterableDataset):
+         self.start_pos = ensure_tuple(start_pos)
+         self.mode: NumpyPadMode = NumpyPadMode(mode)
+         self.pad_opts = pad_opts
++        self.transform = transform
++        self.with_coordinates = with_coordinates
+ 
+     def __iter__(self):
+         worker_info = torch.utils.data.get_worker_info()
+@@ -75,9 +112,19 @@ class GridPatchDataset(IterableDataset):
+         for index in range(iter_start, iter_end):
+             arrays = self.dataset[index]
+ 
+-            iters = [iter_patch(a, self.patch_size, self.start_pos, False, self.mode, **self.pad_opts) for a in arrays]
+-
+-            yield from zip(*iters)
++            iters = [
++                _iter_grid_patches(a, self.patch_size, self.start_pos, self.mode, self.pad_opts) for a in arrays
++            ]
++
++            for pairs in zip(*iters):
++                patches = tuple(p for p, _ in pairs)
++                if self.transform is not None:
++                    patches = tuple(apply_transform(self.transform, p, map_items=False) for p in patches)
++                if self.with_coordinates:
++                    coords = tuple(c for _, c in pairs)
++                    yield patches, coords
++                else:
++                    yield patches
+ 
+ 
+ class PatchDataset(Dataset):
+diff --git a/tests/test_grid_patch_dataset.py b/tests/test_grid_patch_dataset.py
+new file mode 100644
+index 0000000..93ffdd5
+--- /dev/null
++++ b/tests/test_grid_patch_dataset.py
+@@ -0,0 +1,61 @@
++# Copyright 2020 - 2021 MONAI Consortium
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#     http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import unittest
++
++import numpy as np
++
++from monai.data import GridPatchDataset
++from monai.transforms import Lambda
++
++
++class TestGridPatchDataset(unittest.TestCase):
++    def test_patch_count_and_shape(self):
++        images = [np.arange(16, dtype=np.float32).reshape(1, 4, 4)]
++        ds = GridPatchDataset(dataset=[images], patch_size=(2, 2), mode="constant")
++        patches = [p[0] for p in ds]
++        self.assertEqual(len(patches), 4)
++        for p in patches:
++            self.assertEqual(p.shape, (1, 2, 2))
++
++    def test_patch_transform(self):
++        images = [np.ones((1, 4, 4), dtype=np.float32)]
++        ds = GridPatchDataset(
++            dataset=[images], patch_size=(2, 2), mode="constant", transform=Lambda(lambda x: x * 3)
++        )
++        for (patch,) in ds:
++            np.testing.assert_allclose(patch, np.full((1, 2, 2), 3.0))
++
++    def test_coordinates(self):
++        images = [np.arange(16, dtype=np.float32).reshape(1, 4, 4)]
++        ds = GridPatchDataset(dataset=[images], patch_size=(2, 2), mode="constant", with_coordinates=True)
++        items = list(ds)
++        self.assertEqual(len(items), 4)
++        for (patches, coords) in items:
++            (patch,) = patches
++            (coord,) = coords
++            # coordinates locate the patch in the original (unpadded) array
++            np.testing.assert_allclose(patch, images[0][coord])
++            self.assertEqual(len(coord), 3)
++
++    def test_coordinates_with_padding(self):
++        images = [np.arange(4, dtype=np.float32).reshape(1, 4)]
++        ds = GridPatchDataset(dataset=[images], patch_size=(3,), mode="constant", with_coordinates=True)
++        for (patches, coords) in ds:
++            (patch,) = patches
++            (coord,) = coords
++            self.assertEqual(patch.shape, (1, 3))
++            # the spatial slice has the patch size, and it may extend beyond the array bounds
++            self.assertEqual(coord[-1].stop - coord[-1].start, 3)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,199 @@
+diff --git a/docs/source/losses.rst b/docs/source/losses.rst
+index ce2e4a8..dc9d7dc 100644
+--- a/docs/source/losses.rst
++++ b/docs/source/losses.rst
+@@ -33,6 +33,13 @@ Segmentation Losses
+     :members:
+ 
+ .. autoclass:: generalized_dice
++
++`GeneralizedWassersteinDiceLoss`
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++.. autoclass:: GeneralizedWassersteinDiceLoss
++    :members:
++
++.. autoclass:: generalized_wasserstein_dice
+     :members:
+ 
+ `FocalLoss`
+diff --git a/monai/losses/__init__.py b/monai/losses/__init__.py
+index c9ab109..7c3ca0c 100644
+--- a/monai/losses/__init__.py
++++ b/monai/losses/__init__.py
+@@ -9,6 +9,15 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-from .dice import Dice, DiceLoss, GeneralizedDiceLoss, MaskedDiceLoss, dice, generalized_dice
++from .dice import (
++    Dice,
++    DiceLoss,
++    GeneralizedDiceLoss,
++    GeneralizedWassersteinDiceLoss,
++    MaskedDiceLoss,
++    dice,
++    generalized_dice,
++    generalized_wasserstein_dice,
++)
+ from .focal_loss import FocalLoss
+ from .tversky import TverskyLoss
+diff --git a/monai/losses/dice.py b/monai/losses/dice.py
+index 86823f2..5e070c4 100644
+--- a/monai/losses/dice.py
++++ b/monai/losses/dice.py
+@@ -10,7 +10,7 @@
+ # limitations under the License.
+ 
+ import warnings
+-from typing import Callable, Optional, Union
++from typing import Callable, Optional, Sequence, Union
+ 
+ import torch
+ from torch.nn.modules.loss import _Loss
+@@ -297,5 +297,146 @@ class GeneralizedDiceLoss(_Loss):
+         return f
+ 
+ 
++class GeneralizedWassersteinDiceLoss(_Loss):
++    """
++    Compute the generalized Wasserstein Dice loss, a Wasserstein-distance based loss for
++    multi-class segmentation with a class-distance matrix. The per-class weights follow the
++    inverse-squared-volume scheme of the generalized Dice loss, so that small structures count
++    as much as large ones.
++
++    Adapted from the generalized Wasserstein Dice loss in:
++
++        Fidon, L. et al. (2017) Generalised Wasserstein Dice Score for Imbalanced Multi-class
++        Segmentation Using Holistic Convolutional Networks. MICCAI BrainLes 2017.
++
++    The loss for each sample is the class-weighted mean of the expected ground-truth-to-prediction
++    cost ``sum_j M[i, j] * pred[j]`` at the voxels of class ``i``, normalized by the largest entry of
++    ``M`` so that it lies in ``[0, 1]`` when the predictions are probabilities.
++    """
++
++    def __init__(
++        self,
++        distance_matrix: Union[torch.Tensor, Sequence[Sequence[float]]],
++        include_background: bool = True,
++        to_onehot_y: bool = False,
++        sigmoid: bool = False,
++        softmax: bool = False,
++        reduction: Union[LossReduction, str] = LossReduction.MEAN,
++    ) -> None:
++        """
++        Args:
++            distance_matrix: square matrix of shape (C, C) with the pairwise distances between the
++                C classes, where C is the number of prediction channels. Must be non-negative.
++            include_background: If False channel index 0 (background category) is excluded from the calculation.
++            to_onehot_y: whether to convert `y` into the one-hot format. Defaults to False.
++            sigmoid: If True, apply a sigmoid function to the prediction.
++            softmax: If True, apply a softmax function to the prediction.
++            reduction: {``"none"``, ``"mean"``, ``"sum"``}
++                Specifies the reduction to apply to the output. Defaults to ``"mean"``.
++
++                - ``"none"``: no reduction will be applied.
++                - ``"mean"``: the sum of the output will be divided by the number of elements in the output.
++                - ``"sum"``: the output will be summed.
++
++        Raises:
++            ValueError: distance_matrix must be a square matrix with non-negative entries.
++            ValueError: reduction={reduction} is invalid. Valid options are: none, mean or sum.
++            ValueError: sigmoid=True and softmax=True are not compatible.
++
++        """
++        super().__init__(reduction=LossReduction(reduction).value)
++
++        M = torch.as_tensor(distance_matrix, dtype=torch.float32)
++        if M.ndim != 2 or M.shape[0] != M.shape[1]:
++            raise ValueError(f"distance_matrix must be a square matrix, got shape {tuple(M.shape)}.")
++        if bool((M < 0).any()):
++            raise ValueError("distance_matrix must have non-negative entries.")
++        self.distance_matrix = M
++
++        self.include_background = include_background
++        self.to_onehot_y = to_onehot_y
++        if sigmoid and softmax:
++            raise ValueError("sigmoid=True and softmax=True are not compatible.")
++        self.sigmoid = sigmoid
++        self.softmax = softmax
++
++    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
++        """
++        Args:
++            input: the shape should be BNH[WD].
++            target: the shape should be BNH[WD].
++
++        Raises:
++            ValueError: distance_matrix size does not match the number of channels.
++            ValueError: reduction={self.reduction} is invalid.
++
++        """
++        if self.sigmoid:
++            input = torch.sigmoid(input)
++        n_pred_ch = input.shape[1]
++        if n_pred_ch == 1:
++            if self.softmax:
++                warnings.warn("single channel prediction, `softmax=True` ignored.")
++            if self.to_onehot_y:
++                warnings.warn("single channel prediction, `to_onehot_y=True` ignored.")
++            if not self.include_background:
++                warnings.warn("single channel prediction, `include_background=False` ignored.")
++        else:
++            if self.softmax:
++                input = torch.softmax(input, 1)
++            if self.to_onehot_y:
++                target = one_hot(target, n_pred_ch)
++            if not self.include_background:
++                target = target[:, 1:]
++                input = input[:, 1:]
++        assert (
++            target.shape == input.shape
++        ), f"ground truth has differing shape ({target.shape}) from input ({input.shape})"
++
++        M = self.distance_matrix.to(device=input.device, dtype=input.dtype)
++        n_cls = input.shape[1]
++        if M.shape[0] != n_cls:
++            # when background is excluded, restrict the distance matrix to the remaining classes
++            if M.shape[0] == n_cls + 1 and not self.include_background:
++                M = M[1:, 1:]
++            else:
++                raise ValueError(
++                    f"distance_matrix size ({M.shape[0]}) does not match the number of channels ({n_cls})."
++                )
++
++        # flatten spatial dims: shapes (B, C, S)
++        t = target.reshape(target.shape[0], target.shape[1], -1).to(input.dtype)
++        p = input.reshape(input.shape[0], input.shape[1], -1)
++
++        # expected cost of predicting each class for each voxel: (B, C, S) with entries sum_j M[i, j] p[j]
++        mp = torch.einsum("ij,bjs->bis", M, p)
++
++        # class weights: inverse squared volume per sample and class, with inf replaced by the max finite value
++        vol = t.sum(-1)  # (B, C)
++        w = torch.reciprocal(vol * vol)
++        # classes absent from the ground truth give inf weights: replace them by the largest finite weight
++        finite = torch.isfinite(w)
++        w_max = torch.where(finite, w, torch.zeros_like(w)).max(dim=1, keepdim=True)[0]
++        w = torch.where(finite, w, w_max.expand_as(w))
++
++        weighted_t = t * w.unsqueeze(-1)  # (B, C, S)
++        smooth = 1e-5
++        numer = torch.sum(weighted_t * mp, dim=(1, 2))  # (B,)
++        denom = torch.sum(weighted_t, dim=(1, 2)) * torch.max(M)
++        f = numer / (denom + smooth)
++
++        if self.reduction == LossReduction.MEAN.value:
++            f = torch.mean(f)
++        elif self.reduction == LossReduction.SUM.value:
++            f = torch.sum(f)
++        elif self.reduction == LossReduction.NONE.value:
++            pass
++        else:
++            raise ValueError(f"reduction={self.reduction} is invalid.")
++
++        return f
++
++
+ dice = Dice = DiceLoss
+ generalized_dice = GeneralizedDiceLoss
++generalized_wasserstein_dice = GeneralizedWassersteinDiceLoss

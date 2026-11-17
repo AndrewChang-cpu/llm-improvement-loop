@@ -1,0 +1,154 @@
+diff --git a/monai/losses/__init__.py b/monai/losses/__init__.py
+index c9ab109..7c3ca0c 100644
+--- a/monai/losses/__init__.py
++++ b/monai/losses/__init__.py
+@@ -9,6 +9,15 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-from .dice import Dice, DiceLoss, GeneralizedDiceLoss, MaskedDiceLoss, dice, generalized_dice
++from .dice import (
++    Dice,
++    DiceLoss,
++    GeneralizedDiceLoss,
++    GeneralizedWassersteinDiceLoss,
++    MaskedDiceLoss,
++    dice,
++    generalized_dice,
++    generalized_wasserstein_dice,
++)
+ from .focal_loss import FocalLoss
+ from .tversky import TverskyLoss
+diff --git a/monai/losses/dice.py b/monai/losses/dice.py
+index 86823f2..0e11caa 100644
+--- a/monai/losses/dice.py
++++ b/monai/losses/dice.py
+@@ -297,5 +297,128 @@ class GeneralizedDiceLoss(_Loss):
+         return f
+ 
+ 
++class GeneralizedWassersteinDiceLoss(_Loss):
++    """
++    Compute the generalized Wasserstein Dice loss defined in:
++
++        Fidon, L. et. al. (2017) Generalised Wasserstein Dice Score for Imbalanced Multi-class
++        Segmentation Using Holistic Convolutional Networks. MICCAI BrainLes 2017.
++
++    The loss uses a class distance matrix ``M`` (``C x C``, symmetric, zero diagonal) to penalise
++    predictions according to how far the predicted class mass lies from the ground truth class.
++    For each sample ``b`` and class ``k``, with predicted probabilities ``p`` and one-hot target ``g``:
++
++        E[k, s] = sum_l M[k, l] * p[l, s]              (Wasserstein cost of voxel s w.r.t. class k)
++        tp[k]   = sum_s g[k, s] * (1 - E[k, s])        (distance-weighted true positives)
++        denom[k] = sum_s (g[k, s] + p[k, s])
++        loss    = 1 - 2 * sum_k w[k] * tp[k] / sum_k w[k] * denom[k]
++
++    where ``w[k]`` is a per-class weight derived from the ground-truth volume (see ``w_type``).
++    """
++
++    def __init__(
++        self,
++        dist_matrix,
++        w_type: Union[Weight, str] = Weight.SQUARE,
++        reduction: Union[LossReduction, str] = LossReduction.MEAN,
++    ) -> None:
++        """
++        Args:
++            dist_matrix: ``C x C`` class distance matrix (array-like or tensor). It must be square and
++                symmetric with a zero diagonal. It is normalised by its maximum value so that all
++                entries lie in ``[0, 1]``.
++            w_type: {``"square"``, ``"simple"``, ``"uniform"``}
++                Type of function to transform ground truth volume to a weight factor. Defaults to ``"square"``.
++            reduction: {``"none"``, ``"mean"``, ``"sum"``}
++                Specifies the reduction to apply to the output over the batch. Defaults to ``"mean"``.
++
++                - ``"none"``: the loss of each sample in the batch is returned, shape ``[B]``.
++                - ``"mean"``: the mean of the per-sample losses.
++                - ``"sum"``: the sum of the per-sample losses.
++
++        Raises:
++            ValueError: dist_matrix must be a square 2D matrix.
++            ValueError: dist_matrix must be symmetric with a zero diagonal.
++            ValueError: dist_matrix must contain non-negative values.
++            ValueError: reduction={reduction} is invalid. Valid options are: none, mean or sum.
++
++        """
++        super().__init__(reduction=LossReduction(reduction).value)
++
++        m = torch.as_tensor(dist_matrix, dtype=torch.float32)
++        if m.ndim != 2 or m.shape[0] != m.shape[1]:
++            raise ValueError(f"dist_matrix must be a square 2D matrix, got shape {tuple(m.shape)}.")
++        if not torch.allclose(m, m.t()):
++            raise ValueError("dist_matrix must be symmetric.")
++        if torch.any(torch.diagonal(m) != 0):
++            raise ValueError("dist_matrix must have a zero diagonal.")
++        if torch.any(m < 0):
++            raise ValueError("dist_matrix must contain non-negative values.")
++        max_val = torch.max(m)
++        if max_val > 0:
++            m = m / max_val
++        self.register_buffer("dist_matrix", m)
++
++        w_type = Weight(w_type)
++        self.w_func: Callable = torch.ones_like
++        if w_type == Weight.SIMPLE:
++            self.w_func = torch.reciprocal
++        elif w_type == Weight.SQUARE:
++            self.w_func = lambda x: torch.reciprocal(x * x)
++
++    def forward(self, input: torch.Tensor, target: torch.Tensor, smooth: float = 1e-5) -> torch.Tensor:
++        """
++        Args:
++            input: class probabilities, the shape should be BCH[WD].
++            target: one-hot ground truth, the shape should be BCH[WD].
++            smooth: a small constant to avoid nan.
++
++        Raises:
++            ValueError: input and target must have the same shape.
++            ValueError: the number of channels must match the size of dist_matrix.
++            ValueError: reduction={self.reduction} is invalid.
++
++        """
++        if input.shape != target.shape:
++            raise ValueError(
++                f"ground truth has differing shape ({target.shape}) from input ({input.shape})"
++            )
++        n_classes = input.shape[1]
++        if n_classes != self.dist_matrix.shape[0]:
++            raise ValueError(
++                f"number of channels ({n_classes}) must match dist_matrix size ({self.dist_matrix.shape[0]})."
++            )
++
++        m = self.dist_matrix.to(device=input.device, dtype=input.dtype)
++        # Wasserstein cost of each voxel for each true class: E[b, k, ...] = sum_l M[k, l] * p[b, l, ...]
++        expected_dist = torch.einsum("kl,bl...->bk...", m, input)
++
++        # reducing only spatial dimensions (not batch nor channels)
++        reduce_axis = list(range(2, len(input.shape)))
++        tp = torch.sum(target * (1.0 - expected_dist), reduce_axis)
++        denominator = torch.sum(target, reduce_axis) + torch.sum(input, reduce_axis)
++        ground_o = torch.sum(target, reduce_axis)
++
++        w = self.w_func(ground_o.float()).to(input.dtype)
++        # replace infinite weights (classes absent from the ground truth) by the largest finite weight of each sample
++        finite = torch.isfinite(w)
++        max_finite = torch.where(finite, w, torch.zeros_like(w)).amax(dim=1, keepdim=True)
++        w = torch.where(finite, w, max_finite.expand_as(w))
++
++        f = 1.0 - (2.0 * (w * tp).sum(1) + smooth) / ((w * denominator).sum(1) + smooth)
++
++        if self.reduction == LossReduction.MEAN.value:
++            f = torch.mean(f)  # the batch average
++        elif self.reduction == LossReduction.SUM.value:
++            f = torch.sum(f)  # sum over the batch dim
++        elif self.reduction == LossReduction.NONE.value:
++            pass  # returns [B] losses
++        else:
++            raise ValueError(f"reduction={self.reduction} is invalid.")
++
++        return f
++
++
+ dice = Dice = DiceLoss
+ generalized_dice = GeneralizedDiceLoss
++generalized_wasserstein_dice = GeneralizedWassersteinDiceLoss

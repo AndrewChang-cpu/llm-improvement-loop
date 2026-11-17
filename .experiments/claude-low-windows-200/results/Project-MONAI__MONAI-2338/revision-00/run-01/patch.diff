@@ -1,0 +1,321 @@
+diff --git a/monai/utils/__init__.py b/monai/utils/__init__.py
+index 324f6aa..3ea5743 100644
+--- a/monai/utils/__init__.py
++++ b/monai/utils/__init__.py
+@@ -12,6 +12,7 @@
+ # have to explicitly bring these in here to resolve circular import issues
+ from .aliases import alias, resolve_name
+ from .decorators import MethodReplacer, RestartGenerator
++from .deprecate_utils import DeprecatedError, deprecated, deprecated_arg
+ from .enums import (
+     Activation,
+     Average,
+diff --git a/monai/utils/deprecate_utils.py b/monai/utils/deprecate_utils.py
+new file mode 100644
+index 0000000..ccd4e4b
+--- /dev/null
++++ b/monai/utils/deprecate_utils.py
+@@ -0,0 +1,184 @@
++# Copyright 2020 - 2021 MONAI Consortium
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#     http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""
++Decorators for marking functions, methods, classes and arguments as deprecated.
++
++The MONAI version (or a `version_val` supplied explicitly) is compared against the `since` and `removed` versions:
++ - if `version >= removed`, calling the object raises `DeprecatedError`;
++ - elif `version >= since`, calling the object issues a `DeprecationWarning`;
++ - otherwise the object is used without any change.
++"""
++
++import inspect
++import warnings
++from functools import wraps
++from types import FunctionType
++from typing import Any, Callable, Optional, Tuple
++
++import monai
++
++__all__ = ["DeprecatedError", "deprecated", "deprecated_arg"]
++
++
++class DeprecatedError(Exception):
++    """Raised when an object has been removed in the version of MONAI being used."""
++
++
++def _parse_version(version: str) -> Tuple[int, ...]:
++    """Convert a version string such as "0.5.3+12.gabc" into a tuple of integers `(0, 5, 3)`."""
++    numbers = []
++    for part in str(version).split("+")[0].split("."):
++        digits = ""
++        for ch in part:
++            if not ch.isdigit():
++                break
++            digits += ch
++        if not digits:
++            break
++        numbers.append(int(digits))
++    return tuple(numbers)
++
++
++def _is_at_least(version: str, target: Optional[str]) -> bool:
++    """Return True if `version` is greater than or equal to `target`; a `None` target is always reached."""
++    if target is None:
++        return True
++    return _parse_version(version) >= _parse_version(target)
++
++
++def _status(version: str, since: Optional[str], removed: Optional[str]) -> str:
++    """Return "removed", "deprecated" or "active" for the given version and deprecation range."""
++    if removed is not None and _is_at_least(version, removed):
++        return "removed"
++    if _is_at_least(version, since):
++        return "deprecated"
++    return "active"
++
++
++def _check_versions(since: Optional[str], removed: Optional[str]) -> None:
++    if since is not None and removed is not None and _parse_version(since) >= _parse_version(removed):
++        raise ValueError(f"`since` version ({since}) must be earlier than `removed` version ({removed}).")
++
++
++def _message(prefix: str, since: Optional[str], removed: Optional[str], msg_suffix: str) -> str:
++    msg = prefix
++    if since is not None:
++        msg += f" was deprecated in MONAI version {since}"
++    if removed is not None:
++        msg += f" and will be removed in version {removed}" if since is not None else (
++            f" and will be removed in MONAI version {removed}"
++        )
++    msg += "."
++    if msg_suffix:
++        msg += f" {msg_suffix}"
++    return msg
++
++
++def deprecated(
++    since: Optional[str] = None,
++    removed: Optional[str] = None,
++    msg_suffix: str = "",
++    version_val: str = monai.__version__,
++) -> Callable:
++    """
++    Marks a function, method or class as deprecated. Use on a function or method to deprecate it, or on a class to
++    deprecate its construction (its `__init__` is wrapped).
++
++    Args:
++        since: version in which the object was deprecated.
++        removed: version in which the object will be (or was) removed; calling it at or after this version raises
++            `DeprecatedError`.
++        msg_suffix: additional message appended to the warning or error.
++        version_val: the version to compare against, defaults to the installed MONAI version.
++    """
++    _check_versions(since, removed)
++
++    def _decorator(obj: Any) -> Any:
++        is_func = isinstance(obj, FunctionType)
++        kind = "Function" if is_func else "Class"
++        prefix = f"{kind} `{obj.__name__}`"
++        msg = _message(prefix, since, removed, msg_suffix)
++        status = _status(version_val, since, removed)
++
++        if is_func:
++            target = obj
++        else:
++            target = obj.__init__  # type: ignore
++
++        @wraps(target)
++        def _wrapper(*args, **kwargs):
++            if status == "removed":
++                raise DeprecatedError(msg)
++            if status == "deprecated":
++                warnings.warn(msg, category=DeprecationWarning, stacklevel=2)
++            return target(*args, **kwargs)
++
++        if is_func:
++            return _wrapper
++        obj.__init__ = _wrapper  # type: ignore
++        return obj
++
++    return _decorator
++
++
++def deprecated_arg(
++    name: str,
++    since: Optional[str] = None,
++    removed: Optional[str] = None,
++    msg_suffix: str = "",
++    version_val: str = monai.__version__,
++    new_name: Optional[str] = None,
++) -> Callable:
++    """
++    Marks a single argument of a callable as deprecated. If the argument is supplied (positionally or by keyword) when
++    calling the callable, a `DeprecationWarning` is issued, or `DeprecatedError` if the argument has been removed.
++
++    Args:
++        name: name of the deprecated argument.
++        since: version in which the argument was deprecated.
++        removed: version in which the argument was removed.
++        msg_suffix: additional message appended to the warning or error.
++        version_val: the version to compare against, defaults to the installed MONAI version.
++        new_name: name of the argument replacing `name`, mentioned in the message if given.
++    """
++    _check_versions(since, removed)
++
++    def _decorator(func: Callable) -> Callable:
++        try:
++            sig = inspect.signature(func)
++        except (TypeError, ValueError):
++            sig = None
++        prefix = f"Argument `{name}` in function `{func.__name__}`"
++        suffix = msg_suffix
++        if new_name is not None:
++            suffix = f"Please use `{new_name}` instead. {msg_suffix}".strip()
++        msg = _message(prefix, since, removed, suffix)
++        status = _status(version_val, since, removed)
++
++        @wraps(func)
++        def _wrapper(*args, **kwargs):
++            if status != "active":
++                supplied = name in kwargs
++                if not supplied and sig is not None:
++                    try:
++                        supplied = name in sig.bind_partial(*args, **kwargs).arguments
++                    except TypeError:
++                        supplied = False
++                if supplied:
++                    if status == "removed":
++                        raise DeprecatedError(msg)
++                    warnings.warn(msg, category=DeprecationWarning, stacklevel=2)
++            return func(*args, **kwargs)
++
++        return _wrapper
++
++    return _decorator
+diff --git a/tests/test_deprecated.py b/tests/test_deprecated.py
+new file mode 100644
+index 0000000..d4a81a5
+--- /dev/null
++++ b/tests/test_deprecated.py
+@@ -0,0 +1,113 @@
++# Copyright 2020 - 2021 MONAI Consortium
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#     http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import unittest
++import warnings
++
++from monai.utils import DeprecatedError, deprecated, deprecated_arg
++
++
++class TestDeprecated(unittest.TestCase):
++    def test_function_warns(self):
++        @deprecated(since="0.1", removed="0.3", version_val="0.2")
++        def f(x):
++            return x + 1
++
++        with self.assertWarns(DeprecationWarning):
++            self.assertEqual(f(1), 2)
++
++    def test_function_active_and_future(self):
++        @deprecated(since="0.3", removed="0.4", version_val="0.2")
++        def f(x):
++            return x
++
++        with warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("always")
++            self.assertEqual(f(3), 3)
++        self.assertEqual(len(w), 0)
++
++    def test_function_removed_raises(self):
++        @deprecated(since="0.1", removed="0.2", version_val="0.2")
++        def f():
++            return 1
++
++        with self.assertRaises(DeprecatedError):
++            f()
++
++    def test_class_warns_on_init(self):
++        @deprecated(since="0.1", version_val="0.1")
++        class C:
++            def __init__(self, v):
++                self.v = v
++
++        with self.assertWarns(DeprecationWarning):
++            self.assertEqual(C(5).v, 5)
++
++    def test_class_removed_raises(self):
++        @deprecated(since="0.1", removed="0.2", version_val="0.5")
++        class C:
++            pass
++
++        with self.assertRaises(DeprecatedError):
++            C()
++
++    def test_invalid_versions(self):
++        with self.assertRaises(ValueError):
++            deprecated(since="0.3", removed="0.2")
++
++    def test_version_with_suffix(self):
++        @deprecated(since="0.1", version_val="0.1.0+12.gabc")
++        def f():
++            return 1
++
++        with self.assertWarns(DeprecationWarning):
++            f()
++
++
++class TestDeprecatedArg(unittest.TestCase):
++    def test_keyword_warns(self):
++        @deprecated_arg("old", since="0.1", version_val="0.2", new_name="new")
++        def f(new=None, old=None):
++            return new, old
++
++        with self.assertWarns(DeprecationWarning):
++            self.assertEqual(f(old=3), (None, 3))
++
++    def test_positional_warns(self):
++        @deprecated_arg("old", since="0.1", version_val="0.2")
++        def f(new=None, old=None):
++            return new, old
++
++        with self.assertWarns(DeprecationWarning):
++            self.assertEqual(f(1, 2), (1, 2))
++
++    def test_not_supplied_no_warning(self):
++        @deprecated_arg("old", since="0.1", version_val="0.2")
++        def f(new=None, old=None):
++            return new, old
++
++        with warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("always")
++            self.assertEqual(f(new=1), (1, None))
++        self.assertEqual(len(w), 0)
++
++    def test_removed_raises(self):
++        @deprecated_arg("old", since="0.1", removed="0.2", version_val="0.2")
++        def f(old=None):
++            return old
++
++        with self.assertRaises(DeprecatedError):
++            f(old=1)
++        self.assertIsNone(f())
++
++
++if __name__ == "__main__":
++    unittest.main()

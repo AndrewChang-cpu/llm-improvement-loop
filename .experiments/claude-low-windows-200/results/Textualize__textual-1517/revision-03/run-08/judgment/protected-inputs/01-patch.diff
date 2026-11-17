@@ -1,0 +1,328 @@
+diff --git a/src/textual/app.py b/src/textual/app.py
+index b207bbd..7a7f9b3 100644
+--- a/src/textual/app.py
++++ b/src/textual/app.py
+@@ -12,12 +12,14 @@ import warnings
+ from asyncio import Task
+ from contextlib import asynccontextmanager, redirect_stderr, redirect_stdout
+ from datetime import datetime
++from functools import partial
+ from pathlib import Path, PurePath
+ from queue import Queue
+ from time import perf_counter
+ from typing import (
+     TYPE_CHECKING,
+     Any,
++    Awaitable,
+     Callable,
+     Generic,
+     Iterable,
+@@ -130,6 +132,7 @@ class CssPathError(Exception):
+ 
+ 
+ ReturnType = TypeVar("ReturnType")
++CallThreadReturnType = TypeVar("CallThreadReturnType")
+ 
+ 
+ class _NullFile:
+@@ -354,6 +357,8 @@ class App(Generic[ReturnType], DOMNode):
+                 self.devtools = DevtoolsClient()
+ 
+         self._return_value: ReturnType | None = None
++        self._thread_loop: asyncio.AbstractEventLoop | None = None
++        self._thread_id: int = 0
+         self._exit = False
+ 
+         self.css_monitor = (
+@@ -459,6 +464,48 @@ class App(Generic[ReturnType], DOMNode):
+         """Set this app to be the currently active app."""
+         active_app.set(self)
+ 
++    def call_from_thread(
++        self,
++        callback: Callable[..., CallThreadReturnType | Awaitable[CallThreadReturnType]],
++        *args: Any,
++        **kwargs: Any,
++    ) -> CallThreadReturnType:
++        """Run a callable in the context of the app from another thread, and return the result.
++
++        Textual objects are not thread-safe. This method ensures the callable runs
++        in the correct context (the app's event loop, with this app as the active app).
++        The call blocks until the callable returns.
++
++        Args:
++            callback (Callable[..., CallThreadReturnType | Awaitable[CallThreadReturnType]]):
++                A callable that may return a value or an awaitable. Awaitables are awaited.
++            *args: Positional arguments forwarded unchanged to the callable.
++            **kwargs: Keyword arguments forwarded unchanged to the callable.
++
++        Raises:
++            RuntimeError: If the app is not running (including before it has started
++                and after it has stopped).
++            RuntimeError: If called from the app's own thread.
++
++        Returns:
++            CallThreadReturnType: The result of the callable.
++        """
++        if self._thread_loop is None:
++            raise RuntimeError("App is not running")
++        if threading.get_ident() == self._thread_id:
++            raise RuntimeError(
++                "The `call_from_thread` method must run in a different thread from the app"
++            )
++
++        bound_callback = partial(callback, *args, **kwargs)
++
++        async def run_callback() -> CallThreadReturnType:
++            self._set_active()
++            return await invoke(bound_callback)
++
++        future = asyncio.run_coroutine_threadsafe(run_callback(), self._thread_loop)
++        return future.result()
++
+     def compose(self) -> ComposeResult:
+         """Yield child widgets for a container."""
+         yield from ()
+@@ -838,18 +885,24 @@ class App(Generic[ReturnType], DOMNode):
+                 pilot = Pilot(app)
+                 auto_pilot_task = asyncio.create_task(run_auto_pilot(auto_pilot, pilot))
+ 
++        self._thread_loop = asyncio.get_running_loop()
++        self._thread_id = threading.get_ident()
+         try:
+-            await app._process_messages(
+-                ready_callback=None if auto_pilot is None else app_ready,
+-                headless=headless,
+-                terminal_size=size,
+-            )
+-        finally:
+             try:
+-                if auto_pilot_task is not None:
+-                    await auto_pilot_task
++                await app._process_messages(
++                    ready_callback=None if auto_pilot is None else app_ready,
++                    headless=headless,
++                    terminal_size=size,
++                )
+             finally:
+-                await app._shutdown()
++                try:
++                    if auto_pilot_task is not None:
++                        await auto_pilot_task
++                finally:
++                    await app._shutdown()
++        finally:
++            self._thread_loop = None
++            self._thread_id = 0
+ 
+         return app.return_value
+ 
+diff --git a/tests/test_concurrency.py b/tests/test_concurrency.py
+new file mode 100644
+index 0000000..a1e035a
+--- /dev/null
++++ b/tests/test_concurrency.py
+@@ -0,0 +1,203 @@
++"""Tests for calling into the app from threads other than the app thread."""
++
++from __future__ import annotations
++
++import concurrent.futures
++import threading
++from typing import Any, Callable
++
++import pytest
++
++from textual.app import App
++from textual.pilot import Pilot
++from textual.widgets import TextLog
++
++EXIT_CODE = 7
++NOT_RUNNING_MESSAGE = "App is not running"
++SAME_THREAD_MESSAGE = (
++    "The `call_from_thread` method must run in a different thread from the app"
++)
++
++
++class ConcurrencyApp(App[int]):
++    """An app with a text log widget for the cross-thread tests."""
++
++    def compose(self):
++        yield TextLog()
++
++
++def run_app_with_background_thread(
++    app: ConcurrencyApp, work: Callable[[], None]
++) -> int | None:
++    """Run the app headlessly, running `work` on a background thread.
++
++    The background thread is started from the app's ready hook. Whatever `work`
++    does, the thread finishes by calling `app.exit(EXIT_CODE)` through
++    `call_from_thread`. Exceptions raised by `work` are re-raised here, after
++    the app has returned, so that failing assertions in `work` fail the test.
++
++    Returns:
++        int | None: The value returned by `app.run`.
++    """
++    thread_errors: list[BaseException] = []
++
++    def thread_body() -> None:
++        try:
++            work()
++        except BaseException as error:
++            thread_errors.append(error)
++        finally:
++            app.call_from_thread(app.exit, EXIT_CODE)
++
++    thread = threading.Thread(target=thread_body)
++
++    async def start_thread(pilot: Pilot) -> None:
++        thread.start()
++
++    return_value = app.run(headless=True, size=(80, 24), auto_pilot=start_thread)
++    thread.join()
++    if thread_errors:
++        raise thread_errors[0]
++    return return_value
++
++
++def test_call_from_thread_before_app_runs_raises_not_running() -> None:
++    """Calling call_from_thread before the app has started raises "App is not running"."""
++    app = ConcurrencyApp()
++    with pytest.raises(RuntimeError, match=NOT_RUNNING_MESSAGE):
++        app.call_from_thread(lambda: None)
++
++
++def test_call_from_thread_on_app_thread_raises_runtime_error() -> None:
++    """Calling call_from_thread from the app's own thread raises a RuntimeError naming the thread rule."""
++    app = ConcurrencyApp()
++    messages: list[str] = []
++
++    async def call_on_app_thread(pilot: Pilot) -> None:
++        try:
++            app.call_from_thread(lambda: None)
++        except RuntimeError as error:
++            messages.append(str(error))
++        app.exit(EXIT_CODE)
++
++    return_value = app.run(headless=True, size=(80, 24), auto_pilot=call_on_app_thread)
++    assert return_value == EXIT_CODE
++    assert messages == [SAME_THREAD_MESSAGE]
++
++
++def test_call_from_thread_after_app_stopped_raises_not_running() -> None:
++    """Calling call_from_thread after run has returned raises "App is not running" without blocking."""
++    app = ConcurrencyApp()
++
++    async def exit_immediately(pilot: Pilot) -> None:
++        app.exit(EXIT_CODE)
++
++    return_value = app.run(headless=True, size=(80, 24), auto_pilot=exit_immediately)
++    assert return_value == EXIT_CODE
++
++    with pytest.raises(RuntimeError, match=NOT_RUNNING_MESSAGE):
++        app.call_from_thread(lambda: None)
++
++
++def test_call_from_thread_returns_callable_result() -> None:
++    """The value returned by the callable is returned to the calling thread."""
++    app = ConcurrencyApp()
++    results: list[int] = []
++
++    def work() -> None:
++        results.append(app.call_from_thread(lambda: 6 * 7))
++
++    assert run_app_with_background_thread(app, work) == EXIT_CODE
++    assert results == [42]
++
++
++def test_call_from_thread_widget_write_completes_without_error() -> None:
++    """A callable that queries and writes to a widget through the app completes on the calling thread."""
++    app = ConcurrencyApp()
++    completed: list[bool] = []
++
++    def write_to_log(message: str) -> None:
++        app.query_one(TextLog).write(message)
++
++    def work() -> None:
++        app.call_from_thread(write_to_log, "hello from a thread")
++        completed.append(True)
++
++    assert run_app_with_background_thread(app, work) == EXIT_CODE
++    assert completed == [True]
++
++
++def test_call_from_thread_awaits_awaitable_result() -> None:
++    """A callable returning an awaitable is awaited, and its result is returned to the calling thread."""
++    app = ConcurrencyApp()
++    results: list[int] = []
++
++    async def double(value: int) -> int:
++        return value * 2
++
++    def work() -> None:
++        results.append(app.call_from_thread(double, 21))
++
++    assert run_app_with_background_thread(app, work) == EXIT_CODE
++    assert results == [42]
++
++
++def test_call_from_thread_reraises_timeout_exception_with_same_message_and_args() -> None:
++    """A timeout-class exception raised by the callable is re-raised on the calling thread with the same message and args."""
++    app = ConcurrencyApp()
++    caught: list[BaseException] = []
++
++    def raise_timeout() -> None:
++        raise concurrent.futures.TimeoutError("third-party timeout", 30)
++
++    def work() -> None:
++        try:
++            app.call_from_thread(raise_timeout)
++        except Exception as error:
++            caught.append(error)
++
++    assert run_app_with_background_thread(app, work) == EXIT_CODE
++    assert len(caught) == 1
++    expected = concurrent.futures.TimeoutError("third-party timeout", 30)
++    assert str(caught[0]) == str(expected)
++    assert caught[0].args == expected.args
++
++
++def test_call_from_thread_forwards_all_positional_arguments_to_variadic_callable() -> None:
++    """A variadic callable receives every supplied positional and keyword argument."""
++    app = ConcurrencyApp()
++    results: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
++
++    def collect(*args: Any, **kwargs: Any) -> tuple[tuple[Any, ...], dict[str, Any]]:
++        return args, kwargs
++
++    def work() -> None:
++        results.append(app.call_from_thread(collect, 1, 2, 3, label="values"))
++
++    assert run_app_with_background_thread(app, work) == EXIT_CODE
++    assert results == [((1, 2, 3), {"label": "values"})]
++
++
++def test_call_from_thread_forwards_keyword_arguments_to_named_parameters() -> None:
++    """A callable with named parameters receives the supplied keyword arguments."""
++    app = ConcurrencyApp()
++    results: list[tuple[int, int, bool]] = []
++
++    def named(first: int, second: int = 0, *, flag: bool = False) -> tuple[int, int, bool]:
++        return first, second, flag
++
++    def work() -> None:
++        results.append(app.call_from_thread(named, 1, second=2, flag=True))
++
++    assert run_app_with_background_thread(app, work) == EXIT_CODE
++    assert results == [(1, 2, True)]
++
++
++def test_call_from_thread_exit_from_background_thread_returns_exit_value() -> None:
++    """Exiting the app through call_from_thread on a background thread makes run return the exit value."""
++    app = ConcurrencyApp()
++
++    def work() -> None:
++        pass
++
++    assert run_app_with_background_thread(app, work) == EXIT_CODE

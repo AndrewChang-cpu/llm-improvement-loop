@@ -1,0 +1,821 @@
+diff --git a/docs/reference/tabs.md b/docs/reference/tabs.md
+new file mode 100644
+index 0000000..2f1151c
+--- /dev/null
++++ b/docs/reference/tabs.md
+@@ -0,0 +1 @@
++::: textual.widgets.tabs.Tabs
+diff --git a/src/textual/renderables/opacity.py b/src/textual/renderables/opacity.py
+index 238904a..a624180 100644
+--- a/src/textual/renderables/opacity.py
++++ b/src/textual/renderables/opacity.py
+@@ -33,11 +33,14 @@ class Opacity:
+             fg = style.color
+             bg = style.bgcolor
+             if fg and fg.triplet and bg and bg.triplet:
++                # Merge the blended colors into the existing style so that other
++                # attributes, such as click metadata, are kept.
++                blended = _get_blended_style_cached(
++                    fg_color=fg, bg_color=bg, opacity=opacity
++                )
+                 yield Segment(
+                     segment.text,
+-                    _get_blended_style_cached(
+-                        fg_color=fg, bg_color=bg, opacity=opacity
+-                    ),
++                    style + blended,
+                     segment.control,
+                 )
+             else:
+diff --git a/src/textual/renderables/underline_bar.py b/src/textual/renderables/underline_bar.py
+index 59c9e6b..b74dacb 100644
+--- a/src/textual/renderables/underline_bar.py
++++ b/src/textual/renderables/underline_bar.py
+@@ -1,8 +1,10 @@
+ from __future__ import annotations
+ 
++from typing import Mapping
++
+ from rich.console import ConsoleOptions, Console, RenderResult
+-from rich.segment import Segment
+ from rich.style import StyleType
++from rich.text import Text
+ 
+ 
+ class UnderlineBar:
+@@ -12,6 +14,11 @@ class UnderlineBar:
+         highlight_range (tuple[float, float]): The range to highlight. Defaults to ``(0, 0)`` (no highlight)
+         highlight_style (StyleType): The style of the highlighted range of the bar.
+         background_style (StyleType): The style of the non-highlighted range(s) of the bar.
++        clickable_ranges (Mapping[str, tuple[int, int]], optional): Named column spans that
++            carry a ``range_clicked`` click action, keyed by tab name. Each value is a
++            ``(start, end)`` pair with an exclusive end. Spans are attached in mapping order,
++            so a later span overlaps an earlier one. Clickable ranges are not attached when the
++            highlight takes the zero-width early path. Defaults to no clickable ranges.
+         width (int, optional): The width of the bar, or ``None`` to fill available width.
+     """
+ 
+@@ -20,11 +27,15 @@ class UnderlineBar:
+         highlight_range: tuple[float, float] = (0, 0),
+         highlight_style: StyleType = "magenta",
+         background_style: StyleType = "grey37",
++        clickable_ranges: Mapping[str, tuple[int, int]] | None = None,
+         width: int | None = None,
+     ) -> None:
+         self.highlight_range = highlight_range
+         self.highlight_style = highlight_style
+         self.background_style = background_style
++        self.clickable_ranges: Mapping[str, tuple[int, int]] = (
++            {} if clickable_ranges is None else clickable_ranges
++        )
+         self.width = width
+ 
+     def __rich_console__(
+@@ -44,7 +55,8 @@ class UnderlineBar:
+         end = min(end, width)
+ 
+         if start == end == 0 or end < 0 or start > end:
+-            yield Segment(bar * width, style=background_style)
++            # Empty highlight: a single full-width background run, no click spans.
++            yield Text(bar * width, style=background_style, end="")
+             return
+ 
+         # Round start and end to nearest half
+@@ -55,24 +67,34 @@ class UnderlineBar:
+         half_start = start - int(start) > 0
+         half_end = end - int(end) > 0
+ 
++        text = Text(end="")
++
+         # Initial non-highlighted portion of bar
+-        yield Segment(bar * (int(start - 0.5)), style=background_style)
++        text.append(bar * (int(start - 0.5)), style=background_style)
+         if not half_start and start > 0:
+-            yield Segment(half_bar_right, style=background_style)
++            text.append(half_bar_right, style=background_style)
+ 
+         # The highlighted portion
+         bar_width = int(end) - int(start)
+         if half_start:
+-            yield Segment(half_bar_left + bar * (bar_width - 1), style=highlight_style)
++            text.append(half_bar_left + bar * (bar_width - 1), style=highlight_style)
+         else:
+-            yield Segment(bar * bar_width, style=highlight_style)
++            text.append(bar * bar_width, style=highlight_style)
+         if half_end:
+-            yield Segment(half_bar_right, style=highlight_style)
++            text.append(half_bar_right, style=highlight_style)
+ 
+         # The non-highlighted tail
+         if not half_end and end - width != 0:
+-            yield Segment(half_bar_left, style=background_style)
+-        yield Segment(bar * (int(width) - int(end) - 1), style=background_style)
++            text.append(half_bar_left, style=background_style)
++        text.append(bar * (int(width) - int(end) - 1), style=background_style)
++
++        # Click spans are applied last so they take precedence in mapping order.
++        for tab_name, (click_start, click_end) in self.clickable_ranges.items():
++            text.apply_meta(
++                {"@click": f"range_clicked('{tab_name}')"}, click_start, click_end
++            )
++
++        yield text
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/src/textual/widgets/tabs.py b/src/textual/widgets/tabs.py
+new file mode 100644
+index 0000000..36b548b
+--- /dev/null
++++ b/src/textual/widgets/tabs.py
+@@ -0,0 +1,441 @@
++from __future__ import annotations
++
++import math
++from typing import Dict, List, Tuple
++
++from rich.cells import cell_len
++from rich.console import Console, ConsoleOptions, RenderableType, RenderResult
++from rich.segment import Segment
++from rich.style import StyleType
++from rich.text import Text
++
++from .. import events
++from .._layout_resolve import layout_resolve
++from ..keys import Keys
++from ..reactive import Reactive
++from ..renderables.opacity import Opacity
++from ..renderables.underline_bar import UnderlineBar
++from ..widget import Widget
++
++__all__ = ["Tab", "Tabs"]
++
++# Keys that select a tab by position. Only the ASCII digits count.
++DIGIT_KEYS = frozenset("0123456789")
++
++
++class Tab:
++    """A tab item for the Tabs widget.
++
++    Args:
++        label (str): The text shown for the tab.
++        name (str, optional): The name that identifies the tab. Defaults to the label.
++    """
++
++    def __init__(self, label: str, name: str | None = None) -> None:
++        self.label = label
++        self.name = name or label
++
++    def __eq__(self, other: object) -> bool:
++        if not isinstance(other, Tab):
++            return NotImplemented
++        return self.label == other.label and self.name == other.name
++
++    def __repr__(self) -> str:
++        return f"Tab(label={self.label!r}, name={self.name!r})"
++
++    def __str__(self) -> str:
++        return self.label
++
++
++class _TabEdge:
++    """A layout edge for one part of a tab (padding or label).
++
++    Args:
++        size (int, optional): A fixed size in cells, or ``None`` for a flexible edge.
++        min_size (int): The minimum size of a flexible edge. Defaults to 1.
++        fraction (int): The share of remaining space for a flexible edge. Defaults to 1.
++    """
++
++    def __init__(
++        self, size: int | None = None, min_size: int = 1, fraction: int = 1
++    ) -> None:
++        self.size = size
++        self.min_size = min_size
++        self.fraction = fraction
++
++
++def _displayed_tabs(tabs: List[Tab]) -> List[Tab]:
++    """Return one tab per distinct name, in order of first occurrence.
++
++    Each returned tab carries the label of the last tab that has its name.
++
++    Args:
++        tabs (List[Tab]): The full tab list, which may contain duplicate names.
++
++    Returns:
++        List[Tab]: The displayed tabs.
++    """
++    labels: Dict[str, str] = {}
++    for tab in tabs:
++        labels[tab.name] = tab.label
++    return [Tab(label, name) for name, label in labels.items()]
++
++
++class TabsRenderable:
++    """Render the label row and the underline bar of a Tabs widget.
++
++    The label row is built from one padded span per displayed tab. The underline bar
++    highlights the interpolated position of the active tab and carries a click range for
++    every displayed tab.
++
++    Args:
++        tabs (List[Tab]): The full tab list.
++        active_tab_name (str, optional): The name of the active tab, or ``None``.
++        bar_position (float): The position of the underline, as a fractional index into
++            the displayed tabs.
++        active_tab_style (StyleType): The style of the active tab's padded span.
++        active_bar_style (StyleType): The style of the highlighted part of the
++            underline.
++        inactive_tab_style (StyleType): The style of inactive tabs' padded spans.
++        inactive_bar_style (StyleType): The style of the rest of the underline.
++        inactive_text_opacity (float): The blend ratio applied to inactive tabs'
++            text.
++        tab_padding (int, optional): A fixed padding size in cells, or ``None`` to
++            fit the padding to the available width.
++    """
++
++    def __init__(
++        self,
++        tabs: List[Tab],
++        active_tab_name: str | None,
++        bar_position: float,
++        active_tab_style: StyleType,
++        active_bar_style: StyleType,
++        inactive_tab_style: StyleType,
++        inactive_bar_style: StyleType,
++        inactive_text_opacity: float,
++        tab_padding: int | None,
++    ) -> None:
++        self.tabs = tabs
++        self.active_tab_name = active_tab_name
++        self.bar_position = bar_position
++        self.active_tab_style = active_tab_style
++        self.active_bar_style = active_bar_style
++        self.inactive_tab_style = inactive_tab_style
++        self.inactive_bar_style = inactive_bar_style
++        self.inactive_text_opacity = inactive_text_opacity
++        self.tab_padding = tab_padding
++
++    def __rich_console__(
++        self, console: Console, options: ConsoleOptions
++    ) -> RenderResult:
++        width = options.max_width
++        displayed = _displayed_tabs(self.tabs)
++
++        # Each displayed tab contributes left padding, label, and right padding edges.
++        edges: List[_TabEdge] = []
++        for tab in displayed:
++            edges.append(_TabEdge(size=self.tab_padding or None))
++            edges.append(_TabEdge(size=cell_len(tab.label)))
++            edges.append(_TabEdge(size=self.tab_padding or None))
++        sizes = layout_resolve(width, edges)
++
++        label_ranges: Dict[str, Tuple[int, int]] = {}
++        selection_ranges: Dict[str, Tuple[int, int]] = {}
++        label_pieces: List[RenderableType] = []
++
++        position = 0
++        for index, tab in enumerate(displayed):
++            left, label_size, right = sizes[index * 3 : index * 3 + 3]
++            label_start = position + left
++            label_ranges[tab.name] = (label_start, label_start + cell_len(tab.label))
++            span_width = left + label_size + right
++            selection_ranges[tab.name] = (position, position + span_width)
++            position += span_width
++
++            # The padded span is one run of text, so padding shares the label's style
++            # and click action.
++            padded = " " * left + tab.label + " " * right
++            if tab.name == self.active_tab_name:
++                label_pieces.append(
++                    Text(
++                        padded,
++                        style=console.get_style(self.active_tab_style),
++                        end="",
++                        no_wrap=True,
++                        overflow="crop",
++                    )
++                )
++            else:
++                piece = Text(
++                    padded,
++                    style=console.get_style(self.inactive_tab_style),
++                    end="",
++                    no_wrap=True,
++                    overflow="crop",
++                )
++                piece.apply_meta(
++                    {"@click": f"range_clicked('{tab.name}')"}, 0, len(padded)
++                )
++                label_pieces.append(
++                    Opacity(piece, opacity=self.inactive_text_opacity)
++                )
++
++        yield from label_pieces
++        yield Segment("\n")
++
++        highlight_range = self._highlight_range(displayed, label_ranges)
++        yield UnderlineBar(
++            highlight_range=highlight_range,
++            highlight_style=console.get_style(self.active_bar_style),
++            background_style=console.get_style(self.inactive_bar_style),
++            clickable_ranges=selection_ranges,
++            width=width,
++        )
++
++    def _highlight_range(
++        self, displayed: List[Tab], label_ranges: Dict[str, Tuple[int, int]]
++    ) -> Tuple[float, float]:
++        """Interpolate the highlighted label range at the bar position.
++
++        The highlight runs between the label range at the floor index and the label
++        range at the next index. The next index wraps at the end of the list.
++
++        Args:
++            displayed (List[Tab]): The displayed tabs.
++            label_ranges (Dict[str, Tuple[int, int]]): Label ranges keyed by tab name.
++
++        Returns:
++            Tuple[float, float]: The highlight range in cells.
++        """
++        count = len(displayed)
++        if count == 0:
++            return (0, 0)
++        floor_position = math.floor(self.bar_position)
++        fraction = self.bar_position - floor_position
++        index = int(floor_position) % count
++        next_index = (index + 1) % count
++        start, end = label_ranges[displayed[index].name]
++        next_start, next_end = label_ranges[displayed[next_index].name]
++        return (
++            start + fraction * (next_start - start),
++            end + fraction * (next_end - end),
++        )
++
++
++class Tabs(Widget):
++    """A horizontal row of tabs with an animated underline.
++
++    The label row is on the first line and the underline bar is on the second line.
++    Tabs are selected by name. Click a tab, press left or right to move between tabs,
++    press 1 to 9 to select a tab by position, or press a letter to jump to the next tab
++    whose label starts with that letter.
++
++    Args:
++        tabs (List[Tab]): The tabs, in display order. Duplicate names display once,
++            at the first occurrence, with the label of the last tab that has the name.
++        active_tab (str, optional): The name of the initially active tab. Defaults
++            to the name of the first tab. A name that matches no tab is kept, and the
++            underline starts at index 0.
++        active_tab_style (StyleType): The style of the active tab's label. Defaults
++            to ``"#f0f0f0 on #021720"``.
++        active_bar_style (StyleType): The style of the highlighted part of the
++            underline. Defaults to ``"#1BB152"``.
++        inactive_tab_style (StyleType): The style of inactive tabs' labels. Defaults
++            to ``"#f0f0f0 on #021720"``.
++        inactive_bar_style (StyleType): The style of the rest of the underline.
++            Defaults to ``"#455058"``.
++        inactive_text_opacity (float): The blend ratio applied to inactive tabs' text,
++            where 1.0 is fully visible and 0.0 is invisible. Defaults to 0.5.
++        animation_duration (float): The duration of the underline animation, in seconds.
++            Defaults to 0.3.
++        animation_function (str): The name of the easing function used by the underline
++            animation. Defaults to ``"out_cubic"``.
++        tab_padding (int, optional): The number of cells of padding on each side of a
++            label. Defaults to ``None``, which fits the padding to the available width,
++            with a minimum of one cell.
++        search_by_first_character (bool): If true, a letter key activates the next tab
++            whose label starts with that letter. Defaults to True.
++    """
++
++    DEFAULT_STYLES = "height: 2;"
++
++    can_focus = True
++
++    _active_tab_name: Reactive[str | None] = Reactive(None)
++    _bar_position: Reactive[float] = Reactive(0.0)
++
++    def __init__(
++        self,
++        tabs: List[Tab],
++        active_tab: str | None = None,
++        active_tab_style: StyleType = "#f0f0f0 on #021720",
++        active_bar_style: StyleType = "#1BB152",
++        inactive_tab_style: StyleType = "#f0f0f0 on #021720",
++        inactive_bar_style: StyleType = "#455058",
++        inactive_text_opacity: float = 0.5,
++        animation_duration: float = 0.3,
++        animation_function: str = "out_cubic",
++        tab_padding: int | None = None,
++        search_by_first_character: bool = True,
++    ) -> None:
++        super().__init__()
++        self.tabs = tabs
++        self.active_tab_style = active_tab_style
++        self.active_bar_style = active_bar_style
++        self.inactive_tab_style = inactive_tab_style
++        self.inactive_bar_style = inactive_bar_style
++        self.inactive_text_opacity = inactive_text_opacity
++        self.animation_duration = animation_duration
++        self.animation_function = animation_function
++        self.tab_padding = tab_padding
++        self.search_by_first_character = search_by_first_character
++
++        if tabs:
++            self._active_tab_name = active_tab or tabs[0].name
++        else:
++            self._active_tab_name = None
++        self._bar_position = float(self._displayed_index(self._active_tab_name))
++
++    def render(self) -> RenderableType:
++        return TabsRenderable(
++            self.tabs,
++            self._active_tab_name,
++            self._bar_position,
++            self.active_tab_style,
++            self.active_bar_style,
++            self.inactive_tab_style,
++            self.inactive_bar_style,
++            self.inactive_text_opacity,
++            self.tab_padding,
++        )
++
++    async def watch__active_tab_name(self, tab_name: str | None) -> None:
++        if tab_name is None:
++            return
++        self.animate(
++            "_bar_position",
++            float(self._displayed_index(tab_name)),
++            duration=self.animation_duration,
++            easing=self.animation_function,
++        )
++
++    def find_tab_by_name(self, tab_name: str) -> int:
++        """Find the index of the first tab in the full list with a name.
++
++        Args:
++            tab_name (str): The name to look for.
++
++        Returns:
++            int: The index of the first tab with that name, or 0 if no tab has it.
++        """
++        for index, tab in enumerate(self.tabs):
++            if tab.name == tab_name:
++                return index
++        return 0
++
++    def activate_next_tab(self) -> None:
++        """Activate the next tab in the full list, wrapping at the end."""
++        index = (self.find_tab_by_name(self._active_tab_name) + 1) % len(self.tabs)
++        self._active_tab_name = self.tabs[index].name
++
++    def activate_previous_tab(self) -> None:
++        """Activate the previous tab in the full list, wrapping at the start."""
++        index = (self.find_tab_by_name(self._active_tab_name) - 1) % len(self.tabs)
++        self._active_tab_name = self.tabs[index].name
++
++    def activate_tab_by_first_char(self, char: str) -> None:
++        """Activate the next tab whose label starts with a character.
++
++        The search starts after the active tab, wraps around the full list, compares
++        case-insensitively, and never selects the active tab. If no tab matches, the
++        active tab is unchanged.
++
++        Args:
++            char (str): The character to match at the start of a label.
++        """
++        count = len(self.tabs)
++        start = self.find_tab_by_name(self._active_tab_name)
++        wanted = char.lower()
++        for offset in range(1, count + 1):
++            tab = self.tabs[(start + offset) % count]
++            if tab.name == self._active_tab_name:
++                continue
++            if tab.label.lower().startswith(wanted):
++                self._active_tab_name = tab.name
++                return
++
++    def activate_tab_by_number(self, tab_number: int) -> None:
++        """Activate a tab by its 1-based position in the full list.
++
++        A ``tab_number`` above the tab count is ignored. ``0`` activates the 10th tab
++        when there are at least ten tabs, and otherwise the last tab.
++
++        Args:
++            tab_number (int): The 1-based position of the tab, or 0 for the 10th or
++                last tab.
++        """
++        count = len(self.tabs)
++        if tab_number > count:
++            return
++        if tab_number == 0:
++            index = 9 if count >= 10 else -1
++        else:
++            index = tab_number - 1
++        self._active_tab_name = self.tabs[index].name
++
++    def action_range_clicked(self, target_tab_name: str) -> None:
++        """Activate the tab with a name. This is the click action of the tab spans.
++
++        Args:
++            target_tab_name (str): The name of the tab to activate.
++        """
++        self._active_tab_name = target_tab_name
++
++    async def on_key(self, event: events.Key) -> None:
++        """Handle a key press while the widget has focus.
++
++        With no tabs, the key is marked handled and nothing else happens. Otherwise:
++
++        - Escape removes focus from the widget.
++        - Right and left activate the next or previous tab, wrapping at either end.
++        - The keys 1 to 9 activate the tab at that 1-based position. The key 0 activates
++          the 10th tab, or the last tab when there are fewer than ten.
++        - A single letter activates the next tab whose label starts with that letter,
++          if ``search_by_first_character`` is true.
++
++        Every key is marked handled by preventing its default action. Propagation is not
++        stopped, so application bindings still receive the key.
++
++        Args:
++            event (events.Key): The key event.
++        """
++        if not self.tabs:
++            event.prevent_default()
++            return
++
++        key = event.key
++        if key == Keys.Escape:
++            await self.app.set_focus(None)
++        elif key == Keys.Right:
++            self.activate_next_tab()
++        elif key == Keys.Left:
++            self.activate_previous_tab()
++        elif key in DIGIT_KEYS:
++            self.activate_tab_by_number(int(key))
++        elif self.search_by_first_character and len(key) == 1:
++            self.activate_tab_by_first_char(key)
++        event.prevent_default()
++
++    def _displayed_index(self, tab_name: str | None) -> int:
++        """Return the index of a name among the displayed tabs.
++
++        Args:
++            tab_name (str, optional): The name to look for.
++
++        Returns:
++            int: The index among the displayed tabs, or 0 if no displayed tab has
++                the name.
++        """
++        names = [tab.name for tab in _displayed_tabs(self.tabs)]
++        return names.index(tab_name) if tab_name in names else 0
+diff --git a/tests/renderables/test_opacity.py b/tests/renderables/test_opacity.py
+index 05cd353..5ffdc87 100644
+--- a/tests/renderables/test_opacity.py
++++ b/tests/renderables/test_opacity.py
+@@ -1,4 +1,8 @@
++import io
++
+ import pytest
++from rich.console import Console
++from rich.style import Style
+ from rich.text import Text
+ 
+ from tests.utilities.render import render
+@@ -48,3 +52,17 @@ def test_opacity_only_fg_noop():
+ def test_opacity_only_bg_noop():
+     text_only_bg = Text("Hello, world!", style="on #ff0000", end="")
+     assert render(Opacity(text_only_bg, opacity=.5)) == render(text_only_bg)
++
++
++def test_opacity_keeps_click_metadata():
++    meta_text = Text(
++        "Hello, world!",
++        style=Style(color="#ff0000", bgcolor="#00ff00", meta={"@click": "noop()"}),
++        end="",
++    )
++    console = Console(file=io.StringIO(), color_system="truecolor")
++    opacity = Opacity(meta_text, opacity=.5)
++    segments = list(opacity.__rich_console__(console, console.options))
++    styled = [segment for segment in segments if segment.text == "Hello, world!"]
++    assert len(styled) == 1
++    assert styled[0].style.meta == {"@click": "noop()"}
+diff --git a/tests/renderables/test_underline_bar.py b/tests/renderables/test_underline_bar.py
+index 5c5e4de..4849105 100644
+--- a/tests/renderables/test_underline_bar.py
++++ b/tests/renderables/test_underline_bar.py
+@@ -1,3 +1,11 @@
++import io
++from types import SimpleNamespace
++
++import pytest
++from rich.console import Console
++from rich.style import Style
++from rich.text import Text
++
+ from tests.utilities.render import render
+ from textual.renderables.underline_bar import UnderlineBar
+ 
+@@ -124,3 +132,56 @@ def test_custom_styles():
+         f"{GREEN}╺{STOP}"
+         f"{GREEN}━{STOP}"
+     )
++
++
++def _first_rendered_item(bar, width):
++    console = Console(file=io.StringIO())
++    options = SimpleNamespace(max_width=width)
++    return next(iter(bar.__rich_console__(console, options)))
++
++
++def test_clickable_ranges_attach_click_spans_in_mapping_order():
++    bar = UnderlineBar(
++        highlight_range=(2, 4),
++        clickable_ranges={"first": (0, 2), "second": (2, 6)},
++        width=6,
++    )
++    rendered = _first_rendered_item(bar, 6)
++
++    assert isinstance(rendered, Text)
++    assert rendered.plain == "━╸━━╺━"
++    first, second = rendered.spans[-2:]
++    assert (first.start, first.end) == (0, 2)
++    assert (second.start, second.end) == (2, 6)
++    assert isinstance(first.style, Style)
++    assert first.style.meta == {"@click": "range_clicked('first')"}
++    assert second.style.meta == {"@click": "range_clicked('second')"}
++
++
++@pytest.mark.parametrize("highlight_range", [(0, 0), (3, 1), (-5, -2)])
++def test_zero_width_early_path_has_no_click_metadata(highlight_range):
++    bar = UnderlineBar(
++        highlight_range=highlight_range,
++        clickable_ranges={"tab": (0, 3)},
++        width=6,
++    )
++    rendered = _first_rendered_item(bar, 6)
++
++    assert isinstance(rendered, Text)
++    assert rendered.plain == "━━━━━━"
++    for span in rendered.spans:
++        assert isinstance(span.style, Style)
++        assert "@click" not in span.style.meta
++
++
++def test_zero_width_highlight_at_nonzero_position_has_click_metadata():
++    bar = UnderlineBar(
++        highlight_range=(2, 2),
++        clickable_ranges={"tab": (2, 3)},
++        width=6,
++    )
++    rendered = _first_rendered_item(bar, 6)
++
++    click = rendered.spans[-1]
++    assert (click.start, click.end) == (2, 3)
++    assert click.style.meta == {"@click": "range_clicked('tab')"}
+diff --git a/tests/widgets/__init__.py b/tests/widgets/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/widgets/test_tabs.py b/tests/widgets/test_tabs.py
+new file mode 100644
+index 0000000..665e30c
+--- /dev/null
++++ b/tests/widgets/test_tabs.py
+@@ -0,0 +1,136 @@
++import re
++
++from tests.utilities.render import render
++from textual.widgets.tabs import Tab, Tabs
++
++ANSI_CODE = re.compile(r"\x1b\[[0-9;]*m")
++BAR = "━"
++
++
++def plain_lines(renderable):
++    text = ANSI_CODE.sub("", render(renderable))
++    return text.split("\n")
++
++
++def make_tabs(labels, **kwargs):
++    return Tabs([Tab(label) for label in labels], **kwargs)
++
++
++def test_construction_with_empty_list_and_with_tabs():
++    empty = Tabs([])
++    populated = make_tabs(["One", "Two"])
++    assert empty is not None
++    assert populated is not None
++
++
++def test_tab_name_defaults_to_label():
++    tab = Tab("Home")
++    assert tab.name == "Home"
++    assert Tab("Home", name="main").name == "main"
++    assert Tab("Home") == Tab("Home", name="Home")
++    assert str(Tab("Home", name="main")) == "Home"
++
++
++def test_find_tab_by_name_returns_first_index_of_duplicate():
++    tabs = Tabs([Tab("A"), Tab("B", name="x"), Tab("C", name="x")])
++    assert tabs.find_tab_by_name("x") == 1
++
++
++def test_find_tab_by_name_returns_zero_when_missing():
++    tabs = make_tabs(["A", "B"])
++    assert tabs.find_tab_by_name("missing") == 0
++
++
++def test_initial_active_tab_defaults_to_first_tab():
++    tabs = make_tabs(["A", "B", "C"])
++    assert tabs._active_tab_name == "A"
++    assert tabs._bar_position == 0.0
++
++
++def test_initial_active_tab_is_used_when_given():
++    tabs = make_tabs(["A", "B", "C"], active_tab="C")
++    assert tabs._active_tab_name == "C"
++    assert tabs._bar_position == 2.0
++
++
++def test_no_tabs_has_no_active_tab():
++    tabs = Tabs([], active_tab="A")
++    assert tabs._active_tab_name is None
++
++
++def test_next_and_previous_wrap_around():
++    tabs = make_tabs(["A", "B", "C"])
++    tabs.activate_previous_tab()
++    assert tabs._active_tab_name == "C"
++    tabs.activate_next_tab()
++    assert tabs._active_tab_name == "A"
++    tabs.activate_next_tab()
++    assert tabs._active_tab_name == "B"
++
++
++def test_first_character_search_wraps_and_skips_active_tab():
++    tabs = make_tabs(["Apple", "Avocado", "banana", "Apricot"])
++    tabs.activate_tab_by_first_char("a")
++    assert tabs._active_tab_name == "Avocado"
++    tabs.activate_tab_by_first_char("a")
++    assert tabs._active_tab_name == "Apricot"
++    tabs.activate_tab_by_first_char("a")
++    assert tabs._active_tab_name == "Apple"
++
++
++def test_first_character_search_is_case_insensitive():
++    tabs = make_tabs(["Apple", "banana"])
++    tabs.activate_tab_by_first_char("B")
++    assert tabs._active_tab_name == "banana"
++
++
++def test_first_character_search_without_match_keeps_active_tab():
++    tabs = make_tabs(["Apple", "banana"])
++    tabs.activate_tab_by_first_char("z")
++    assert tabs._active_tab_name == "Apple"
++
++
++def test_activate_tab_by_number_positions():
++    tabs = make_tabs(["T1", "T2", "T3"])
++    tabs.activate_tab_by_number(2)
++    assert tabs._active_tab_name == "T2"
++    tabs.activate_tab_by_number(0)
++    assert tabs._active_tab_name == "T3"
++    tabs.activate_tab_by_number(4)
++    assert tabs._active_tab_name == "T3"
++
++
++def test_activate_tab_by_number_zero_selects_tenth_tab_when_ten_or_more():
++    tabs = make_tabs([f"T{number}" for number in range(1, 13)])
++    tabs.activate_tab_by_number(0)
++    assert tabs._active_tab_name == "T10"
++
++
++def test_action_range_clicked_sets_active_tab():
++    tabs = make_tabs(["A", "B", "C"])
++    tabs.action_range_clicked("C")
++    assert tabs._active_tab_name == "C"
++
++
++def test_duplicate_names_display_once_with_last_label():
++    tabs = Tabs([Tab("A"), Tab("B"), Tab("A2", name="A")], tab_padding=1)
++    assert plain_lines(tabs.render())[0] == " A2  B "
++
++
++def test_row_layout_with_fixed_padding():
++    tabs = make_tabs(["One", "Two"], tab_padding=1)
++    lines = plain_lines(tabs.render())
++    assert lines[0] == " One  Two "
++    assert lines[1] == BAR * 100
++
++
++def test_flexible_padding_fills_the_row():
++    tabs = make_tabs(["One", "Two"])
++    lines = plain_lines(tabs.render())
++    assert len(lines[0]) == 100
++
++
++def test_no_tabs_renders_empty_row_and_full_underline():
++    tabs = Tabs([])
++    lines = plain_lines(tabs.render())
++    assert lines == ["", BAR * 100]

@@ -1,0 +1,194 @@
+diff --git a/docs/source/losses.rst b/docs/source/losses.rst
+index ce2e4a8..3f87f17 100644
+--- a/docs/source/losses.rst
++++ b/docs/source/losses.rst
+@@ -35,6 +35,14 @@ Segmentation Losses
+ .. autoclass:: generalized_dice
+     :members:
+ 
++`GeneralizedWassersteinDiceLoss`
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++.. autoclass:: GeneralizedWassersteinDiceLoss
++    :members:
++
++.. autoclass:: generalized_wasserstein_dice
++    :members:
++
+ `FocalLoss`
+ ~~~~~~~~~~~
+ .. autoclass:: FocalLoss
+diff --git a/monai/losses/__init__.py b/monai/losses/__init__.py
+index c9ab109..7c3ca0c 100644
+--- a/monai/losses/__init__.py
++++ b/monai/losses/__init__.py
+@@ -9,6 +9,15 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-from .dice import Dice, DiceLoss, GeneralizedDiceLoss, MaskedDiceLoss, dice, generalized_dice
++from .dice import (
++    Dice,
++    DiceLoss,
++    GeneralizedDiceLoss,
++    GeneralizedWassersteinDiceLoss,
++    MaskedDiceLoss,
++    dice,
++    generalized_dice,
++    generalized_wasserstein_dice,
++)
+ from .focal_loss import FocalLoss
+ from .tversky import TverskyLoss
+diff --git a/monai/losses/dice.py b/monai/losses/dice.py
+index 86823f2..03a29fb 100644
+--- a/monai/losses/dice.py
++++ b/monai/losses/dice.py
+@@ -10,7 +10,7 @@
+ # limitations under the License.
+ 
+ import warnings
+-from typing import Callable, Optional, Union
++from typing import Callable, Optional, Sequence, Union
+ 
+ import torch
+ from torch.nn.modules.loss import _Loss
+@@ -297,5 +297,140 @@ class GeneralizedDiceLoss(_Loss):
+         return f
+ 
+ 
++class GeneralizedWassersteinDiceLoss(_Loss):
++    """
++    Compute the generalized Wasserstein Dice loss defined in:
++
++        Fidon, L. et. al. (2017) Generalised Wasserstein Dice Score for Imbalanced Multi-class
++        Segmentation using Holistic Convolutional Networks. MICCAI BrainLes 2017.
++
++    The loss uses a ground distance matrix ``M`` between the classes (values in [0, 1], zero on the diagonal).
++    For a prediction ``p`` and a one-hot ground truth ``g``, the Wasserstein-based soft score of voxel ``i``
++    for class ``l`` is ``alpha_il = 1 - sum_k M[k, l] * p_ik``. The class-weighted generalized Dice overlap
++    is then computed between ``g`` and ``alpha``:
++
++        loss = 1 - 2 * sum_l w_l * sum_i g_il * alpha_il / (sum_l w_l * sum_i (g_il + alpha_il))
++
++    When ``M = 1 - I`` (all distinct classes at distance 1), ``alpha`` equals ``p`` and the loss reduces to
++    :py:class:`GeneralizedDiceLoss` with the square weighting.
++
++    """
++
++    def __init__(
++        self,
++        dist_matrix: Union[torch.Tensor, Sequence[Sequence[float]]],
++        weighting_mode: str = "default",
++        sigmoid: bool = False,
++        softmax: bool = False,
++        reduction: Union[LossReduction, str] = LossReduction.MEAN,
++        smooth: float = 1e-5,
++    ) -> None:
++        """
++        Args:
++            dist_matrix: 2D square matrix ``M`` (C x C) of ground distances between classes, with values in [0, 1].
++                It is expected to be symmetric with zeros on the diagonal.
++            weighting_mode: {``"default"``, ``"uniform"``}
++                Type of class weights. ``"default"`` uses ``w_l = 1 / (sum_i g_il)^2`` (inverse squared volume),
++                ``"uniform"`` uses ``w_l = 1`` for all classes. Defaults to ``"default"``.
++            sigmoid: If True, apply a sigmoid function to the prediction.
++            softmax: If True, apply a softmax function to the prediction.
++            reduction: {``"none"``, ``"mean"``, ``"sum"``}
++                Specifies the reduction to apply to the output. Defaults to ``"mean"``.
++
++                - ``"none"``: no reduction will be applied.
++                - ``"mean"``: the sum of the output will be divided by the number of elements in the output.
++                - ``"sum"``: the output will be summed.
++            smooth: a small constant to avoid nan.
++
++        Raises:
++            ValueError: dist_matrix must be a square 2D matrix.
++            ValueError: weighting_mode must be one of ``"default"`` or ``"uniform"``.
++            ValueError: sigmoid=True and softmax=True are not compatible.
++            ValueError: reduction={reduction} is invalid. Valid options are: none, mean or sum.
++
++        """
++        super().__init__(reduction=LossReduction(reduction).value)
++
++        m = torch.as_tensor(dist_matrix, dtype=torch.float32)
++        if m.ndimension() != 2 or m.shape[0] != m.shape[1]:
++            raise ValueError(f"dist_matrix must be a square 2D matrix, got shape {tuple(m.shape)}.")
++        if sigmoid and softmax:
++            raise ValueError("sigmoid=True and softmax=True are not compatible.")
++        if weighting_mode not in ("default", "uniform"):
++            raise ValueError(f"weighting_mode={weighting_mode} is invalid. Valid options are: default or uniform.")
++
++        self.register_buffer("m", m)
++        self.num_classes = m.shape[0]
++        self.weighting_mode = weighting_mode
++        self.sigmoid = sigmoid
++        self.softmax = softmax
++        self.smooth = smooth
++
++    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
++        """
++        Args:
++            input: the shape should be BCH[WD], where C is the number of classes.
++            target: the shape should be BCH[WD] (one-hot) or B1H[WD] (class indices).
++
++        Raises:
++            ValueError: input channels do not match the size of dist_matrix.
++            ValueError: reduction={self.reduction} is invalid.
++
++        """
++        if self.sigmoid:
++            input = torch.sigmoid(input)
++        if self.softmax:
++            input = torch.softmax(input, 1)
++
++        n_pred_ch = input.shape[1]
++        if n_pred_ch != self.num_classes:
++            raise ValueError(
++                f"input has {n_pred_ch} channels but dist_matrix describes {self.num_classes} classes."
++            )
++        if target.shape[1] == 1 and n_pred_ch > 1:
++            target = one_hot(target, num_classes=n_pred_ch)
++        assert (
++            target.shape == input.shape
++        ), f"ground truth has differing shape ({target.shape}) from input ({input.shape})"
++
++        # reducing only spatial dimensions (not batch nor channels)
++        reduce_axis = list(range(2, len(input.shape)))
++        flat_input = input.reshape(input.shape[0], n_pred_ch, -1)
++
++        # Wasserstein-based soft score: alpha[b, l, s] = 1 - sum_k M[k, l] * p[b, k, s]
++        expected_dist = torch.einsum("kl,bks->bls", self.m.to(input.dtype), flat_input)
++        alpha = 1.0 - expected_dist.reshape(input.shape)
++
++        ground_o = torch.sum(target, reduce_axis)  # B x C
++        alpha_o = torch.sum(alpha, reduce_axis)  # B x C
++        intersection = torch.sum(target * alpha, reduce_axis)  # B x C
++
++        if self.weighting_mode == "default":
++            w = torch.reciprocal(ground_o.float() * ground_o.float())
++            # classes absent from the ground truth get infinite weight: replace them by the largest finite weight
++            infs = torch.isinf(w)
++            finite_w = torch.where(infs, torch.zeros_like(w), w)
++            max_w = torch.max(finite_w, dim=1, keepdim=True)[0]
++            w = torch.where(infs, max_w.expand_as(w), w)
++        else:
++            w = torch.ones_like(ground_o, dtype=torch.float32)
++
++        numerator = 2.0 * (intersection * w).sum(1) + self.smooth
++        denominator = ((ground_o + alpha_o) * w).sum(1) + self.smooth
++        f = 1.0 - numerator / denominator
++
++        if self.reduction == LossReduction.MEAN.value:
++            f = torch.mean(f)  # the batch average
++        elif self.reduction == LossReduction.SUM.value:
++            f = torch.sum(f)  # sum over the batch dim
++        elif self.reduction == LossReduction.NONE.value:
++            pass  # returns [N] losses
++        else:
++            raise ValueError(f"reduction={self.reduction} is invalid.")
++
++        return f
++
++
+ dice = Dice = DiceLoss
+ generalized_dice = GeneralizedDiceLoss
++generalized_wasserstein_dice = GeneralizedWassersteinDiceLoss

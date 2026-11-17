@@ -1,0 +1,207 @@
+diff --git a/rdflib/extras/shacl.py b/rdflib/extras/shacl.py
+new file mode 100644
+index 0000000..5eca713
+--- /dev/null
++++ b/rdflib/extras/shacl.py
+@@ -0,0 +1,92 @@
++"""Utilities for working with SHACL shapes graphs."""
++from __future__ import annotations
++
++from typing import Union
++
++from rdflib import Graph, Literal, URIRef
++from rdflib.namespace import RDF, SH
++from rdflib.paths import AlternativePath, InvPath, MulPath, Path, SequencePath
++from rdflib.term import Node
++
++
++class SHACLPathError(Exception):
++    """Raised when a SHACL path structure is malformed or unusable."""
++
++
++# The parsing approach follows pyshacl's SHACL-to-SPARQL path conversion.
++def parse_shacl_path(
++    shapes_graph: Graph,
++    path_identifier: Node,
++) -> Union[URIRef, Path]:
++    """Convert the object of a ``sh:path`` triple into an RDFLib path.
++
++    A valid SHACL path is an IRI that is not ``rdf:nil``, or a blank node
++    describing a sequence (an RDF list of at least two paths), an inverse,
++    an alternative (an RDF list of at least two paths), or a ``*``, ``+``
++    or ``?`` modifier of another path. Literals are rejected with
++    ``TypeError``; every other malformed input raises
++    :class:`SHACLPathError`.
++
++    The shapes graph is only read, never modified.
++
++    :param shapes_graph: The :class:`~rdflib.graph.Graph` holding the shapes.
++    :param path_identifier: The object of a ``sh:path`` triple.
++    :return: A :class:`~rdflib.term.URIRef` for a plain predicate, or a
++        :class:`~rdflib.paths.Path` for a complex path.
++    """
++    # The raw value is widened to object so that None and plain strings are
++    # rejected at runtime, not treated as wildcards by graph lookups.
++    candidate: object = path_identifier
++    if isinstance(candidate, Literal):
++        raise TypeError(f"SHACL path must not be a literal: {candidate!r}")
++    if not isinstance(candidate, Node):
++        raise SHACLPathError(f"Not a usable SHACL path node: {candidate!r}")
++    node: Node = candidate
++
++    # A plain predicate.
++    if isinstance(node, URIRef):
++        if node == RDF.nil:
++            raise SHACLPathError("rdf:nil is not a valid SHACL path")
++        return node
++
++    # A sequence path, written as an RDF list.
++    if shapes_graph.value(node, RDF.first) is not None:
++        items = list(shapes_graph.items(node))
++        if len(items) < 2:
++            raise SHACLPathError(
++                f"Sequence path needs at least two items, got {len(items)}: {node!r}"
++            )
++        return SequencePath(*[parse_shacl_path(shapes_graph, i) for i in items])
++
++    # sh:inversePath
++    inverse = shapes_graph.value(node, SH.inversePath)
++    if inverse is not None:
++        return InvPath(parse_shacl_path(shapes_graph, inverse))
++
++    # sh:alternativePath, whose value is an RDF list.
++    alternatives = shapes_graph.value(node, SH.alternativePath)
++    if alternatives is not None:
++        options = list(shapes_graph.items(alternatives))
++        if len(options) < 2:
++            raise SHACLPathError(
++                f"Alternative path needs at least two items, got {len(options)}: "
++                f"{node!r}"
++            )
++        return AlternativePath(*[parse_shacl_path(shapes_graph, o) for o in options])
++
++    # sh:zeroOrMorePath
++    zero_or_more = shapes_graph.value(node, SH.zeroOrMorePath)
++    if zero_or_more is not None:
++        return MulPath(parse_shacl_path(shapes_graph, zero_or_more), "*")
++
++    # sh:oneOrMorePath
++    one_or_more = shapes_graph.value(node, SH.oneOrMorePath)
++    if one_or_more is not None:
++        return MulPath(parse_shacl_path(shapes_graph, one_or_more), "+")
++
++    # sh:zeroOrOnePath
++    zero_or_one = shapes_graph.value(node, SH.zeroOrOnePath)
++    if zero_or_one is not None:
++        return MulPath(parse_shacl_path(shapes_graph, zero_or_one), "?")
++
++    raise SHACLPathError(f"Unrecognized SHACL path node: {node!r}")
+diff --git a/test/test_extras/test_extras_shacl.py b/test/test_extras/test_extras_shacl.py
+new file mode 100644
+index 0000000..5f8d6ad
+--- /dev/null
++++ b/test/test_extras/test_extras_shacl.py
+@@ -0,0 +1,103 @@
++from __future__ import annotations
++
++from typing import Type, Union
++
++import pytest
++
++from rdflib import Graph, Namespace, URIRef
++from rdflib.extras.shacl import SHACLPathError, parse_shacl_path
++from rdflib.namespace import SH
++from rdflib.paths import Path
++
++EX = Namespace("http://example.org/")
++
++SHAPES_TTL = """
++@prefix sh: <http://www.w3.org/ns/shacl#> .
++@prefix ex: <http://example.org/> .
++
++ex:iri sh:path ex:p .
++ex:seq sh:path ( ex:p ex:q ex:r ) .
++ex:seqNested sh:path ( ex:p [ sh:inversePath ex:q ] ) .
++ex:seqNoRest sh:path _:c1 .
++_:c1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> ex:p ;
++    <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> _:c2 .
++_:c2 <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> ex:q .
++ex:inv sh:path [ sh:inversePath ex:p ] .
++ex:alt sh:path [ sh:alternativePath ( ex:p ex:q ) ] .
++ex:altSeq sh:path [ sh:alternativePath ( ( ex:p ex:q ) ex:r ) ] .
++ex:star sh:path [ sh:zeroOrMorePath ex:p ] .
++ex:plus sh:path [ sh:oneOrMorePath ex:p ] .
++ex:opt sh:path [ sh:zeroOrOnePath ex:p ] .
++ex:starInv sh:path [ sh:zeroOrMorePath [ sh:inversePath ex:p ] ] .
++ex:nil sh:path () .
++ex:oneSeq sh:path ( ex:p ) .
++ex:nilInSeq sh:path ( ex:p () ) .
++ex:emptyAlt sh:path [ sh:alternativePath () ] .
++ex:oneAlt sh:path [ sh:alternativePath ( ex:p ) ] .
++ex:unknown sh:path [ ex:foo ex:bar ] .
++ex:literal sh:path "p" .
++"""
++
++
++@pytest.fixture(scope="module")
++def shapes_graph() -> Graph:
++    graph = Graph()
++    graph.parse(data=SHAPES_TTL, format="turtle")
++    return graph
++
++
++@pytest.mark.parametrize(
++    ("shape", "expected"),
++    [
++        ("iri", EX.p),
++        ("seq", EX.p / EX.q / EX.r),
++        ("seqNested", EX.p / ~EX.q),
++        ("seqNoRest", EX.p / EX.q),
++        ("inv", ~EX.p),
++        ("alt", EX.p | EX.q),
++        ("altSeq", (EX.p / EX.q) | EX.r),
++        ("star", EX.p * "*"),  # type: ignore[operator]
++        ("plus", EX.p * "+"),  # type: ignore[operator]
++        ("opt", EX.p * "?"),  # type: ignore[operator]
++        ("starInv", ~EX.p * "*"),
++        ("nil", SHACLPathError),
++        ("oneSeq", SHACLPathError),
++        ("nilInSeq", SHACLPathError),
++        ("emptyAlt", SHACLPathError),
++        ("oneAlt", SHACLPathError),
++        ("unknown", SHACLPathError),
++        ("literal", TypeError),
++    ],
++)
++def test_parse_shacl_path(
++    shapes_graph: Graph,
++    shape: str,
++    expected: Union[URIRef, Path, Type[Exception]],
++) -> None:
++    path_node = shapes_graph.value(EX[shape], SH.path)
++    if isinstance(expected, type):
++        with pytest.raises(expected):
++            parse_shacl_path(shapes_graph, path_node)  # type: ignore[arg-type]
++    else:
++        result = parse_shacl_path(shapes_graph, path_node)  # type: ignore[arg-type]
++        assert result == expected
++
++
++@pytest.mark.parametrize("bad", [None, "http://example.org/p"])
++def test_non_node_inputs_are_rejected(
++    shapes_graph: Graph,
++    bad: Union[None, str],
++) -> None:
++    with pytest.raises(SHACLPathError):
++        parse_shacl_path(shapes_graph, bad)  # type: ignore[arg-type]
++
++
++def test_parsing_leaves_graph_unchanged(shapes_graph: Graph) -> None:
++    before = set(shapes_graph)
++    for shape in ("nil", "nilInSeq", "emptyAlt", "literal", "seq", "starInv"):
++        path_node = shapes_graph.value(EX[shape], SH.path)
++        try:
++            parse_shacl_path(shapes_graph, path_node)  # type: ignore[arg-type]
++        except (SHACLPathError, TypeError):
++            pass
++    assert set(shapes_graph) == before

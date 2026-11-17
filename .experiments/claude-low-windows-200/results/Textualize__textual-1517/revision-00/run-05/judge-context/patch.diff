@@ -1,0 +1,137 @@
+diff --git a/src/textual/app.py b/src/textual/app.py
+index b207bbd..0769580 100644
+--- a/src/textual/app.py
++++ b/src/textual/app.py
+@@ -355,6 +355,7 @@ class App(Generic[ReturnType], DOMNode):
+ 
+         self._return_value: ReturnType | None = None
+         self._exit = False
++        self._loop: asyncio.AbstractEventLoop | None = None
+ 
+         self.css_monitor = (
+             FileMonitor(self.css_path, self._on_css_change)
+@@ -1327,6 +1328,7 @@ class App(Generic[ReturnType], DOMNode):
+         headless: bool = False,
+         terminal_size: tuple[int, int] | None = None,
+     ) -> None:
++        self._loop = asyncio.get_running_loop()
+         self._set_active()
+ 
+         if self.devtools is not None:
+@@ -1724,6 +1726,47 @@ class App(Generic[ReturnType], DOMNode):
+         """
+         return self.screen.get_widget_at(x, y)
+ 
++    def call_from_thread(
++        self, callback: Callable[..., Any], *args: Any, **kwargs: Any
++    ) -> Any:
++        """Run a callback in the app's event loop from another thread, and wait for the result.
++
++        This method blocks the calling thread until the callback has returned.
++        It must not be called from the thread running the app, as that would deadlock.
++
++        Args:
++            callback (Callable[..., Any]): A callable. May be a coroutine function, in which
++                case it is awaited in the app's loop.
++            *args: Positional arguments passed to the callback.
++            **kwargs: Keyword arguments passed to the callback.
++
++        Raises:
++            RuntimeError: If the app is not running, or if called from the app's own thread.
++
++        Returns:
++            Any: The return value of the callback.
++        """
++        loop = self._loop
++        if loop is None or not self._running:
++            raise RuntimeError("App is not running")
++        try:
++            running_loop = asyncio.get_running_loop()
++        except RuntimeError:
++            running_loop = None
++        if running_loop is loop:
++            raise RuntimeError(
++                "call_from_thread must not be called from the app's thread (would deadlock)"
++            )
++
++        async def run_callback() -> Any:
++            result = callback(*args, **kwargs)
++            if inspect.isawaitable(result):
++                result = await result
++            return result
++
++        future = asyncio.run_coroutine_threadsafe(run_callback(), loop)
++        return future.result()
++
+     def bell(self) -> None:
+         """Play the console 'bell'."""
+         if not self.is_headless:
+diff --git a/tests/test_call_from_thread.py b/tests/test_call_from_thread.py
+new file mode 100644
+index 0000000..bcfda66
+--- /dev/null
++++ b/tests/test_call_from_thread.py
+@@ -0,0 +1,63 @@
++import threading
++
++import pytest
++
++from textual.app import App
++
++
++class ThreadApp(App[None]):
++    pass
++
++
++async def test_call_from_thread_returns_value() -> None:
++    """call_from_thread should run the callback in the app's loop and return its result."""
++    app = ThreadApp()
++    results: list[object] = []
++
++    def worker() -> None:
++        results.append(app.call_from_thread(lambda a, b: a + b, 2, b=3))
++
++    async with app.run_test() as pilot:
++        thread = threading.Thread(target=worker)
++        thread.start()
++        while thread.is_alive():
++            await pilot.pause(0.01)
++        thread.join()
++
++    assert results == [5]
++
++
++async def test_call_from_thread_runs_in_app_thread() -> None:
++    """The callback should execute on the app's thread, not the worker thread."""
++    app = ThreadApp()
++    callback_thread: list[int] = []
++
++    def record() -> None:
++        callback_thread.append(threading.get_ident())
++
++    def worker() -> None:
++        app.call_from_thread(record)
++
++    async with app.run_test() as pilot:
++        thread = threading.Thread(target=worker)
++        thread.start()
++        while thread.is_alive():
++            await pilot.pause(0.01)
++        thread.join()
++
++    assert callback_thread == [threading.get_ident()]
++
++
++async def test_call_from_app_thread_raises() -> None:
++    """Calling call_from_thread from the app's own thread would deadlock, so it must raise."""
++    app = ThreadApp()
++    async with app.run_test():
++        with pytest.raises(RuntimeError):
++            app.call_from_thread(lambda: None)
++
++
++def test_call_from_thread_when_not_running() -> None:
++    """Calling call_from_thread before the app runs should raise RuntimeError."""
++    app = ThreadApp()
++    with pytest.raises(RuntimeError):
++        app.call_from_thread(lambda: None)

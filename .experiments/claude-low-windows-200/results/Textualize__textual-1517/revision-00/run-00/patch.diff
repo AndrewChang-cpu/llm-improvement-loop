@@ -1,0 +1,122 @@
+diff --git a/src/textual/app.py b/src/textual/app.py
+index b207bbd..3774541 100644
+--- a/src/textual/app.py
++++ b/src/textual/app.py
+@@ -268,6 +268,9 @@ class App(Generic[ReturnType], DOMNode):
+         if no_color is not None:
+             self._filter = Monochrome()
+ 
++        self._thread_id: int = 0
++        self._loop: asyncio.AbstractEventLoop | None = None
++
+         self._writer_thread: _WriterThread | None = None
+         if sys.__stdout__ is None:
+             file = _NullFile()
+@@ -422,6 +425,37 @@ class App(Generic[ReturnType], DOMNode):
+         """list[Screen]: A *copy* of the screen stack."""
+         return self._screen_stack.copy()
+ 
++    def call_from_thread(self, callback: Callable, *args, **kwargs) -> Any:
++        """Run a callback in the app's event loop from another thread, blocking
++        until the callback has returned. Positional and keyword arguments are
++        passed to the callable. If the callback is a coroutine function (or
++        returns an awaitable), it is awaited.
++
++        Must not be called from the app's own thread, since that would deadlock.
++
++        Args:
++            callback (Callable): A callable to run in the app's loop.
++
++        Raises:
++            RuntimeError: If called from the same thread as the app.
++
++        Returns:
++            Any: The return value of the callback.
++        """
++        if self._loop is None or self._thread_id == threading.get_ident():
++            raise RuntimeError(
++                "The `call_from_thread` method must be called from a different thread than the app"
++            )
++
++        async def run_callback() -> Any:
++            result = callback(*args, **kwargs)
++            if inspect.isawaitable(result):
++                result = await result
++            return result
++
++        future = asyncio.run_coroutine_threadsafe(run_callback(), self._loop)
++        return future.result()
++
+     def exit(
+         self, result: ReturnType | None = None, message: RenderableType | None = None
+     ) -> None:
+@@ -1328,6 +1362,8 @@ class App(Generic[ReturnType], DOMNode):
+         terminal_size: tuple[int, int] | None = None,
+     ) -> None:
+         self._set_active()
++        self._thread_id = threading.get_ident()
++        self._loop = asyncio.get_running_loop()
+ 
+         if self.devtools is not None:
+             from .devtools.client import DevtoolsConnectionError
+diff --git a/tests/test_call_from_thread.py b/tests/test_call_from_thread.py
+new file mode 100644
+index 0000000..f26d2bf
+--- /dev/null
++++ b/tests/test_call_from_thread.py
+@@ -0,0 +1,55 @@
++import threading
++
++from textual.app import App
++
++
++def test_call_from_thread_returns_result():
++    results = {}
++
++    class ThreadedApp(App[None]):
++        def on_mount(self) -> None:
++            def worker() -> None:
++                results["value"] = self.call_from_thread(lambda a, b: a + b, 2, b=3)
++                results["thread_ident"] = threading.get_ident()
++                self.call_from_thread(self.exit)
++
++            threading.Thread(target=worker).start()
++
++    app = ThreadedApp()
++    app.run(headless=True)
++    assert results["value"] == 5
++    assert results["thread_ident"] != threading.get_ident()
++
++
++def test_call_from_thread_runs_in_app_thread():
++    results = {}
++
++    class ThreadedApp(App[None]):
++        def on_mount(self) -> None:
++            results["app_thread"] = threading.get_ident()
++
++            def worker() -> None:
++                results["callback_thread"] = self.call_from_thread(threading.get_ident)
++                self.call_from_thread(self.exit)
++
++            threading.Thread(target=worker).start()
++
++    app = ThreadedApp()
++    app.run(headless=True)
++    assert results["callback_thread"] == results["app_thread"]
++
++
++def test_call_from_thread_raises_in_app_thread():
++    errors = []
++
++    class ThreadedApp(App[None]):
++        def on_mount(self) -> None:
++            try:
++                self.call_from_thread(lambda: None)
++            except RuntimeError as error:
++                errors.append(error)
++            self.exit()
++
++    app = ThreadedApp()
++    app.run(headless=True)
++    assert len(errors) == 1

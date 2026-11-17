@@ -1,0 +1,180 @@
+diff --git a/astropy/units/quantity.py b/astropy/units/quantity.py
+index 7043156..d5bb6d8 100644
+--- a/astropy/units/quantity.py
++++ b/astropy/units/quantity.py
+@@ -29,7 +29,7 @@ from .format.latex import Latex
+ from .quantity_helper import can_have_arbitrary_unit, check_output, converters_and_unit
+ from .quantity_helper.function_helpers import (
+     DISPATCHED_FUNCTIONS, FUNCTION_HELPERS, SUBCLASS_SAFE_FUNCTIONS, UNSUPPORTED_FUNCTIONS)
+-from .structured import StructuredUnit
++from .structured import StructuredUnit, _structured_unit_like_dtype
+ from .utils import is_effectively_unity
+ 
+ __all__ = ["Quantity", "SpecificTypeQuantity",
+@@ -435,6 +435,8 @@ class Quantity(np.ndarray):
+         # Maybe str, or list/tuple of Quantity? If so, this may set value_unit.
+         # To ensure array remains fast, we short-circuit it.
+         value_unit = None
++        # Set when the class default unit is used for input without a unit.
++        use_default_unit = False
+         if not isinstance(value, np.ndarray):
+             if isinstance(value, str):
+                 # The first part of the regex string matches any integer/float;
+@@ -489,6 +491,7 @@ class Quantity(np.ndarray):
+                 # Default to dimensionless for no (initialized) unit attribute.
+                 if unit is None:
+                     unit = cls._default_unit
++                    use_default_unit = True
+                 value_unit = unit  # signal below that no conversion is needed
+             else:
+                 try:
+@@ -507,6 +510,11 @@ class Quantity(np.ndarray):
+         value = np.array(value, dtype=dtype, copy=copy, order=order,
+                          subok=True, ndmin=ndmin)
+ 
++        # For structured data with no unit given, use a default structured
++        # unit that mirrors the dtype of the converted array.
++        if use_default_unit and value.dtype.names:
++            unit = value_unit = _structured_unit_like_dtype(unit, value.dtype)
++
+         # check that array contains numbers or long int objects
+         if (value.dtype.kind in 'OSU' and
+             not (value.dtype.kind == 'O' and
+diff --git a/astropy/units/structured.py b/astropy/units/structured.py
+index ead091e..0a67cbb 100644
+--- a/astropy/units/structured.py
++++ b/astropy/units/structured.py
+@@ -57,6 +57,34 @@ def _normalize_names(names):
+     return tuple(result)
+ 
+ 
++def _structured_unit_like_dtype(unit, dtype):
++    """Build a structured unit with the structure of a record dtype.
++
++    Parameters
++    ----------
++    unit : unit-like or `~astropy.units.StructuredUnit`
++        The unit placed at every non-record (leaf) field of ``dtype``.
++        If it is already a `~astropy.units.StructuredUnit`, it is returned
++        unchanged; the caller guarantees that it matches ``dtype``.
++    dtype : `~numpy.dtype`
++        A record dtype, i.e., a dtype with named fields. Fields that are
++        themselves record dtypes are handled recursively.
++
++    Returns
++    -------
++    `~astropy.units.StructuredUnit`
++        A structured unit with the same field names and nesting as ``dtype``.
++    """
++    if isinstance(unit, StructuredUnit):
++        return unit
++
++    units = tuple(
++        _structured_unit_like_dtype(unit, dtype.fields[name][0])
++        if dtype.fields[name][0].names else unit
++        for name in dtype.names)
++    return StructuredUnit(units, names=dtype)
++
++
+ class StructuredUnit:
+     """Container for units for a structured Quantity.
+ 
+diff --git a/astropy/units/tests/test_structured.py b/astropy/units/tests/test_structured.py
+index fe4134a..1e6780a 100644
+--- a/astropy/units/tests/test_structured.py
++++ b/astropy/units/tests/test_structured.py
+@@ -12,6 +12,7 @@ from numpy.testing import assert_array_equal
+ from astropy import units as u
+ from astropy.tests.helper import check_pickling_recovery, pickle_protocol
+ from astropy.units import Quantity, StructuredUnit, Unit, UnitBase
++from astropy.units.quantity import _structured_unit_like_dtype
+ from astropy.utils.compat import NUMPY_LT_1_21_1
+ from astropy.utils.masked import Masked
+ 
+@@ -417,6 +418,20 @@ class TestStructuredQuantity(StructuredTestBaseWithUnits):
+         assert isinstance(q_pv_t.unit, StructuredUnit)
+         assert q_pv_t.unit == self.pv_t_unit
+ 
++    def test_initialization_with_default_unit_nested(self):
++        # With no unit given, the default unit mirrors the nested dtype.
++        q_pv_t = Quantity(self.pv_t)
++        assert_array_equal(q_pv_t.value, self.pv_t)
++        assert isinstance(q_pv_t.unit, StructuredUnit)
++        expected = _structured_unit_like_dtype(u.dimensionless_unscaled,
++                                               self.pv_t_dtype)
++        assert q_pv_t.unit == expected
++        dimensionless_nested = StructuredUnit(
++            ((u.dimensionless_unscaled, u.dimensionless_unscaled),
++             u.dimensionless_unscaled),
++            names=(['pv', ('p', 'v')], 't'))
++        assert q_pv_t.unit == dimensionless_nested
++
+     def test_initialization_by_multiplication_with_unit(self):
+         q_pv_t = self.pv_t * self.pv_t_unit
+         assert q_pv_t.unit is self.pv_t_unit
+@@ -644,6 +659,11 @@ class TestStructuredSpecificTypeQuantity(StructuredTestBaseWithUnits):
+         pv2 = self.PositionVelocity(self.pv, 'AU,AU/day')
+         assert_array_equal(pv2['p'], self.pv['p'] << u.AU)
+ 
++    def test_default_unit_none_raises_for_structured_input(self):
++        # Regression guard: no default unit means no unit can be built.
++        with pytest.raises(TypeError):
++            self.PositionVelocity(self.pv)
++
+     def test_error_on_non_equivalent_unit(self):
+         with pytest.raises(u.UnitsError):
+             self.PositionVelocity(self.pv, 'AU')
+@@ -651,6 +671,44 @@ class TestStructuredSpecificTypeQuantity(StructuredTestBaseWithUnits):
+             self.PositionVelocity(self.pv, 'AU,yr')
+ 
+ 
++class TestStructuredDefaultUnit(StructuredTestBaseWithUnits):
++    def test_list_of_record_scalars_default_unit(self):
++        # A list of record scalars gives a record dtype, like the array does.
++        q = Quantity(list(self.pv_t))
++        assert_array_equal(q.value, self.pv_t)
++        expected = _structured_unit_like_dtype(u.dimensionless_unscaled,
++                                               self.pv_t_dtype)
++        assert isinstance(q.unit, StructuredUnit)
++        assert q.unit == expected
++
++    def test_list_of_plain_tuples_keeps_default_unit(self):
++        # numpy makes an unstructured array from plain tuples.
++        q = Quantity([(1., 2.), (3., 4.)])
++        assert not isinstance(q.unit, StructuredUnit)
++        assert q.unit == u.dimensionless_unscaled
++
++    def test_subclass_default_unit_used_for_leaves(self):
++        class KmQuantity(Quantity):
++            _default_unit = u.km
++
++        q = KmQuantity(self.pv_t)
++        expected = _structured_unit_like_dtype(u.km, self.pv_t_dtype)
++        assert q.unit == expected
++        assert q.unit['pv']['p'] == u.km
++        assert q.unit['t'] == u.km
++
++    def test_subclass_default_unit_none_raises(self):
++        class NoDefaultQuantity(Quantity):
++            _default_unit = None
++
++        with pytest.raises(TypeError):
++            NoDefaultQuantity(self.pv_t)
++
++    def test_explicit_unit_unchanged(self):
++        q = Quantity(self.pv_t, self.pv_t_unit)
++        assert q.unit == self.pv_t_unit
++
++
+ class TestStructuredLogUnit:
+     def setup_class(self):
+         self.mag_time_dtype = np.dtype([('mag', 'f8'), ('t', 'f8')])
+diff --git a/docs/changes/units/13676.api.rst b/docs/changes/units/13676.api.rst
+new file mode 100644
+index 0000000..3d3f522
+--- /dev/null
++++ b/docs/changes/units/13676.api.rst
+@@ -0,0 +1,3 @@
++Constructing a ``Quantity`` from a structured array with ``unit=None`` now gives
++a default unit that is a ``StructuredUnit`` structured like the input data,
++with the class default unit at every field.

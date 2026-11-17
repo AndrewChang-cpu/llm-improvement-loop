@@ -1,0 +1,1446 @@
+{
+  "current_specification": "## Goals\n- Make file writing and image plotting usable without an ignite engine: an engine-free CSV saver and NIfTI saver in the data package, and an engine-free 2D/3D plot function in the visualization package.\n- Keep the three ignite-facing components (segmentation saver handler, classification saver handler, TensorBoard image handler) as thin adapters that read engine state through transforms and delegate in one call.\n- Support single-item and batch saving, optional metadata-driven naming, and the constructor options below.\n- Keep the reference file outputs, including the NIfTI dtype rule.\n\n## Scope\nIn scope:\n- New modules monai/data/csv_saver.py and monai/data/nifti_saver.py, and a new plot function in monai/visualize/img2tensorboard.py.\n- Changes to monai/handlers/segmentation_saver.py, monai/handlers/classification_saver.py, and monai/handlers/tensorboard_handlers.py.\n- Changing the NIfTI writer default dtype in monai/data/nifti_writer.py from the string form to the numpy float32 type. The value is identical.\n- Updating in-repo callers of the renamed parameter: examples/segmentation_3d/unet_evaluation_array.py, examples/segmentation_3d/unet_evaluation_dict.py, and tests/integration_sliding_window.py.\n- The tests listed under Test requirements.\nOut of scope: transforms, other handlers, ignite attach mechanics beyond this section, new dependencies, and new modules beyond the two data modules.\n\n## Terminology\n- Item: one entry along the first (batch) dimension, channel-first.\n- Batch: data whose first dimension indexes items. Batch operations iterate over it.\n- Meta data mapping: keys filename_or_obj, affine, and original_affine. In batch calls each value is a per-item sequence, indexed in parallel with the batch.\n- Absent meta data: none or an empty mapping. Naming falls back to the item index, and no affine or original affine is used.\n- Item index: a counter starting at zero, kept by each saver. It increments on every single-item save, including each item within a batch. It names items only when meta data is absent.\n- Ignite-free: the module imports neither ignite nor the handlers package and takes no engine object.\n- Data root: optional root for relative folders. This feature never supplies one, so it is empty.\n\n## Workflows\n1. Classification (CSV) through the handler: each completed iteration, the handler gets meta data from its batch transform and model output from its output transform, and calls the CSV saver's batch save once. On the completion event, it calls finalize, which writes the file.\n2. Segmentation (NIfTI) through the handler: each completed iteration, the handler gets meta data and output the same way, calls the NIfTI saver's batch save once, then logs one info message.\n3. Standalone use: a caller constructs a saver directly and calls save or save_batch. The NIfTI saver writes each item immediately. The CSV saver writes its file only when finalize is called.\n4. TensorBoard image handler: on each call, compute the step from the global iteration transform. For three sources in this order, skip a source that is None; otherwise convert a tensor to numpy, require an array, and plot with the handler's index, max channels, and max frames:\n   - the first element of the batch transform output, tag 'input_0';\n   - the second element of the batch transform output, tag 'input_1';\n   - the output transform result, tag 'output'.\n   Flush the writer at the end.\n5. Plot function:\n   - Assert that the writer is a SummaryWriter. Select the item at the index and convert a tensor to numpy.\n   - Two dimensions: rescale values to 0 to 1 and write one image with suffix 'HW'.\n   - Three dimensions: if the first dimension is 3 and max channels is 3, write one RGB image with suffix 'CHW'. Otherwise, if max channels is at least 1, write exactly one image, channel 0 rescaled to 0 to 1, with suffix 'HW_0'. If max channels is 0, write nothing.\n   - Four or more dimensions: flatten the leading dimensions into a list of 3D volumes. For each of the first max-channels volumes, rescale to 0 to 255 and write one animated GIF with suffix 'HWD_j', where j is the volume index, using max frames as the frame count, a scale of 1.0, and the given step.\n   - Any other dimensionality: write nothing and raise no error.\n\n## Data model\nCSV cache:\n- An insertion-ordered mapping from a string key to a float32 array of values. The key is the filename_or_obj value when meta data is present, otherwise the string form of the item index.\n- Saving with an existing key replaces its values and keeps its position.\n- Finalize writes one line per key, in insertion order: the key, then a comma and each flattened value's text, then a newline. There is no header row.\n- With overwrite false and an existing file, finalize first reads each row: the first column is the key, and the rest parse as float32. File values replace in-memory values with the same key. Keys already in memory keep their positions; keys found only in the file are appended after all in-memory keys, in file order. Example: memory holds A and B, the file holds A and C; the written order is A, B, C, and A's value is the file's value.\n- Finalize creates the output directory if missing.\n\nNIfTI output layout and dtype:\n- For each input filename, remove the directory part and repeatedly strip extensions to get a base name. The output path is the output directory, then the base name as a folder, then the base name joined with an underscore and the postfix, then the extension. The input's directory part is not preserved.\n- Without meta data, the item index string is the base name.\n- Before writing, move each item's channel axis to the last position. Write with the affine and original affine from meta data, each optional.\n- The written dtype is the saver's dtype when set, otherwise the data's own dtype. The default is none for the NIfTI saver and the segmentation handler.\n\n## API contracts\nParameters are listed in order, with defaults in parentheses.\n\nCSV saver (CSVSaver, monai/data/csv_saver.py):\n- Constructor: output directory (current directory), filename ('predictions.csv'), overwrite (true). The filename must be a string ending in '.csv'. The file path is the output directory joined with the filename.\n- save: data; meta_data (optional, default none). With present meta data, the key comes from filename_or_obj. Otherwise the key is the string form of the item index. A tensor is detached, moved to CPU, and converted to numpy. Values are stored as float32. The item index advances by one.\n- save_batch: batch_data; meta_data (optional, default none). For each item along the first dimension, it calls save with that item, passing its per-item mapping or none when meta data is absent. The batch must be passable by keyword batch_data as well as by position.\n- finalize: no required argument. Writes the file as described under Data model. No engine parameter.\n\nNIfTI saver (NiftiSaver, monai/data/nifti_saver.py):\n- Constructor: output directory (current directory), output postfix ('seg'), output extension ('.nii.gz'), dtype (none, meaning keep the data's dtype).\n- save: data; meta_data (optional, default none), with the naming, affine, and dtype rules above. Writes through the existing NIfTI writer in monai/data/nifti_writer.py.\n- save_batch: batch_data; meta_data (optional, default none), with the same per-item rules as the CSV saver. The batch must be passable by keyword batch_data as well as by position.\n- The file-name helper is a private static method with parameters postfix, input filename, output folder, and an optional data root (default empty).\n\nPlot function (plot_2d_or_3d_image, monai/visualize/img2tensorboard.py):\n- Parameters in order: data (tensor or array in NCHW[D] layout; one item is plotted), step, writer, index (0), max channels (1), max frames (64), tag ('output').\n- Accepts a tensor or numpy array. Returns nothing.\n\nClassificationSaver completion hook:\n- On the engine's completion event, the handler registers a callable that accepts and ignores the engine argument, then calls the CSV saver's finalize with no arguments.\n\nTensorBoard image handler (TensorBoardImageHandler, monai/handlers/tensorboard_handlers.py):\n- Constructor: summary writer (optional; a new writer is created if none), batch transform, output transform, global iteration transform, index (0), max channels (1), max frames (64). The index parameter is new and sits before max channels.\n- Per-call behavior is as in Workflows. Callable with the engine; plotting is delegated to the plot function.\n\nSegmentation saver handler (SegmentationSaver, monai/handlers/segmentation_saver.py):\n- Constructor: output directory (current directory), output postfix ('seg'), output extension ('.nii.gz'), dtype (none), batch transform (identity), output transform (identity), name (optional). Output directory replaces the former output path parameter.\n- attach: sets the logger if none is set, from name or the engine's logger. Registers the per-iteration hook if not already registered.\n- Call: gets meta data and output, calls the NIfTI saver's batch save once, then logs. It holds one NIfTI saver built from output directory, postfix, extension, and dtype.\n\nClassification saver handler (ClassificationSaver, monai/handlers/classification_saver.py):\n- Constructor: output directory (current directory), filename ('predictions.csv'), overwrite (true), batch transform, output transform, name. The filename parameter is new and sits before overwrite.\n- attach: sets the logger as above, registers the per-iteration hook, and registers the completion hook. Attach must complete without error on the pinned ignite version.\n- Call: gets meta data and output, and calls the CSV saver's batch save once.\n\n## Module architecture\n- monai/data/csv_saver.py and monai/data/nifti_saver.py (new): standard-library csv and os, numpy, torch, and the NIfTI writer in monai/data as needed. No ignite.\n- monai/visualize/img2tensorboard.py: the plot function sits beside the existing animated-GIF helpers and uses the rescale helper in monai/transforms/utils.\n- Segmentation and classification handler modules keep their ignite imports, hold a saver instance, and delegate. They contain no file-writing loops and no file-name construction.\n- monai/handlers/tensorboard_handlers.py imports the plot function and calls it directly.\n- Batch iteration belongs to the savers. Handlers make one delegating call. Handlers depend on data and visualize; data and visualize never import handlers or ignite.\n\n## Implementation constraints\n- Savers and the plot function take no engine object. Their inputs are plain data, paths, and a SummaryWriter.\n- The pinned ignite version (pytorch-ignite 0.3.0) checks each handler's signature at registration, and a completion handler without an engine argument makes attach fail. The classification handler therefore registers an engine-accepting wrapper around finalize; finalize itself keeps taking no engine argument.\n- Convert tensors to numpy (detach, move to CPU) before any numpy operation, including inside the plot function. The rescale helper requires numpy input.\n- Write NIfTI files only through the existing NIfTI writer. The plot function must not construct its own SummaryWriter.\n- Leave the existing animated-GIF helpers unchanged. Add no new dependencies or requirements or setup-file changes. Ignite may be imported only inside handler modules.\n\n## Naming\n- output_dir is the output directory parameter in the CSV saver, NIfTI saver, and both handlers. output_path is not used.\n- CSV parameter: filename. NIfTI parameters: output postfix, output extension, dtype.\n- Saver method parameters: data for save, batch_data for save_batch, meta_data for the optional mapping in both.\n- TensorBoard tags: input_0, input_1, output. Plot suffixes: HW, CHW, HW_0, HWD_j.\n- Test files: tests/test_csv_saver.py, tests/test_nifti_saver.py, tests/test_handler_segmentation_saver.py, tests/test_handler_classification_saver.py (updated), tests/test_plot_2d_or_3d_image.py. Test method names follow the descriptive test_ form of existing repository tests.\n\n## Validation\n- CSV filename: a string ending in '.csv', checked by assertion.\n- Plot function: the writer must be a SummaryWriter, checked by assertion.\n- TensorBoard handler: after tensor conversion, each non-None input, label, and output must be an array; otherwise raise ValueError with the original handler's wording for each of the three messages.\n\n## Error handling\n- A missing filename_or_obj key in meta data propagates as KeyError. Do not wrap it or convert it to ValueError.\n- Absent meta data falls back to the item index without raising.\n- Plot with unsupported dimensionality: write nothing and raise nothing.\n\n## Logging\n- The segmentation handler logs one info message after each batch save, with the text 'saved all the model outputs as nifti files.'.\n- The handler logger is a plain assignable attribute, set in attach to the engine's logger when none is set, or from the name argument.\n- The savers and the classification handler do not log.\n\n## Documentation\n- Use Google-style docstrings with Args blocks, following the repository convention.\n- The segmentation handler's call docstring keeps the sentence that the output file datatype is determined from the engine output dtype.\n- Saver docstrings describe the meta data keys and the item-index fallback. The CSV saver's overwrite docstring states that when overwrite is false, rows loaded from an existing file replace in-memory values with the same key.\n- Docstrings must not cite export paths the package does not provide. Reference classes by their module.\n\n## Maintainability\n- All new and changed files, including tests and examples, must pass the root flake8 configuration, including the E-series checks. Put a space after every comma in call arguments and list literals.\n- Each new and changed file ends with exactly one line break after its last code line, with no following blank line (the CI lint job fails on W391). Keep lines within the configured maximum length.\n\n## Compatibility\n- Intended breaking changes, per the reference:\n  - SegmentationSaver: the output path parameter is renamed to output_dir. Positional order becomes output directory, postfix, extension, dtype, transforms, name. The default dtype changes from the string float32 to none.\n  - ClassificationSaver: filename is inserted before overwrite.\n  - TensorBoardImageHandler: index is inserted before max channels.\n  - The handler attributes output_dir, overwrite, output_path, output_postfix, output_ext, and dtype need not be retained.\n- In-repo callers use output_dir. No output_path alias is required. The default dtype of none keeps the model output dtype, matching the original behavior. The default file layout and CSV contents are unchanged.\n\n## Behavioral acceptance criteria\n- CSV: save_batch of eight zero values named testfile0 through testfile7, then finalize, writes predictions.csv with eight rows in order, each starting with its name.\n- NIfTI: save_batch of zeros with shape eight by one by two by two, named testfile0 through testfile7, creates output/testfileN/testfileN_seg.nii.gz for each N. Input 'sub/case0.nii.gz' produces output/case0/case0_seg.nii.gz. Without meta data, or with empty meta data, items are named by index.\n- Dtype: a NIfTI saver with no dtype writes the data's own dtype; with a dtype set, it writes that dtype. The segmentation handler's default keeps an integer output as an integer.\n- Segmentation handler: attaches to an ignite engine and writes files with the layout above, using the output_dir keyword.\n- Classification handler: attaches on the pinned version without error, accepts filename, and writes predictions.csv when the engine completes.\n- CSV with overwrite false: retained file rows, file values replacing in-memory values, and the merge order under Data model.\n- Plot: torch zero tensors with shapes (1,1,10,10), (1,3,10,10), (1,4,10,10), (1,1,10,10,10), and (1,3,10,10,10) each plot without error and create the run output.\n- Plot, three-dimensional non-RGB item: exactly one image, for channel 0, with suffix HW_0. With max channels 0, no image is written.\n- TensorBoard handler: index selects which batch element is plotted.\n- Keyword calls: save_batch with batch_data and save with data succeed on both the CSV and NIfTI savers.\n\n## Test requirements\n- Each test file under Naming exists and follows repository style: unittest, parameterized for shape cases, and temporary directories removed after each test.\n- Expected paths match the layout rules under Data model. Tests check that output exists rather than pixel values for constant input.\n- Plot tests for three-dimensional single-channel input assert the tag followed by '_HW_0' (for example input_0_HW_0). A three-dimensional non-RGB test with max channels 0 asserts that no image is written.\n- The overwrite-false CSV test asserts that file values replace in-memory values for shared keys and that row order follows the merge rule.\n- The updated classification handler test passes filename. The integration sliding-window test uses output_dir.",
+  "current_words": 2572,
+  "minimum_candidate_words": 1801,
+  "maximum_candidate_words": 2314,
+  "categories": {
+    "Purpose": [
+      "Goals",
+      "Scope",
+      "Assumptions",
+      "Terminology"
+    ],
+    "Behavior": [
+      "Workflows"
+    ],
+    "Data": [
+      "Data model"
+    ],
+    "Interfaces": [
+      "API contracts"
+    ],
+    "Architecture": [
+      "Module architecture",
+      "Implementation constraints",
+      "Dependencies"
+    ],
+    "Conventions": [
+      "Naming",
+      "Validation",
+      "Error handling",
+      "Logging",
+      "Documentation"
+    ],
+    "Quality": [
+      "Performance",
+      "Security",
+      "Reliability",
+      "Usability",
+      "Maintainability"
+    ],
+    "Compatibility": [
+      "Compatibility"
+    ],
+    "Operations": [
+      "Operations"
+    ],
+    "Acceptance": [
+      "Behavioral acceptance criteria",
+      "Test requirements"
+    ]
+  },
+  "original": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Project-MONAI__MONAI-202/base",
+  "reference": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Project-MONAI__MONAI-202/reference",
+  "requirements": {
+    "patch_and_checks": "Patch applies to the original snapshot (no tests are run).",
+    "file_location": "Code is placed in the required existing module or component.",
+    "api_contract": "API names, visibility, parameters, types, and return contracts match requirements.",
+    "dependency_direction": "Imports and dependency directions respect existing boundaries.",
+    "extension_registration": "Required registration and interface implementation are present.",
+    "approved_dependencies": "No unapproved dependencies are introduced.",
+    "architectural_fit": "Responsibilities belong in the intended layer or component.",
+    "extension_point_adherence": "Existing extension mechanisms are used rather than a parallel path.",
+    "abstraction_integrity": "Domain, transport, persistence, and framework boundaries are preserved.",
+    "convention_fit": "Follow the repository conventions visible in the original and reference code for validation, errors, naming, logging, and tests.",
+    "requirement_intent": "The feature satisfies its behavioral intent and constraints."
+  },
+  "runs": [
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json:2 records \"patch_applies\": true and checks.json:3 records \"commands\": [] (no executed checks), so no test results are claimed.",
+            "The file set that differs between base and generated (diff -rq) is 16 files, matching the 16 `diff --git` entries in patch.diff: docs/source/data.rst, two examples, nifti_writer.py, classification_saver.py, segmentation_saver.py, tensorboard_handlers.py, img2tensorboard.py, integration_sliding_window.py, and the new csv_saver.py, nifti_saver.py and five new or changed test files.",
+            "By reading, the candidate's behavior matches the reference test expectations: csv_saver.py:70-72 handles 0-d tensor items per index; nifti_saver.py:108-113 writes <name>/<name>_seg.nii.gz; img2tensorboard.py:156-171 covers the 2D, 3D, and 4D+ shapes in the reference test. Nothing was executed."
+          ],
+          "deficiency": "No deficiency found."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "CSVSaver is in monai/data/csv_saver.py:19 and NiftiSaver is in monai/data/nifti_saver.py:20, the same locations the reference uses (reference.diff:27 and :121).",
+            "plot_2d_or_3d_image is defined in monai/visualize/img2tensorboard.py:135, matching the reference location (reference.diff:640).",
+            "The handler adapters stay in monai/handlers/classification_saver.py:41 and segmentation_saver.py:41-42, and tensorboard_handlers.py:214-233 calls the visualize-layer function."
+          ],
+          "deficiency": "No deficiency found."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "CSVSaver.__init__(output_dir='./', filename='predictions.csv', overwrite=True) at csv_saver.py:25, with save(data, meta_data=None) at :42, save_batch(batch_data, meta_data=None) at :61, and finalize() at :74. These match reference.diff:59, :95, :111, :75.",
+            "NiftiSaver.__init__(output_dir='./', output_postfix='seg', output_ext='.nii.gz', dtype=None) at nifti_saver.py:25, with save at :76 and save_batch at :115. These match reference.diff:152, :205, :230.",
+            "ClassificationSaver.__init__(output_dir, filename, overwrite, batch_transform, output_transform, name) at classification_saver.py:24. SegmentationSaver.__init__ at segmentation_saver.py:24 uses dtype=None in the same position as the reference (reference.diff:368). TensorBoardImageHandler adds index=0 before max_channels at tensorboard_handlers.py:178, matching reference.diff:489.",
+            "plot_2d_or_3d_image(data, step, writer, index=0, max_channels=1, max_frames=64, tag='output') at img2tensorboard.py:135 matches reference.diff:640.",
+            "Deviation: csv_saver.py:55 applies str() to the key, which accepts more input than the reference does. It is not a contract break."
+          ],
+          "deficiency": "No deficiency found."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "csv_saver.py:12-16 imports only csv, os, numpy and torch. nifti_saver.py:12-17 imports os, numpy, torch, and monai.data.nifti_writer, so the data layer has no ignite dependency.",
+            "tensorboard_handlers.py:17 imports from monai.visualize.img2tensorboard, the same edge the reference uses.",
+            "img2tensorboard.py:19 imports monai.transforms.utils, the same as reference.diff:594. No new upward dependency is introduced."
+          ],
+          "deficiency": "No deficiency found."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "classification_saver.py:52-53 registers _finalize_on_completed on Events.COMPLETED with has_event_handler checking the same bound method, so the duplicate-registration guard works.",
+            "The reference guard at reference.diff:323-324 checks self.saver.finalize but registers a new lambda, so the check never matches and the handler is registered again on every attach. The candidate does not have this defect.",
+            "classification_saver.py:50-51 and segmentation_saver.py:51-52 keep the ITERATION_COMPLETED registration intact."
+          ],
+          "deficiency": "No deficiency found."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "The source changes add no third-party imports beyond numpy, torch, ignite, and tensorboard, which the base code already uses (csv_saver.py:12-16, img2tensorboard.py:12-19).",
+            "nifti_writer.py:13 in base already imports nibabel, and nifti_saver.py only relies on write_nifti.",
+            "The new tests import parameterized and nibabel, which base tests already use (base tests/test_load_nifti.py, test_dataset.py). No new dependency is added."
+          ],
+          "deficiency": "No deficiency found."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "The data-layer savers hold the logic: csv_saver.py:61-72 and nifti_saver.py:115-126 do the per-item iteration.",
+            "The handler layer is only an ignite adapter: classification_saver.py:61-71 and segmentation_saver.py:54-68 delegate to self.saver.save_batch.",
+            "The TensorBoard handler delegates drawing to plot_2d_or_3d_image (tensorboard_handlers.py:214, 223, 232), and the duplicated _add_2_or_3_d method is removed. This matches reference.diff:540-568."
+          ],
+          "deficiency": "No deficiency found."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Event registration uses ignite's add_event_handler and has_event_handler, as the base code does (classification_saver.py:50-53, segmentation_saver.py:51-52).",
+            "Existing helpers are reused: write_nifti at nifti_saver.py:113 and add_animated_gif at img2tensorboard.py:172. No parallel writer path is created.",
+            "grep of the generated tree finds no remaining _add_2_or_3_d, output_path, _prediction_dict, or _preds_filepath references in the changed source."
+          ],
+          "deficiency": "No deficiency found."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "csv_saver.py and nifti_saver.py import no ignite or engine types, so the savers can run without ignite, which is the PR's stated goal.",
+            "plot_2d_or_3d_image takes a SummaryWriter argument (img2tensorboard.py:135, 153) and does not depend on the engine. Its assert mirrors reference.diff:656.",
+            "The handler layer keeps its ignite-specific logic (classification_saver.py:55-59 wraps finalize with the engine signature), so the framework boundary stays in the handlers."
+          ],
+          "deficiency": "No deficiency found."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Lint limit: .flake8:3 sets max-line-length = 120. No line in the changed Python files exceeds 120 characters.",
+            "Validation uses assert, as the repo does (nifti_writer.py:27 in base). csv_saver.py:34 and img2tensorboard.py:153 follow that pattern.",
+            "Docstrings use the Args: layout the repo uses. segmentation_saver.py:68 logs 'saved all the model outputs as nifti files.', identical to reference.diff:469. Removing the per-file classification log line matches the reference.",
+            "New tests reuse the base license header and unittest/parameterized style (tests/test_nifti_saver.py:1-20). Test method names differ from the reference's IDs, which is a naming choice, not a convention violation."
+          ],
+          "deficiency": "No deficiency found."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "The PR's four items are covered: CSVSaver (csv_saver.py:19), NiftiSaver (nifti_saver.py:20), plot_2d_or_3d_image (img2tensorboard.py:135), and tests for each.",
+            "Classification output rows follow insertion order with file values overriding in-memory values under overwrite=False (csv_saver.py:78-83), matching reference.diff:80-84.",
+            "Segmentation output writes <name>/<name>_seg.nii.gz with the default dtype kept (nifti_saver.py:108-113), and the TensorBoard index selects the item (img2tensorboard.py:156).",
+            "Candidate-only robustness: csv_saver.py:81-82 skips blank rows, csv_saver.py:85 guards an empty output_dir, and nifti_saver.py:103-106 converts tensor affines."
+          ],
+          "deficiency": "No deficiency found."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-202/round-02/candidate-03/run-00/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/integration_sliding_window.py",
+          "tests/test_csv_saver.py",
+          "tests/test_handler_classification_saver.py",
+          "tests/test_handler_segmentation_saver.py",
+          "tests/test_nifti_saver.py",
+          "tests/test_plot_2d_or_3d_image.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "patch.diff applies to a scratch copy of base with `patch -p1 --dry-run` (succeeded); the real apply on the scratch copy produces a tree identical to generated/ (diff -r excluding .git is empty).",
+            "judge-context/checks.json:2 records patch_applies=true; :3 commands=[] (no tests executed, as instructed).",
+            "Candidate test files tests/test_csv_saver.py, test_nifti_saver.py, test_plot_2d_or_3d_image.py, test_handler_segmentation_saver.py, plus edits to integration_sliding_window.py and test_handler_classification_saver.py, are all present in the generated tree and match the patch."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "monai/data/csv_saver.py:20 defines CSVSaver and monai/data/nifti_saver.py:20 defines NiftiSaver, the same modules as reference/monai/data/csv_saver.py and nifti_saver.py.",
+            "monai/visualize/img2tensorboard.py:135 defines plot_2d_or_3d_image, the same module as reference/monai/visualize/img2tensorboard.py:130.",
+            "Handlers delegate: monai/handlers/classification_saver.py:72 (save_batch) and monai/handlers/segmentation_saver.py:68 (save_batch); tensorboard_handlers.py:213,222,231 call plot_2d_or_3d_image."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "csv_saver.py:28 `__init__(output_dir='./', filename='predictions.csv', overwrite=True)` matches reference csv_saver.py:59; save/save_batch/finalize at csv_saver.py:45, :64, :80 match the reference names.",
+            "nifti_saver.py:28 `__init__(output_dir='./', output_postfix='seg', output_ext='.nii.gz', dtype=None)` matches reference nifti_saver.py:152.",
+            "classification_saver.py:25 inserts `filename` as the second parameter, same as reference classification_saver.py:22. segmentation_saver.py:25 uses `output_dir` and `dtype=None`, same as reference :368.",
+            "tensorboard_handlers.py:178 adds `index=0` before max_channels, same as reference :176. img2tensorboard.py:135 signature is identical to reference :130.",
+            "Removed surface (ClassificationSaver.finalize, SegmentationSaver._create_file_basename, output_path/dtype attributes) is also removed in the reference, so it is not a regression against the requirements."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "monai/data/csv_saver.py:12-17 imports only csv, os, collections, numpy, torch; no ignite import in the data layer.",
+            "monai/data/nifti_saver.py:17 imports monai.data.nifti_writer (same package, no upward edge).",
+            "monai/handlers/classification_saver.py:14,16 and segmentation_saver.py:14,16 import ignite and monai.data (handlers depend downward on data; data never imports handlers).",
+            "monai/visualize/img2tensorboard.py:19 imports monai.transforms.utils; the reference has the same edge (reference img2tensorboard.py:594).",
+            "monai/handlers/tensorboard_handlers.py:17 imports plot_2d_or_3d_image; the old `monai.transforms.utils.rescale_array` import was removed because it became unused."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "monai/handlers/classification_saver.py:51-54: the ITERATION_COMPLETED registration is kept and Events.COMPLETED is registered with self._finalize_on_completed, guarded by has_event_handler on that same bound method.",
+            "classification_saver.py:56-60: _finalize_on_completed(self, _engine) calls self.saver.finalize(), so the registered handler actually writes the CSV.",
+            "segmentation_saver.py:49-53 keeps the ITERATION_COMPLETED registration from base.",
+            "Reference classification_saver.py:50-51 registers a fresh lambda, so its has_event_handler guard can never match; the candidate's guard is the stronger form."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "requirements.txt (base) lists torch, pytorch-ignite, numpy, nibabel, tensorboard, parameterized; the patch adds no package dependency.",
+            "New monai imports (csv_saver.py:12-17, nifti_saver.py:12-17) are stdlib or already-required numpy/torch.",
+            "Tests use parameterized (already in requirements.txt, also used by base tests/test_dataset.py) and nibabel (used by base tests/test_load_nifti.py)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Framework-free savers live in monai/data: csv_saver.py:20 and nifti_saver.py:20, matching the reference's two-level split (reference csv_saver.py:51, nifti_saver.py:144).",
+            "Handler classes are reduced to ignite adapters: classification_saver.py:62-72 and segmentation_saver.py:55-69.",
+            "Plotting moved to the visualize layer: monai/visualize/img2tensorboard.py:135, called from tensorboard_handlers.py:213-231."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Handlers keep the existing ignite hook: classification_saver.py:48-54 and segmentation_saver.py:49-53 use attach and add_event_handler as in base.",
+            "TensorBoardImageHandler calls the shared plot function at tensorboard_handlers.py:213, :222, :231; the parallel `_add_2_or_3_d` path (base tensorboard_handlers.py:231 and its loop at :246) is gone, and grep finds no remaining reference in generated/.",
+            "The per-item loops in both handlers were replaced by the savers' save_batch (classification_saver.py:72, segmentation_saver.py:68), so there is no second write path."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Torch-to-numpy conversion sits in the data layer: csv_saver.py:59-60 and nifti_saver.py:102-107, not in the handlers.",
+            "Ignite and logging are imported only by the handlers (classification_saver.py:12-14, segmentation_saver.py:12-14); csv_saver.py:12-17 and nifti_saver.py:12-17 do not import ignite.",
+            "The TensorBoard writer type check stays inside the visualize function (img2tensorboard.py:153), and the handler keeps only its own ValueError checks."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Google-style Args docstrings follow repo convention (csv_saver.py:28-36, nifti_saver.py:20-35, img2tensorboard.py:136-152).",
+            "Input validation uses assert with a message, as in the reference (csv_saver.py:37; reference csv_saver.py:38).",
+            "Lint limits from base .flake8 (max-line-length=120) are met: an awk scan of added lines in patch.diff found 0 lines over 120 characters and 0 trailing-whitespace lines.",
+            "Tests follow the repo's unittest + parameterized pattern (test_handler_tb_image.py:20,36).",
+            "Non-blocking: test_plot_2d_or_3d_image.py:52 has a tautological glob assertion; the base test_handler_tb_image.py:55 uses the same pattern, so it is consistent with the repo."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "TensorBoard: img2tensorboard.py:158 (2D), :162-168 (3D RGB and single-channel HW_0), :170-174 (4D+ animated GIF), with index honored via `d = data[index]` at :154.",
+            "NIfTI: nifti_saver.py:79-114 writes per item to <output_dir>/<name>/<name>_<postfix><ext> via _create_file_basename (:109); dtype=None keeps the data dtype (:113); meta_data key 'filename_or_obj' drives the name (:56 area).",
+            "CSV: csv_saver.py:64-78 caches per item keyed by filename_or_obj; finalize at :80-92 writes rows and creates output_dir; overwrite=False merge at :83-89 preserves position for existing keys.",
+            "ClassificationSaver and SegmentationSaver route through the new savers (classification_saver.py:72, segmentation_saver.py:68-69), matching reference behavior.",
+            "Unit tests cover each new piece (test_csv_saver.py, test_nifti_saver.py, test_handler_segmentation_saver.py, test_plot_2d_or_3d_image.py).",
+            "Non-blocking edge deviations outside the stated requirements: img2tensorboard.py:166 uses `max_channels >= 1` where the reference slices `d[:max_channels]` (reference :162), so a negative max_channels differs; img2tensorboard.py:167 `d[0]` raises IndexError on a zero-length channel dimension, where base tensorboard_handlers.py:246 wrote nothing."
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-202/round-02/candidate-03/run-01/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/integration_sliding_window.py",
+          "tests/test_csv_saver.py",
+          "tests/test_handler_classification_saver.py",
+          "tests/test_handler_segmentation_saver.py",
+          "tests/test_nifti_saver.py",
+          "tests/test_plot_2d_or_3d_image.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json:2 records \"patch_applies\": true",
+            "judge-context/checks.json:3 records \"commands\": [] (no tests executed; judged by reading)",
+            "diff -rq of base vs generated lists exactly the file set in patch.diff (examples x2, nifti_writer, classification_saver, segmentation_saver, tensorboard_handlers, img2tensorboard, integration_sliding_window, and 5 new/modified tests); no stray artifacts",
+            "Changed modules' imports are used: generated/monai/handlers/tensorboard_handlers.py:12-18 (np at :228, warnings at :136, torch at :226, SummaryWriter at :195); classification_saver.py:12-16 (logging at :45)"
+          ],
+          "deficiency": "None blocking. Candidate tests were not executed, so their pass status is unverified."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/monai/data/csv_saver.py:19 class CSVSaver, in monai/data as in reference.diff:27-28",
+            "generated/monai/data/nifti_saver.py:20 class NiftiSaver, in monai/data as in reference.diff:121-122",
+            "generated/monai/visualize/img2tensorboard.py:135 plot_2d_or_3d_image, same module as reference.diff:640",
+            "generated/monai/handlers/classification_saver.py:41 and segmentation_saver.py:40-41 delegate to the data-layer savers"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated/monai/data/csv_saver.py:25 __init__(output_dir='./', filename='predictions.csv', overwrite=True); save at :41, save_batch at :63, finalize at :76",
+            "generated/monai/data/nifti_saver.py:25 __init__(output_dir='./', output_postfix='seg', output_ext='.nii.gz', dtype=None); save at :75, save_batch at :108",
+            "generated/monai/handlers/classification_saver.py:24 filename inserted before overwrite, same position as reference.diff:275",
+            "generated/monai/handlers/segmentation_saver.py:24 output_dir and dtype=None, same as reference.diff:368",
+            "generated/monai/handlers/tensorboard_handlers.py:178 index=0 before max_channels; used at :232-233 via _plot",
+            "generated/monai/visualize/img2tensorboard.py:135 plot_2d_or_3d_image(data, step, writer, index=0, max_channels=1, max_frames=64, tag='output') matches reference.diff:640"
+          ],
+          "deficiency": "None. Removal of the public ClassificationSaver.finalize and of the SegmentationSaver output_path/dtype attributes is also done by the reference, so it is accepted."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/monai/data/csv_saver.py:12-16 imports are stdlib, numpy, torch only",
+            "generated/monai/data/nifti_saver.py:17 imports monai.data.nifti_writer (same package)",
+            "generated/monai/visualize/img2tensorboard.py:19 imports monai.transforms.utils, same as reference.diff:594",
+            "handlers import only monai.data / monai.visualize and ignite"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated/monai/handlers/classification_saver.py:52-53 registers self._finalize_on_completed on Events.COMPLETED, and the has_event_handler guard at :52 checks the same bound method, so the duplicate guard works",
+            "reference.diff:323-324 instead registers a fresh lambda while guarding on self.saver.finalize, so its guard never matches; the candidate is stronger here",
+            "generated/monai/handlers/segmentation_saver.py:50-51 registration unchanged from base"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No new runtime packages in any source file; monai/data/csv_saver.py and nifti_saver.py use only numpy, torch, and stdlib",
+            "tests/test_nifti_saver.py:20 and tests/test_plot_2d_or_3d_image.py:19 use parameterized, which base tests already use (e.g. base/tests/test_dataset.py)",
+            "nibabel is an existing dependency (base/monai/data/nifti_writer.py:13)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Write/aggregate logic lives in monai/data: generated/monai/data/csv_saver.py:59-96 and nifti_saver.py:96-119",
+            "Handlers are thin event adapters: generated/monai/handlers/classification_saver.py:59-69, segmentation_saver.py:53-67",
+            "Plot logic moved to generated/monai/visualize/img2tensorboard.py:135-166; TensorBoardImageHandler delegates at tensorboard_handlers.py:223-233",
+            "Matches the reference layering (reference.diff:240-282 for the data layer, reference.diff:640-683 for plotting)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Uses ignite Events and add_event_handler/has_event_handler: generated/monai/handlers/classification_saver.py:50-53 and segmentation_saver.py:50-51, the same mechanism as base classification_saver.py:55-56",
+            "No parallel event or dispatch path is introduced"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "generated/monai/data/csv_saver.py:12-16 and nifti_saver.py:12-17 import no ignite or engine types",
+            "Engine coupling stays in the handlers: classification_saver.py:14 and segmentation_saver.py:14 import only Events",
+            "Savers take plain data and a meta-data dict"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Style matches base: single quotes, '{}'.format, Args-style docstrings, Apache header on new files",
+            "Tests follow base layout with unittest and parameterized (tests/test_nifti_saver.py:20, :38; test_plot_2d_or_3d_image.py:19, :49)",
+            "Naming nit: tests/test_nifti_saver.py:49 'test_input_directory_is_removed' actually checks subfolder naming for 'sub/case0.nii.gz'",
+            "Naming nit: tests/test_plot_2d_or_3d_image.py:57 'test_3d_single_channel_writes_hw_0' passes a 4-D tensor (1,1,10,10), so the per-item rank is 3"
+          ],
+          "deficiency": "Non-blocking test-name nits only (see evidence)."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Savers match reference semantics: csv_saver.py:59 key fallback str(self._data_index); nifti_saver.py:96 filename fallback; nifti_saver.py:101 dtype = self.dtype if not None else data.dtype (reference.diff:228)",
+            "ClassificationSaver/SegmentationSaver route through save_batch (classification_saver.py:69; segmentation_saver.py:66)",
+            "TensorBoard index selection: img2tensorboard.py:151 d = data[index]; ndim==2/3/>=4 branches match reference.diff:661-683",
+            "Regression (minor, non-blocking): img2tensorboard.py:159-160 'elif max_channels >= 1: d2 = rescale_array(d[0], 0, 1)' raises IndexError for a 3-D item with zero channels. Base tensorboard_handlers.py:246 (enumerate(d[:self.max_channels])) and reference img2tensorboard.py:162 are loop-guarded and write nothing in that case.",
+            "Negligible: negative max_channels writes nothing in the patch, whereas reference slicing d[:max_channels] writes channel 0 for multi-channel data"
+          ],
+          "deficiency": "Non-blocking edge regression for zero-channel 3-D input (IndexError at img2tensorboard.py:160) and for negative max_channels. Degenerate inputs only; core behavior matches the reference."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-202/round-02/candidate-03/run-02/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/integration_sliding_window.py",
+          "tests/test_csv_saver.py",
+          "tests/test_handler_classification_saver.py",
+          "tests/test_handler_segmentation_saver.py",
+          "tests/test_nifti_saver.py",
+          "tests/test_plot_2d_or_3d_image.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json:2 patch_applies=true; :3 commands=[] (no execution evidence exists, so behavior is judged by reading only).",
+            "Generated tree vs base (diff -rq, excluding .git/__pycache__) differs in exactly the files touched by patch.diff: docs/source/data.rst, 2 examples, monai/data/nifti_writer.py, 3 handlers, monai/visualize/img2tensorboard.py, integration_sliding_window.py, test_handler_classification_saver.py, plus new csv_saver.py, nifti_saver.py and 4 new tests. No stray files.",
+            "No base tests were deleted; only tests/test_handler_classification_saver.py and tests/integration_sliding_window.py are modified. The four reference-added test files (test_csv_saver, test_handler_segmentation_saver, test_nifti_saver, test_plot_2d_or_3d_image) are present in the candidate under the same names."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "CSVSaver in monai/data/csv_saver.py (patch.diff:46) and NiftiSaver in monai/data/nifti_saver.py (patch.diff:150), same as reference.diff:27 and :121.",
+            "plot_2d_or_3d_image is in monai/visualize/img2tensorboard.py:135, same as reference.diff:640.",
+            "Handlers delegate in place: generated/monai/handlers/classification_saver.py:43 and segmentation_saver.py:43 construct CSVSaver/NiftiSaver; tensorboard_handlers.py:234-236 delegates the plot."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "CSVSaver.__init__(output_dir='./', filename='predictions.csv', overwrite=True) at generated/monai/data/csv_saver.py:27 matches reference.diff:59; save/save_batch/finalize at csv_saver.py:43/63/78 match reference signatures.",
+            "NiftiSaver.__init__(output_dir, output_postfix, output_ext, dtype=None) at generated/monai/data/nifti_saver.py:25 matches reference.diff:152.",
+            "SegmentationSaver param order (output_dir, output_postfix, output_ext, dtype=None, batch_transform, output_transform, name) at generated/monai/handlers/segmentation_saver.py:24 matches reference.diff:368-369.",
+            "ClassificationSaver adds filename after output_dir at generated/monai/handlers/classification_saver.py:24, matching reference.diff:275.",
+            "TensorBoardImageHandler adds index=0 before max_channels at generated/monai/handlers/tensorboard_handlers.py:178, matching reference.diff:489. plot_2d_or_3d_image signature at img2tensorboard.py:135 matches reference.diff:640.",
+            "Public ClassificationSaver.finalize is removed (no def finalize in classification_saver.py), as in reference.diff:303. Base callers were checked: only the handler itself used it, so removal breaks no in-repo caller.",
+            "Non-blocking note: CSVSaver.save stringifies the key (csv_saver.py:54), where the reference uses the raw key. Identical for str filenames."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "monai/data/csv_saver.py imports only stdlib, numpy and torch (patch.diff:63-68). nifti_saver.py imports monai.data.nifti_writer (patch.diff:172), which is within monai/data, so no upward dependency.",
+            "Handlers import from monai.data (classification_saver.py:15, segmentation_saver.py NiftiSaver import) and from monai.visualize.img2tensorboard (tensorboard_handlers.py:17). Neither introduces a reverse import from data/visualize into handlers.",
+            "img2tensorboard.py:19 imports monai.transforms.utils.rescale_array, the same dependency as reference.diff:594."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "ClassificationSaver.attach keeps registration of self for ITERATION_COMPLETED (classification_saver.py:50-51) and registers _finalize_on_completed for COMPLETED (classification_saver.py:52-53).",
+            "No registry or __init__ export is required: monai/data/__init__.py, monai/handlers/__init__.py and monai/visualize/__init__.py contain only the license header.",
+            "Non-blocking note: the patch's duplicate-registration guard is correct. It checks the same bound method it registers (classification_saver.py:52-53). Reference.diff:323-324 checks self.saver.finalize but registers a new lambda, so its guard never matches and a second attach() would double-register. The patch is stronger than the reference here."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No new third-party package. requirements.txt lists torch, pytorch-ignite, numpy, nibabel, tensorboard, pillow and parameterized.",
+            "New tests import only parameterized, nibabel, ignite, torch (patch.diff:872-889 and 798-, 958-), plus stdlib unittest/tempfile/mock, all already available."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Write logic moves out of the handlers into the reusable monai/data savers: classification_saver.py:72 and segmentation_saver.py:67 each reduce to one save_batch call.",
+            "Plotting moves into visualize/img2tensorboard.py:135, where add_animated_gif already lives (img2tensorboard.py:98). TensorBoardImageHandler keeps only the event wiring (tensorboard_handlers.py:204-232).",
+            "Non-blocking note: TensorBoardImageHandler._plot (tensorboard_handlers.py:234-236) is a one-line pass-through. Reference calls plot_2d_or_3d_image directly (reference.diff:515). Harmless."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Existing helpers are reused rather than duplicated: write_nifti (nifti_saver.py:110) and add_animated_gif (img2tensorboard.py:177).",
+            "The old parallel paths are removed: TensorBoardImageHandler._add_2_or_3_d (base tensorboard_handlers.py:231) and SegmentationSaver._create_file_basename (base segmentation_saver.py:57) are deleted by patch.diff:455-490 and :592-620. The base grep found no remaining callers outside the patched files.",
+            "The ignite add_event_handler/has_event_handler pattern is kept unchanged (classification_saver.py:50-53, segmentation_saver.py:48-51)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "CSVSaver and NiftiSaver have no ignite import (patch.diff:63-68 for csv_saver.py; patch.diff:167-172 for nifti_saver.py). Event-engine concerns stay in the handler classes.",
+            "The writer type check lives in the plotting function (img2tensorboard.py:151 assert isinstance(writer, SummaryWriter)), matching the reference's check (reference.diff:656).",
+            "File writes are confined to the savers (csv_saver.py finalize at :78; nifti_saver.py save at :76), as in reference.diff:88-93."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Validation uses assert with a message, as elsewhere in the repo (csv_saver.py:35, img2tensorboard.py:151; base nifti_writer.py:27). Error style matches.",
+            "Google-style Args docstrings follow the existing handler docstrings (classification_saver.py:24-38, segmentation_saver.py:24-38).",
+            "flake8 limit is 120 (.flake8). No added line in patch.diff exceeds 120 characters and there is no trailing whitespace (verified by grep).",
+            "Non-blocking note: docs/source/data.rst:44-49 places the csv_saver automodule under the 'Nifti format handling' section, which is a placement mismatch since CSV is not NIfTI. The reference adds no docs. Minor.",
+            "Non-blocking note: tests use tempfile.TemporaryDirectory rather than the ./tempdir convention. tempfile is used by other base tests (e.g. tests/test_dataset.py), so this is acceptable."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "CSVSaver behaves as the reference: overwrite=False merge and append (csv_saver.py:78 finalize; patch.diff:135-140 vs reference.diff:80-84), keys from filename_or_obj or the item index (csv_saver.py:54-56 vs reference.diff:105), and blank-row skipping as a benign addition (patch.diff:138-139).",
+            "NiftiSaver honors the constructor dtype and keeps the data dtype when it is None (nifti_saver.py:107 vs reference.diff:228). Base SegmentationSaver ignored its dtype argument entirely, so this is the intended fix.",
+            "Feature surface is complete: ClassificationSaver filename (classification_saver.py:24,43), SegmentationSaver output_dir (segmentation_saver.py:24), TensorBoardImageHandler index selects the item (img2tensorboard.py:154 d = data[index]; tensorboard_handlers.py:178,200). Examples and the integration test are updated to output_dir (patch.diff:22-40, :690-702).",
+            "Non-blocking deviations from the reference: (a) batch_transform is called once rather than twice in TensorBoardImageHandler.__call__ (tensorboard_handlers.py:207), identical results for pure transforms; (b) rows are written in insertion order rather than sorted, which the reference also does; (c) plot converts the whole batch before indexing (img2tensorboard.py:152-154), which the base __call__ also did before plotting.",
+            "Non-blocking doc drift shared with the reference: the TensorBoardImageHandler class docstring still says the first batch element is shown, and the SegmentationSaver.__call__ docstring still says dtype comes from engine.state.output.dtype."
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-202/round-02/candidate-03/run-03/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/integration_sliding_window.py",
+          "tests/test_csv_saver.py",
+          "tests/test_handler_classification_saver.py",
+          "tests/test_handler_segmentation_saver.py",
+          "tests/test_nifti_saver.py",
+          "tests/test_plot_2d_or_3d_image.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json:2 records patch_applies=true and commands=[]; no tests were run for this experiment.",
+            "`patch -p1 --dry-run -d base -i patch.diff` (no writes) printed 'checking file' for all 15 patched files with no FAILED or reject lines.",
+            "`diff -rq base generated` changed-file set matches patch.diff: 2 examples, monai/data/csv_saver.py and nifti_saver.py (new), nifti_writer.py, classification_saver.py, segmentation_saver.py, tensorboard_handlers.py, img2tensorboard.py, integration_sliding_window.py, and the 6 test files listed in checks.json candidate_test_changes."
+          ],
+          "deficiency": "None blocking. Test behavior is judged by reading only because no tests were executed for this experiment."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/monai/data/csv_saver.py:28 defines CSVSaver and generated/monai/data/nifti_saver.py:26 defines NiftiSaver, the same modules as reference/monai/data/csv_saver.py and nifti_saver.py (reference.diff:27-31 and :121-125).",
+            "generated/monai/visualize/img2tensorboard.py:134 defines plot_2d_or_3d_image, the same module as reference/monai/visualize/img2tensorboard.py:130.",
+            "generated/monai/handlers/classification_saver.py:40 and segmentation_saver.py:39 delegate file writing to the data-layer savers; generated/monai/handlers/tensorboard_handlers.py:17 imports plot_2d_or_3d_image."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "CSVSaver.__init__(output_dir='./', filename='predictions.csv', overwrite=True) at generated/monai/data/csv_saver.py:28, matching reference.diff:59; save, save_batch and finalize at csv_saver.py:45, 63 and 78.",
+            "NiftiSaver.__init__(output_dir, output_postfix, output_ext, dtype=None) at generated/monai/data/nifti_saver.py:26, matching reference.diff:152.",
+            "SegmentationSaver.__init__(output_dir, output_postfix, output_ext, dtype=None, ...) at generated/monai/handlers/segmentation_saver.py:23, matching reference.diff:368-369.",
+            "ClassificationSaver.__init__ takes filename as its second parameter at generated/monai/handlers/classification_saver.py:23, matching reference.diff:275.",
+            "TensorBoardImageHandler gains index=0 before max_channels at generated/monai/handlers/tensorboard_handlers.py:178, matching reference.diff:489. Existing callers use keywords or defaults only (examples/segmentation_3d/unet_training_*.py, tests/test_handler_tb_image.py), so the positional shift breaks nothing.",
+            "write_nifti default is dtype=np.float32 at generated/monai/data/nifti_writer.py:16, matching reference.diff:248.",
+            "Removed public API: ClassificationSaver.finalize (base/monai/handlers/classification_saver.py:58), SegmentationSaver.output_path (base segmentation_saver.py:41) and _create_file_basename (base segmentation_saver.py:57). reference.diff removes the same, so this is part of the intended contract."
+          ],
+          "deficiency": "None against the reference. Relative to the original snapshot, removing ClassificationSaver.finalize and SegmentationSaver.output_path is an API break, but the reference makes the same break."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/monai/handlers/classification_saver.py:14 and segmentation_saver.py:14 import only from monai.data (handlers depend on data, not the reverse).",
+            "generated/monai/data/nifti_saver.py:15 imports only monai.data.nifti_writer; csv_saver.py:12-16 and nifti_saver.py:12-15 import no monai.handlers or ignite modules.",
+            "generated/monai/handlers/tensorboard_handlers.py:17 imports monai.visualize.img2tensorboard. generated/monai/visualize/img2tensorboard.py:18 imports monai.transforms.utils, the same edge the original tensorboard_handlers.py used and the reference uses."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No new packages. New code imports numpy, torch, ignite, nibabel, PIL and tensorboard, all already in requirements.txt.",
+            "Tests import parameterized (tests/test_nifti_saver.py, tests/test_plot_2d_or_3d_image.py), which is listed in requirements.txt and used by existing tests such as tests/test_rand_rotated.py."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "ClassificationSaver.attach registers the completion hook with a has_event_handler guard at generated/monai/handlers/classification_saver.py:51-52, using the private _finalize_on_completed(self, _engine) at :54-59 that ignite's Events.COMPLETED call signature requires. The reference uses an equivalent lambda (reference.diff:323-324).",
+            "SegmentationSaver.attach keeps its ITERATION_COMPLETED registration at generated/monai/handlers/segmentation_saver.py:49-50, and __call__ at :52 implements the handler interface.",
+            "ClassificationSaver.__call__ at generated/monai/handlers/classification_saver.py:61-71 remains the ITERATION_COMPLETED handler."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "File writing moved to the data layer: CSVSaver.finalize at generated/monai/data/csv_saver.py:78-96 and NiftiSaver.save at generated/monai/data/nifti_saver.py:76-110, which calls write_nifti at :110.",
+            "Handlers keep only ignite wiring and transform plumbing: classification_saver.py:69-71 and segmentation_saver.py:63-65 call self.saver.save_batch.",
+            "Plotting lives in the visualize layer at generated/monai/visualize/img2tensorboard.py:134-170, and TensorBoardImageHandler delegates to it at tensorboard_handlers.py:214, 223 and 232."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Event wiring still uses ignite's add_event_handler with has_event_handler guards (classification_saver.py:51-52; segmentation_saver.py:49-50), not a parallel mechanism.",
+            "Existing helpers are reused rather than duplicated: write_nifti (nifti_saver.py:110), rescale_array and add_animated_gif (img2tensorboard.py:134-170).",
+            "Old private helpers have no remaining callers: generated/monai/handlers/tensorboard_handlers.py contains no _add_2_or_3_d reference, and segmentation_saver.py no longer has _create_file_basename (base segmentation_saver.py:57 removed)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "CSVSaver and NiftiSaver import no ignite or handler types (generated/monai/data/csv_saver.py:12-16, nifti_saver.py:12-15). Tensor-to-numpy conversion happens at the saver boundary (csv_saver.py:~55, nifti_saver.py:97-103).",
+            "generated/monai/visualize/img2tensorboard.py:153-155 converts the whole batch to numpy before selecting index. The reference converts only the selected item (reference/monai/visualize/img2tensorboard.py:146-158). This is a copy-cost difference with the same output, not a boundary breach."
+          ],
+          "deficiency": "Minor, non-blocking: the full batch is converted before indexing (img2tensorboard.py:153-155) where the reference converts only the selected item. The output is the same."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Docstrings follow the repo's 'Args:' style (csv_saver.py:29-36; nifti_saver.py:27-35). Assert-with-message checks match the reference (csv_saver.py:37; img2tensorboard.py:152).",
+            "awk over all changed generated sources found no line longer than 120 characters, the max-line-length in base/.flake8.",
+            "Imports by reading: csv_saver.py (os, csv, OrderedDict, np, torch), nifti_saver.py (os, np, torch, write_nifti), and the handlers (logging, Events) are all used. No dead imports found.",
+            "Tests use the repo's tempfile pattern (e.g., tests/test_csv_saver.py, test_nifti_saver.py) with setUp/tearDown cleanup. The reference uses ./tempdir, but both styles appear in the repo."
+          ],
+          "deficiency": "None blocking. classification_saver.py:44 and 47-48 still set self.logger, which is no longer used. The reference keeps the same dead attribute."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Required behaviors are present: CSVSaver index keys and overwrite merge (csv_saver.py:57-59, 83-89); NiftiSaver index fallback and dtype=None meaning 'keep the data dtype' (nifti_saver.py:97, 109); SegmentationSaver passes dtype through (nifti_saver.py:109-110); ClassificationSaver filename and overwrite (classification_saver.py:40); TensorBoard index applied (img2tensorboard.py:155; tensorboard_handlers.py:178, 214, 223, 232).",
+            "Callers migrated from output_path to output_dir: examples/segmentation_3d/unet_evaluation_array.py:98, unet_evaluation_dict.py:101 and tests/integration_sliding_window.py:61. A grep of base shows no other output_path callers.",
+            "3D single-channel case matches the reference: channel 0 is written as '<tag>_HW_0' when max_channels>=1 (img2tensorboard.py:168-170), as the reference loop does (reference/monai/visualize/img2tensorboard.py:162)."
+          ],
+          "deficiency": "Non-blocking divergences. (a) Zero-channel 3D input with max_channels>=1: generated img2tensorboard.py:168-169 indexes d[0] and raises IndexError, while the reference's enumerate(d[:max_channels]) writes nothing. (b) ClassificationSaver output is no longer sorted by key (base classification_saver.py:72 used sorted(...); generated CSVSaver.finalize writes insertion order, matching the reference), a behavior change relative to the original snapshot. (c) TensorBoardImageHandler calls batch_transform once (tensorboard_handlers.py:206) where base and reference call it twice (base :205, :213). Output is unchanged for deterministic transforms."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-202/round-02/candidate-03/run-04/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/integration_sliding_window.py",
+          "tests/test_csv_saver.py",
+          "tests/test_handler_classification_saver.py",
+          "tests/test_handler_segmentation_saver.py",
+          "tests/test_nifti_saver.py",
+          "tests/test_plot_2d_or_3d_image.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies=true, commands=[] (no tests executed, as instructed).",
+            "Generated tree's changed-file set (git diff HEAD --stat, 16 files) matches patch.diff's file list exactly; diff of original vs generated shows only the patch's files.",
+            "Read-only import/reference sweep: no remaining references to output_path, _add_2_or_3_d, _create_file_basename outside nifti_saver.py:42, or stale img2tensorboard. references in generated/monai/handlers/tensorboard_handlers.py (imports at lines 14-18). Classification/segmentation savers no longer use np/torch and have no leftover uses.",
+            "Existing tests/test_handler_tb_image.py constructs TensorBoardImageHandler() with no args and feeds (x, y) tuples; traced through the new plot path (tensorboard_handlers.py:207-224, img2tensorboard.py:158-173) and it remains compatible."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "CSVSaver lives in generated/monai/data/csv_saver.py:26, matching reference.diff:59 (monai/data/csv_saver.py).",
+            "NiftiSaver lives in generated/monai/data/nifti_saver.py:27, matching reference.diff:152 (monai/data/nifti_saver.py).",
+            "plot_2d_or_3d_image is in generated/monai/visualize/img2tensorboard.py:135, matching reference.diff:640.",
+            "Test files tests/test_csv_saver.py, test_nifti_saver.py, test_handler_segmentation_saver.py, test_plot_2d_or_3d_image.py use the same names and locations as the reference."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "CSVSaver(output_dir, filename, overwrite) at generated/monai/data/csv_saver.py:26, save(data, meta_data=None) at :43, save_batch(batch_data, meta_data=None) at :62, finalize() at :77; same parameter order and defaults as reference.diff:59/95/111/75.",
+            "NiftiSaver(output_dir, output_postfix, output_ext, dtype=None) at generated/monai/data/nifti_saver.py:27; matches reference.diff:152.",
+            "SegmentationSaver(output_dir, output_postfix, output_ext, dtype=None, batch_transform, output_transform, name) at generated/monai/handlers/segmentation_saver.py:23; same order as reference.diff:368.",
+            "ClassificationSaver(output_dir, filename, overwrite, batch_transform, output_transform, name) at generated/monai/handlers/classification_saver.py:23; same as reference.diff:275.",
+            "TensorBoardImageHandler gains index=0 before max_channels at generated/monai/handlers/tensorboard_handlers.py:178, same position as reference.diff:489; the example call sites (examples/segmentation_3d/unet_training_dict.py:163, unet_training_array.py:158) use keywords only, so the insertion is safe.",
+            "write_nifti default dtype changed to np.float32 at generated/monai/data/nifti_writer.py:16, matching reference.diff:248.",
+            "Removed surface (ClassificationSaver.finalize, SegmentationSaver output_path/dtype attributes, _add_2_or_3_d) is also removed in the reference. The candidate renames ClassificationSaver.finalize to a private _finalize (classification_saver.py:54); no callers exist in the repo (grep)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "monai/handlers/classification_saver.py:14 and segmentation_saver.py:14 import from monai.data (handlers depend on data, the same direction as the original nifti_writer import).",
+            "monai/data/nifti_saver.py:17 imports monai.data.nifti_writer, within the same package.",
+            "monai/visualize/img2tensorboard.py imports monai.transforms.utils for rescale_array, the same as reference.diff:594.",
+            "grep finds no imports of monai.visualize or monai.handlers inside monai/transforms, so no import cycle is introduced."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "ClassificationSaver.attach registers self for ITERATION_COMPLETED (classification_saver.py:49-50) and self._finalize for Events.COMPLETED (classification_saver.py:51-52).",
+            "_finalize(self, _engine) at classification_saver.py:54 accepts the engine argument that ignite passes. The installed ignite 0.5.3 checks handler signatures at registration (ignite/engine/engine.py:340). The pinned ignite 0.3.0 (requirements.txt) was not checked.",
+            "The has_event_handler dedupe check uses the same bound method, so it matches on re-attach. The reference (reference.diff:323-324) checks self.saver.finalize but registers a lambda, so its dedupe never matches. The candidate is stronger here."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "csv_saver.py:14-19 uses only stdlib, numpy, and torch, which are already dependencies (requirements.txt).",
+            "img2tensorboard.py adds torch and torch.utils.tensorboard imports; both are already required by tensorboard_handlers.py and requirements.txt (torch, tensorboard).",
+            "New tests use parameterized, nibabel, and ignite (all in requirements.txt) and the stdlib mock. No new third-party packages are introduced."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "File-writing logic moved out of handlers into monai/data savers: classification_saver.py:68 and segmentation_saver.py:65 delegate via self.saver.save_batch.",
+            "Plotting logic moved from TensorBoardImageHandler into monai/visualize/img2tensorboard.py:135; the handler delegates at tensorboard_handlers.py:224.",
+            "This is the same split as the reference (reference.diff:344, 468, 515-536)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Handlers keep the ignite handler-object pattern: attach() registers self for ITERATION_COMPLETED (segmentation_saver.py:49-50) and __call__ keeps the batch_transform/output_transform contract (classification_saver.py:58-68, segmentation_saver.py:52-66).",
+            "No parallel dispatch path or custom event mechanism is added."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "CSVSaver.save/save_batch/finalize (csv_saver.py:43/62/77) and NiftiSaver.save/save_batch (nifti_saver.py:78/115) accept plain data and meta_data dicts and know nothing about ignite Engine or handler state.",
+            "Handlers do not perform file IO themselves; the IO is in monai/data and the rendering is in monai/visualize (tensorboard_handlers.py:217-224).",
+            "Tensor-to-numpy conversion is applied at the boundary (csv_saver.py:57, nifti_saver.py:94-106), not leaked into handler state."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Naming matches reference: output_dir, _data_index, _filepath, _create_file_basename (nifti_saver.py:42), index (tensorboard_handlers.py:178).",
+            "Validation uses assert for filename, matching repo and reference style (csv_saver.py:35; reference.diff:70).",
+            "Logging: segmentation_saver.py:66 uses the same message as reference.diff:469; no per-file log remains.",
+            "Line length: no lines over 120 in changed files (.flake8 max-line-length=120; awk check found none).",
+            "Tests use tempfile plus tearDown (test_csv_saver.py:37-41), which the base tests also use (tests/test_dataset.py, test_load_nifti.py); the original ./tempdir style is still present in test_handler_classification_saver.py.",
+            "Non-blocking nits: NiftiSaver.save_batch drops None-valued meta entries (nifti_saver.py:128) while CSVSaver.save_batch does not (csv_saver.py:62-75), an asymmetry; the data.rst additions (patch.diff:9-19) are a scope addition the reference does not have, though they follow the file's heading conventions."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "CSVSaver row keys come from filename_or_obj or the running item index (csv_saver.py:56-58), matching reference.diff:105.",
+            "overwrite=False merge semantics (csv_saver.py:83-89): in-memory keys keep their position, file-only keys are appended. This matches reference.diff:80-84.",
+            "NiftiSaver path layout output_dir/<base>/<base>_<postfix><ext> is preserved (nifti_saver.py:108-113), and the input subfolder is not kept (tests/test_nifti_saver.py:43-48).",
+            "dtype=None keeps the data's dtype (nifti_saver.py:110). The original SegmentationSaver ignored its dtype param and used seg_output.dtype, so effective behavior is preserved.",
+            "Tensorboard tags match the original and reference: _HW (img2tensorboard.py:162), _CHW (:165), _HW_0 (:168), _HWD_j (:173). index selects the item (:158), defaulting to 0.",
+            "Intended changes shared with the reference, not regressions introduced by the candidate: ClassificationSaver output is now insertion-ordered instead of the original sorted(...) (patch.diff:371 removed line); the per-file log lines are replaced by one message; the classification test keeps epoch_length=2 where the reference dropped it (not a failure)."
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-202/round-02/candidate-03/run-05/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/integration_sliding_window.py",
+          "tests/test_csv_saver.py",
+          "tests/test_handler_classification_saver.py",
+          "tests/test_handler_segmentation_saver.py",
+          "tests/test_nifti_saver.py",
+          "tests/test_plot_2d_or_3d_image.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json: patch_applies=true; commands=[] so no executable checks were recorded (no tests run, per the experiment setup).",
+            "diff -rq base vs generated shows exactly the 15 paths in judge-context/patch.diff (monai/data/csv_saver.py, monai/data/nifti_saver.py, nifti_writer.py, both handlers, tensorboard_handlers.py, img2tensorboard.py, 2 examples, integration_sliding_window.py and 6 test files); no stray files.",
+            "Caveat, not a failure under this criterion: prepared.json lists official IDs such as tests/test_csv_saver.py::TestCSVSaver::test_saved_content, tests/test_nifti_saver.py::TestNiftiSaver::test_saved_content and tests/test_plot_2d_or_3d_image.py::TestPlot2dOr3dImage::test_tb_image_shape_0..4. The candidate's own files define different names (generated/tests/test_csv_saver.py:30-83, generated/tests/test_nifti_saver.py:32-76, generated/tests/test_plot_2d_or_3d_image.py:44-76 in class TestPlot2DOr3DImage), so those IDs only resolve if the harness substitutes the reference test files. test_handler_segmentation_saver.py:26 and the classification test do match."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/monai/data/csv_saver.py:19 (CSVSaver) and generated/monai/data/nifti_saver.py:20 (NiftiSaver) live in monai/data, matching reference.",
+            "generated/monai/visualize/img2tensorboard.py:135 defines plot_2d_or_3d_image, same module as reference.",
+            "generated/monai/handlers/classification_saver.py:14,42 and generated/monai/handlers/segmentation_saver.py:14,42-43 delegate to the data-layer savers, matching reference placement."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "CSVSaver: generated/monai/data/csv_saver.py:26 __init__(output_dir, filename, overwrite), save :43, save_batch :61, finalize :73. Same names and parameter order as reference.",
+            "NiftiSaver: generated/monai/data/nifti_saver.py:27 __init__(output_dir, output_postfix, output_ext, dtype=None); save/save_batch present. Matches reference.",
+            "SegmentationSaver: generated/monai/handlers/segmentation_saver.py:23-24 uses output_dir and dtype=None, matching reference. The original output_path/dtype='float32' (base monai/handlers/segmentation_saver.py:25) is intentionally renamed/changed, as in reference. Grep finds no stale output_path callers.",
+            "ClassificationSaver: generated/monai/handlers/classification_saver.py:23 adds filename after output_dir, matching reference.",
+            "TensorBoardImageHandler: generated/monai/handlers/tensorboard_handlers.py:173-178 inserts index=0 before max_channels, matching reference. Examples and test_handler_tb_image.py:48 use keywords or no args, so the positional shift breaks nothing.",
+            "plot_2d_or_3d_image: img2tensorboard.py:135 has the reference parameter order (data, step, writer, index=0, max_channels=1, max_frames=64, tag='output').",
+            "write_nifti default dtype=np.float32 at generated/monai/data/nifti_writer.py:16, matching reference.",
+            "Removals (ClassificationSaver.finalize at base classification_saver.py:55-56 and SegmentationSaver._create_file_basename / output_path) also occur in the reference, so they are not candidate-specific regressions."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/monai/data/csv_saver.py:12-16 imports only csv, os, numpy, torch.",
+            "generated/monai/data/nifti_saver.py:12-17 imports nifti_writer (lower layer) and no handler or ignite code.",
+            "generated/monai/handlers/segmentation_saver.py:14 and classification_saver.py:14 import from monai.data; tensorboard_handlers.py:17 imports monai.visualize.img2tensorboard. Direction is handler -> data/visualize.",
+            "monai/transforms/utils.py:12-17 has no monai.visualize or monai.handlers imports, so img2tensorboard's rescale_array import creates no cycle (same as reference)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "Base monai/data/__init__.py:1-10, monai/visualize/__init__.py:1-10 and monai/handlers/__init__.py:1-10 contain only license headers; no export list exists to update.",
+            "Reference adds no registration, and the candidate adds none, which is correct.",
+            "Ignite handler interface kept: generated/monai/handlers/classification_saver.py:46-58 and segmentation_saver.py:47-67 keep attach() and __call__()."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No new packages or requirement files are touched (patch.diff file list).",
+            "New imports are existing dependencies: numpy/torch/ignite/nibabel (generated/monai/data/csv_saver.py:15-16, nifti_saver.py:14-15, tests/test_nifti_saver.py:16-19).",
+            "parameterized is already used by 52 test files in the base snapshot (tests/test_nifti_saver.py:19; tests/test_plot_2d_or_3d_image.py)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "File-writing logic moved into the data layer: generated/monai/data/nifti_saver.py:76-103 and csv_saver.py:43-96.",
+            "Handlers only handle engine wiring and transforms: segmentation_saver.py:53-67 and classification_saver.py:58-68.",
+            "Plotting moved to img2tensorboard.py:135-175, and TensorBoardImageHandler delegates via tensorboard_handlers.py:228-230. This is the same split as reference."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "classification_saver.py:46-56 keeps the existing engine.has_event_handler / add_event_handler pattern.",
+            "The candidate's dedupe check uses the registered bound method (classification_saver.py:51-52, _finalize_on_completed). Reference (reference classification_saver.py:50) checks self.saver.finalize but registers a lambda (reference line 324), so its dedupe never matches. The candidate's version is the correct one.",
+            "batch_transform/output_transform hooks are preserved (classification_saver.py:58-68; segmentation_saver.py:53-66)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "generated/monai/data/csv_saver.py and nifti_saver.py contain no ignite or engine references (imports at csv_saver.py:12-16, nifti_saver.py:12-17).",
+            "Engine-specific code remains in handlers: segmentation_saver.py:53-67 reads engine.state.batch/output; classification_saver.py:58-68 does the same.",
+            "Image I/O goes through nifti_writer.write_nifti (nifti_saver.py:103), not reimplemented."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Argument validation uses assert with a message, as the reference csv_saver does (generated/monai/data/csv_saver.py:35).",
+            "Google-style Args docstrings (csv_saver.py:26-34, nifti_saver.py:27-37, segmentation_saver.py:23-38) and snake_case naming are consistent with the repo.",
+            "Per-batch logging kept via self.logger.info (segmentation_saver.py:67), the same as reference.",
+            "Minor, not failing: the _item_meta_data helper is duplicated verbatim in csv_saver.py:99-103 and nifti_saver.py:118-122 (reference inlines a dict comprehension in each save_batch). The new test files use tempfile.TemporaryDirectory (e.g., test_csv_saver.py:30-31), while base saver tests use os.path.join('.', 'tempdir') (base tests/test_handler_classification_saver.py:26). Both styles exist in base (2 vs 3 files), so this is not a violation."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Reference features are all present: CSVSaver/NiftiSaver extraction (csv_saver.py:61-96, nifti_saver.py:76-115); ClassificationSaver filename (classification_saver.py:23,42); SegmentationSaver output_dir/dtype (segmentation_saver.py:23-30,42-43); TensorBoardImageHandler index (tensorboard_handlers.py:178,200,228-230); plot extraction (img2tensorboard.py:135-175); write_nifti default (nifti_writer.py:16); examples and integration_sliding_window updated.",
+            "Behavioral parity with the reference test scenarios, verified by reading: 3-channel non-RGB 3D writes only channel 0 (img2tensorboard.py:165-169, same return-inside-loop behavior as reference); 5D data uses add_animated_gif (img2tensorboard.py:171-175); no-metadata items keyed by index with no affine (csv_saver.py:55, nifti_saver.py:91-93).",
+            "Candidate deviations from reference, all minor: (a) a negative max_channels writes nothing (img2tensorboard.py:165 `if max_channels >= 1`), while reference's d[:max_channels] would still write channel 0; that input is invalid. (b) The dtype fallback uses `self.dtype is None` (nifti_saver.py:102), which is safer than reference's `self.dtype or data.dtype` (reference nifti_saver.py:102). I could not verify numpy dtype truthiness here because numpy is not installed in the sandbox, so this is unverified. (c) batch_transform is called once (tensorboard_handlers.py:206) instead of twice.",
+            "Behavior changes shared with the reference, not candidate-specific: CSV rows are now insertion-ordered, not sorted (base classification_saver.py:72 sorted; csv_saver.py:124-128 unsorted, as in reference csv_saver.py:57); the classification finalize log line is removed.",
+            "Weak test (not a behavioral failure): generated/tests/test_plot_2d_or_3d_image.py:68-74 test_index_selects_batch_item uses zeros for both batch items, so it cannot show that index=1 is the item plotted."
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-202/round-02/candidate-03/run-06/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/integration_sliding_window.py",
+          "tests/test_csv_saver.py",
+          "tests/test_handler_classification_saver.py",
+          "tests/test_handler_segmentation_saver.py",
+          "tests/test_nifti_saver.py",
+          "tests/test_plot_2d_or_3d_image.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies=true; commands=[] (no tests run, per the experiment setup).",
+            "Staged diff in generated/ (git diff --cached) matches patch.diff line-for-line apart from index hashes; generated file set matches patch.diff (same 15 files).",
+            "Candidate-added test defect (not a patch-application failure): generated/tests/test_plot_2d_or_3d_image.py:76 asserts assertIn('output_HWD_0', tags). With max_frames=10 (line 73), add_animated_gif takes the '/image/{}' suffix branch (base monai/visualize/img2tensorboard.py:69-72) and emits tag 'output_HWD_0/image/0' (img2tensorboard.py:88). By reading, that assertion fails. Library code is unaffected."
+          ],
+          "deficiency": "No failure against the criterion as written (patch applies; tests are not run). Non-blocking: the candidate-added test test_index_selects_item (test_plot_2d_or_3d_image.py:69-76) would fail by reading because its tag expectation is wrong; it also uses all-zero data, so it does not prove index selection."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "New savers placed in monai/data/csv_saver.py and monai/data/nifti_saver.py, the same locations as the reference.",
+            "plot_2d_or_3d_image is in monai/visualize/img2tensorboard.py:134, the same module as the reference, and is imported by monai/handlers/tensorboard_handlers.py:17.",
+            "Handler changes stay in monai/handlers/classification_saver.py and segmentation_saver.py, and the example and integration-test call-site renames match the reference files."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "CSVSaver.__init__(output_dir, filename, overwrite) at generated/monai/data/csv_saver.py:26, with save/save_batch/finalize at lines 42/61/74.",
+            "NiftiSaver.__init__(output_dir, output_postfix, output_ext, dtype=None) at generated/monai/data/nifti_saver.py:26.",
+            "ClassificationSaver.__init__ adds filename before overwrite at generated/monai/handlers/classification_saver.py:25 (same as reference).",
+            "SegmentationSaver.__init__ renames output_path to output_dir and sets dtype=None at generated/monai/handlers/segmentation_saver.py:24 (same as reference).",
+            "TensorBoardImageHandler adds index=0 before max_channels at generated/monai/handlers/tensorboard_handlers.py:178; the index is used on all three plot calls (lines 214, 223, 232).",
+            "plot_2d_or_3d_image(data, step, writer, index=0, max_channels=1, max_frames=64, tag='output') at img2tensorboard.py:134 matches the reference signature.",
+            "Behavior changes also present in the reference: ClassificationSaver.finalize is removed in favor of private _finalize (classification_saver.py:57); CSV rows are no longer sorted (csv_saver.py:89; reference csv_saver.py:57; base classification_saver.py:72 sorted); the per-file and per-finalize info logs are dropped. These match the reference, so they are not patch regressions."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "monai/visualize/img2tensorboard.py imports monai.transforms.utils.rescale_array, the same edge as the reference.",
+            "monai/transforms/utils.py imports only monai.utils.misc (line 17), so no import cycle is introduced.",
+            "monai/data/nifti_saver.py imports monai.data.nifti_writer; the handlers depend on monai.data and monai.visualize, and nothing in monai.data or monai.visualize imports handlers.",
+            "CSVSaver and NiftiSaver do not import ignite, so the data layer stays independent of the handler layer."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "No registry or plugin mechanism is involved; the reference adds none.",
+            "monai/data/__init__.py and monai/visualize/__init__.py contain only license headers in the base snapshot, so no export registration is required, and none is added by the reference or the candidate."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "Library code uses only numpy, torch, ignite, nibabel, PIL and tensorboard, all already used or declared in the base (base requirements.txt lines 4, 5, 10; setup.py lines 31-33).",
+            "Candidate tests add imports of parameterized, tensorboard's EventAccumulator and nibabel, all declared in requirements.txt/setup.py. No new third-party dependency is introduced."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "File-writing and filename logic moved out of the handlers into monai/data savers (nifti_saver.py:77-107, csv_saver.py:74-93).",
+            "Handlers delegate: classification_saver.py:63-73 calls self.saver.save_batch; segmentation_saver.py:54-68 does the same.",
+            "TensorBoard drawing moved to img2tensorboard.plot_2d_or_3d_image, matching the reference layering."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Reuses existing write_nifti (nifti_saver.py:106), add_animated_gif (img2tensorboard.py:172) and rescale_array instead of adding parallel writers.",
+            "Keeps the ignite attach pattern with a has_event_handler guard (classification_saver.py:54-55) and the existing __call__ hook for the handler-to-saver path.",
+            "Removes the duplicated _add_2_or_3_d and _create_file_basename helpers rather than keeping two copies."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "csv_saver.py and nifti_saver.py import only csv/os/numpy/torch (and nifti_writer); none imports ignite or the handler layer.",
+            "ignite Events remains only in the handler modules (classification_saver.py and segmentation_saver.py import blocks).",
+            "plot_2d_or_3d_image takes an explicit writer and keeps the SummaryWriter type check (img2tensorboard.py:146), which the reference also has."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Docstrings use the repo's Args: layout and the same assert-based validation style as the reference (csv_saver.py __init__ assert; img2tensorboard.py:146).",
+            "SegmentationSaver keeps a one-line info log (segmentation_saver.py:68), matching the reference.",
+            "Candidate tests use tempfile.TemporaryDirectory, as tests/integration_sliding_window.py already does, instead of the './tempdir' pattern. Both appear in the repo, so this is not a violation.",
+            "Candidate test class and method names (TestPlot2DOr3DImage, test_plot_shape) differ from the FAIL_TO_PASS IDs. This is an optional naming choice, and the hidden test file replaces it."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "CSVSaver (csv_saver.py:74-93), NiftiSaver (nifti_saver.py:77-107) and plot_2d_or_3d_image (img2tensorboard.py:134-172) are all usable without ignite, as the feature requires.",
+            "The 3D non-RGB branch (img2tensorboard.py:162-166) writes one {tag}_HW_0 image when max_channels>=1 and nothing when max_channels=0. This matches the reference's loop-with-early-return (reference img2tensorboard.py, plot_2d_or_3d_image), which also writes only channel 0.",
+            "dtype: NiftiSaver keeps the data dtype when self.dtype is None (nifti_saver.py:105), matching the reference's default.",
+            "Missing-affine case: write_nifti receives None and falls back to identity, as in the reference.",
+            "Not a regression: TensorBoardImageHandler now calls batch_transform once (tensorboard_handlers.py:207) instead of the base's twice. This is behavior-preserving for pure transforms and is not a reference requirement.",
+            "Candidate-added test test_index_selects_item (test_plot_2d_or_3d_image.py:76) has the wrong tag expectation (see patch_and_checks). This affects the candidate's own test, not the library behavior the requirement describes."
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-202/round-02/candidate-03/run-07/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/integration_sliding_window.py",
+          "tests/test_csv_saver.py",
+          "tests/test_handler_classification_saver.py",
+          "tests/test_handler_segmentation_saver.py",
+          "tests/test_nifti_saver.py",
+          "tests/test_plot_2d_or_3d_image.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "patch.diff applies to the base snapshot: `git apply --check` exited 0 (run during this review).",
+            "Applying patch.diff to a scratch copy of base yields a tree identical to generated/ (diff -rq excluding .git); the scratch copy was then removed.",
+            "checks.json: patch_applies=true, commands=[], api_inspection=[], verified_api_facts=[]; no executable checks are recorded.",
+            "Reading-based trace of the reference FAIL_TO_PASS shapes: CSVSaver.save_batch with 0-dim tensors -> generated/monai/data/csv_saver.py:57 and finalize at csv_saver.py:75-90; NiftiSaver.save_batch -> nifti_saver.py:72-106; plot_2d_or_3d_image for 3D/4D/5D inputs -> generated/monai/visualize/img2tensorboard.py:134-165."
+          ],
+          "deficiency": "None. No tests were executed; the behavioral judgments are from reading the code only."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "CSVSaver at generated/monai/data/csv_saver.py:19 and NiftiSaver at generated/monai/data/nifti_saver.py:18, both in monai/data as in the reference.",
+            "plot_2d_or_3d_image at generated/monai/visualize/img2tensorboard.py:134, the same module the reference uses.",
+            "Handlers delegate to the new classes: generated/monai/handlers/classification_saver.py:43 and generated/monai/handlers/segmentation_saver.py:43.",
+            "New tests sit under tests/ with names matching the reference FAIL_TO_PASS modules (test_csv_saver.py, test_nifti_saver.py, test_handler_segmentation_saver.py, test_plot_2d_or_3d_image.py)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "CSVSaver(output_dir, filename, overwrite): generated/monai/data/csv_saver.py:25; save/save_batch/finalize at csv_saver.py:41, 60, 75 match the reference signatures.",
+            "NiftiSaver(output_dir, output_postfix, output_ext, dtype=None): generated/monai/data/nifti_saver.py:23, same order as the reference.",
+            "SegmentationSaver(output_dir, output_postfix, output_ext, dtype=None, batch_transform, output_transform, name): generated/monai/handlers/segmentation_saver.py:22, same order as reference.",
+            "ClassificationSaver(output_dir, filename, overwrite, ...): generated/monai/handlers/classification_saver.py:22, same order as reference.",
+            "TensorBoardImageHandler gains index=0 before max_channels at generated/monai/handlers/tensorboard_handlers.py:178; plot_2d_or_3d_image parameter order at img2tensorboard.py:134 matches reference.",
+            "Non-contract difference: the internal saver is `self._saver` (classification_saver.py:43, segmentation_saver.py:43) where the reference exposes `self.saver` (reference classification_saver.py:39). This is an implementation attribute, not a documented contract, so it is accepted.",
+            "The public ClassificationSaver.finalize (original classification_saver.py:58) is removed. The reference removes it too; finalize now lives on CSVSaver."
+          ],
+          "deficiency": "None blocking."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/monai/data/csv_saver.py:12-16 imports only os, csv, collections, numpy, torch; nifti_saver.py:12-15 adds only the sibling monai.data.nifti_writer. Neither imports ignite or monai.handlers.",
+            "generated/monai/handlers/classification_saver.py:14 and segmentation_saver.py:14 import monai.data (handlers depend on data, which is the correct direction).",
+            "generated/monai/visualize/img2tensorboard.py:18 imports monai.transforms.utils, the same as the reference. monai/transforms/utils.py:12-17 imports only stdlib, numpy and monai.utils.misc, so no cycle is introduced."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "Event registration uses ignite's existing mechanism with has_event_handler guards: generated/monai/handlers/classification_saver.py:45-51 registers self on ITERATION_COMPLETED and self._finalize_on_complete on COMPLETED; segmentation_saver.py:46-50 registers self on ITERATION_COMPLETED.",
+            "monai/data/__init__.py and monai/handlers/__init__.py contain only license headers in base, so there is no export registry to update.",
+            "generated/docs/source/data.rst:44-52 adds automodule entries for nifti_saver and csv_saver. The reference does not, but this is harmless and fits the PR's documentation checkbox."
+          ],
+          "deficiency": "None blocking."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No new third-party dependency. csv, collections and os are stdlib; numpy, torch, nibabel and ignite are already used in base; parameterized (used by the new plot test) is already listed in base requirements.txt."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Core write logic moved into the data layer (generated/monai/data/csv_saver.py, nifti_saver.py), as in the reference.",
+            "Handler classes are reduced to engine glue: generated/monai/handlers/classification_saver.py:59-69 and segmentation_saver.py:52-66.",
+            "The plot helper lives in the visualize layer (img2tensorboard.py:134); tensorboard_handlers.py:206-232 delegates to it."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "No parallel path: handlers keep the batch_transform/output_transform hooks and the existing attach/add_event_handler flow (classification_saver.py:45-51, segmentation_saver.py:46-50).",
+            "tensorboard_handlers.py:206 calls batch_transform once, whereas the reference calls it twice (reference tensorboard_handlers.py:206 and 215). This is a benign deviation that keeps the same hook contract and makes image and label come from a single call."
+          ],
+          "deficiency": "None blocking."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "CSVSaver and NiftiSaver have no engine or ignite dependency (generated/monai/data/csv_saver.py:12-16, nifti_saver.py:12-15); engine concerns stay in the handlers.",
+            "plot_2d_or_3d_image takes a SummaryWriter and only type-checks it (img2tensorboard.py:147), with no engine coupling."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Google-style docstrings with Args blocks (csv_saver.py:26-33; nifti_saver.py:27-33). assert-with-message validation matches the repo style (nifti_writer.py:27). No line exceeds the 120-column limit in .flake8.",
+            "Parameter naming (output_dir, filename, output_postfix, output_ext, dtype) matches the reference.",
+            "Non-blocking nit (a): classification_saver.py:42 keeps self.logger, and attach uses it at 46-47, but nothing in the handler logs any more. The `name` argument therefore has no observable effect. The original logged 'saved classification predictions into' at base classification_saver.py:77. The reference drops the same message, so this matches the reference.",
+            "Non-blocking nit (b): the ClassificationSaver __init__ docstring still mentions 'prediction_dict' (classification_saver.py:29), a stale name the reference also keeps.",
+            "Non-blocking nit (c): new tests use tempfile.mkdtemp in setUp/tearDown (tests/test_csv_saver.py:30-33, test_nifti_saver.py:26-29), not the ./tempdir + rmtree pattern of base tests/test_handler_classification_saver.py:26-27. integration_sliding_window already uses tempfile, so both patterns exist in the repo."
+          ],
+          "deficiency": "None blocking. Non-blocking nits are listed in evidence: an unused logger path (matches reference), a stale 'prediction_dict' docstring (matches reference), and the tempfile test pattern (also used in the repo)."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "All four deliverables are present: TensorBoard plotting (img2tensorboard.py:134-165 with tensorboard_handlers.py:206-232); NIfTI saving (nifti_saver.py:72-106 with segmentation_saver.py:52-66); CSV saving (csv_saver.py:19-90 with classification_saver.py:53-69); unit tests for nifti_saver, csv_saver, plot and segmentation_saver.",
+            "Behavior traced against the reference: the CSV key rule (csv_saver.py:54-56), overwrite=False merge (csv_saver.py:79-87), optional affine (nifti_saver.py:90-91), dtype defaulting to data dtype (nifti_saver.py:102), and plot tags output_HW / output_CHW / output_HW_0 / output_HWD_j (img2tensorboard.py:150-165) all match the reference.",
+            "Intended behavior changes shared with the reference: output_path -> output_dir (segmentation_saver.py:22); CSV rows are now insertion-ordered rather than sorted (csv_saver.py:75-82, versus base classification_saver.py:72 which used sorted()); per-file log lines are replaced by one summary line (segmentation_saver.py:66).",
+            "Candidate-only, benign differences: (i) plot converts the whole batch to numpy before indexing (img2tensorboard.py:149-150), where the reference indexes first; this is an extra copy only for direct callers. (ii) NIfTI dtype uses an explicit `is None` check (nifti_saver.py:102), where the reference uses `self.dtype or data.dtype`; the truthiness idiom can fall back for falsy numpy dtype objects. (iii) CSVSaver accepts list input and skips blank rows (csv_saver.py:57, 84)."
+          ],
+          "deficiency": "None blocking."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-202/round-02/candidate-03/run-08/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/integration_sliding_window.py",
+          "tests/test_csv_saver.py",
+          "tests/test_handler_classification_saver.py",
+          "tests/test_handler_segmentation_saver.py",
+          "tests/test_nifti_saver.py",
+          "tests/test_plot_2d_or_3d_image.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies=true.",
+            "Pre-image blob hashes of base files match the patch's index lines: base/monai/handlers/classification_saver.py hashes to 501dce8 (patch: index 501dce8..8096d87); base/monai/handlers/tensorboard_handlers.py hashes to fb5eb34 (patch: index fb5eb34..bc9021d); base/monai/visualize/img2tensorboard.py hashes to 7498ce1 (patch: index 7498ce1..7e21465).",
+            "Generated tree file set equals base plus patch.diff: the two example files, nifti_writer.py, classification_saver.py, segmentation_saver.py, tensorboard_handlers.py, img2tensorboard.py, integration_sliding_window.py, test_handler_classification_saver.py are modified; csv_saver.py, nifti_saver.py and the four new test files are added. No extra files.",
+            "No tests were run (per the experiment setup); this is a reading-based judgment."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "CSVSaver lives in generated/monai/data/csv_saver.py:19, matching reference/monai/data/csv_saver.py.",
+            "NiftiSaver lives in generated/monai/data/nifti_saver.py:20, matching reference/monai/data/nifti_saver.py.",
+            "plot_2d_or_3d_image is in generated/monai/visualize/img2tensorboard.py:135, the same module as reference/monai/visualize/img2tensorboard.py:130.",
+            "Handlers only wire events and delegate: generated/monai/handlers/classification_saver.py:42 (self.saver = CSVSaver(...)), generated/monai/handlers/segmentation_saver.py:41-42 (self.saver = NiftiSaver(...))."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "CSVSaver.__init__(output_dir='./', filename='predictions.csv', overwrite=True) at generated/monai/data/csv_saver.py:29, with save(data, meta_data=None), save_batch(batch_data, meta_data=None), finalize(), matching reference/monai/data/csv_saver.py:59 and the reference's method set.",
+            "NiftiSaver.__init__(output_dir, output_postfix, output_ext, dtype=None) at generated/monai/data/nifti_saver.py:31, matching reference/monai/data/nifti_saver.py:152.",
+            "ClassificationSaver.__init__ adds filename='predictions.csv' before overwrite at generated/monai/handlers/classification_saver.py:25, matching reference diff (filename before overwrite).",
+            "SegmentationSaver.__init__ renames output_path to output_dir and defaults dtype to None at generated/monai/handlers/segmentation_saver.py:25, matching reference.",
+            "TensorBoardImageHandler.__init__ inserts index=0 before max_channels at generated/monai/handlers/tensorboard_handlers.py:178, with self.index = index at :200, matching reference.",
+            "write_nifti default dtype changed to np.float32 at generated/monai/data/nifti_writer.py:16, matching reference.",
+            "plot_2d_or_3d_image(data, step, writer, index=0, max_channels=1, max_frames=64, tag='output') at generated/monai/visualize/img2tensorboard.py:135, matching reference:130 signature.",
+            "Removed public surface (ClassificationSaver.finalize, SegmentationSaver._create_file_basename and its attributes) is also removed by the reference (reference/monai/handlers/classification_saver.py:50-51 and the reference diff), so it is not a deviation."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "Handlers depend on the data layer only: generated/monai/handlers/classification_saver.py:16 imports monai.data.csv_saver; generated/monai/handlers/segmentation_saver.py:16 imports monai.data.nifti_saver.",
+            "generated/monai/handlers/tensorboard_handlers.py:18 imports monai.visualize.img2tensorboard, the same edge as reference.",
+            "generated/monai/visualize/img2tensorboard.py:19 imports monai.transforms.utils.rescale_array, the same edge as reference/monai/visualize/img2tensorboard.py.",
+            "monai/transforms/utils.py imports only monai.utils.misc (base/monai/transforms/utils.py:15-17 area), so this introduces no cycle back into visualize or handlers.",
+            "monai/data/nifti_saver.py:14-18 imports only nibabel-backed write_nifti plus numpy/torch; no handler imports."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "ClassificationSaver registers its completion hook with ignite: generated/monai/handlers/classification_saver.py:53-54 uses has_event_handler(self._finalize_on_completed, Events.COMPLETED) then add_event_handler(...).",
+            "The hook's signature is valid under the pinned ignite 0.3.0 (requirements.txt: pytorch-ignite==0.3.0). ignite 0.3.0 engine.py:555-569 _check_signature does signature.bind(self, ...) at registration, and _finalize_on_completed(self, _engine) binds the engine. The candidate's comment at classification_saver.py:57 is accurate.",
+            "The reference uses a lambda (reference/monai/handlers/classification_saver.py:50-51) whose dedup guard checks self.saver.finalize, which never matches the lambda, so re-attach would duplicate the handler. The candidate's guard checks the same bound method it registers, so the dedup check is correct in the candidate.",
+            "SegmentationSaver's ITERATION_COMPLETED registration is unchanged (generated/monai/handlers/segmentation_saver.py:48-52)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No new third-party packages. New modules import only numpy, torch, os, csv, and the existing monai.data.nifti_writer (generated/monai/data/csv_saver.py:44-48, nifti_saver.py:146-151).",
+            "img2tensorboard.py adds torch and torch.utils.tensorboard.SummaryWriter (generated lines 14, 16), both already used by the package and tensorboard_handlers.py.",
+            "Tests use parameterized, nibabel, and tempfile; parameterized and nibabel are listed in requirements.txt, and tempfile is stdlib. The base integration test already uses tempfile.TemporaryDirectory (base/tests/integration_sliding_window.py:~61)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "File writing moved out of handlers into monai/data: CSV writing in generated/monai/data/csv_saver.py:78-92 (finalize), NIfTI writing in generated/monai/data/nifti_saver.py:81-113 (save), matching reference placement.",
+            "Handlers keep only ignite wiring and transform extraction: generated/monai/handlers/classification_saver.py:60-70 and segmentation_saver.py:54-68.",
+            "Plotting logic moved to a module-level function in img2tensorboard (generated/monai/visualize/img2tensorboard.py:135-172), matching reference:130.",
+            "The candidate's private _plot_source helper (generated/monai/handlers/tensorboard_handlers.py:217-224) de-duplicates three call sites and stays inside the handler class. The reference does not have it, but it is a reasonable internal choice, not a layering problem."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Uses the existing ignite event mechanism (classification_saver.py:51-54, segmentation_saver.py:51-52); no parallel event path.",
+            "Reuses the existing writer: nifti_saver.py:113 calls write_nifti rather than reimplementing nibabel saving.",
+            "Reuses existing TensorBoard helpers: img2tensorboard.py:161,164,167 call writer.add_image, img2tensorboard.py:172 calls the module's own add_animated_gif, and rescale_array is imported at :19 rather than duplicated.",
+            "The original _add_2_or_3_d logic (base/monai/handlers/tensorboard_handlers.py:231-258) is preserved in plot_2d_or_3d_image, with the same tags 'HW', 'CHW', 'HW_0' and 'HWD_j' (img2tensorboard.py:161-172)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "CSV and NIfTI I/O are isolated in monai/data (csv_saver.py:78-92, nifti_saver.py:81-113); handlers never open files.",
+            "plot_2d_or_3d_image takes a SummaryWriter and asserts its type (img2tensorboard.py:154), the same boundary as reference:130-131.",
+            "Torch-to-numpy conversion happens before the numpy-only write_nifti, which asserts ndarray input (base/monai/data/nifti_writer.py:27). Candidate converts data (nifti_saver.py:99-101) and affine/original_affine (nifti_saver.py:103-107).",
+            "TensorBoardImageHandler._plot_source converts tensors and type-checks before plotting (generated/monai/handlers/tensorboard_handlers.py:68-75, 217-224), preserving the original ValueError contract."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Validation uses assert like the reference: csv_saver.py:38 (assert isinstance(filename, str) and filename.endswith('.csv')) vs reference/monai/data/csv_saver.py:38 (filename[-4:] == '.csv').",
+            "Error messages preserved verbatim from the base TensorBoard handler: base/monai/handlers/tensorboard_handlers.py:210, 218, 226 map to generated tensorboard_handlers.py:59-64 error_message arguments.",
+            "Logging kept in SegmentationSaver as a single per-batch info line (generated/monai/handlers/segmentation_saver.py:68), matching the reference wording. Classification's finalize log line is removed, as in the reference.",
+            "Naming follows the codebase (CSVSaver/NiftiSaver, _create_file_basename moved as a staticmethod at nifti_saver.py:45-46, _finalize_on_completed).",
+            "Tests follow repo conventions: unittest, parameterized.expand, and if __name__ == '__main__'. The candidate uses tempfile.mkdtemp with setUp/tearDown, consistent with base integration_sliding_window.py's TemporaryDirectory.",
+            "Minor, non-blocking: csv_saver.py:90 uses os.makedirs(exist_ok=True) instead of the original exists-check. Equivalent behavior."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Savers: CSVSaver (csv_saver.py:19-92) and NiftiSaver (nifti_saver.py:20-126) provide save, save_batch, and finalize (CSV only), with meta-less indexing by a counter (csv_saver.py:58, nifti_saver.py:113-126 area).",
+            "ClassificationSaver exposes filename, and it reaches the file path via CSVSaver (classification_saver.py:25, 42).",
+            "SegmentationSaver exposes output_dir and a dtype that is honored: nifti_saver.py:110 uses self.dtype when set, where the base ignored dtype (base segmentation_saver.py:120 used seg_output.dtype).",
+            "TensorBoardImageHandler gains index and plots the selected item (tensorboard_handlers.py:178, 200, 224).",
+            "write_nifti default is np.float32 (nifti_writer.py:16). Examples and integration_sliding_window.py are updated to output_dir (examples/segmentation_3d/unet_evaluation_array.py and _dict.py).",
+            "Intended behavioral changes shared with the reference, not candidate-specific: CSV rows are now in insertion order, not sorted (base classification_saver.py:72 used sorted(); csv_saver.py:92 iterates insertion order, reference csv_saver.py:89 likewise). Per-file 'saved:' logs are replaced by one per-batch log. Public ClassificationSaver.finalize is removed.",
+            "Candidate-only improvements: the dtype check uses 'is not None' (nifti_saver.py:110), while the reference's 'self.dtype or data.dtype' (reference/monai/data/nifti_saver.py:102) relies on dtype truthiness; the has_event_handler guard is correct (classification_saver.py:53); the output-sorted order is documented as insertion order (csv_saver.py:112-114 docstring).",
+            "Test coverage: candidate adds tests for CSVSaver, NiftiSaver, handler segmentation saver, plot_2d_or_3d_image, and merge behavior (overwrite=False). The base classification test keeps epoch_length=2 (base/tests/test_handler_classification_saver.py:40); its expectations still hold under insertion order by reading."
+          ],
+          "deficiency": "None."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-202/round-02/candidate-03/run-09/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/integration_sliding_window.py",
+          "tests/test_csv_saver.py",
+          "tests/test_handler_classification_saver.py",
+          "tests/test_handler_segmentation_saver.py",
+          "tests/test_nifti_saver.py",
+          "tests/test_plot_2d_or_3d_image.py"
+        ],
+        "api_inspection": []
+      }
+    }
+  ]
+}

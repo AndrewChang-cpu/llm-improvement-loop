@@ -1,0 +1,177 @@
+diff --git a/monai/data/grid_dataset.py b/monai/data/grid_dataset.py
+index f85569d..f51f5d0 100644
+--- a/monai/data/grid_dataset.py
++++ b/monai/data/grid_dataset.py
+@@ -10,15 +10,16 @@
+ # limitations under the License.
+ 
+ import math
+-from typing import Callable, Dict, Optional, Sequence, Union
++from typing import Callable, Dict, Generator, Optional, Sequence, Tuple, Union
+ 
++import numpy as np
+ import torch
+ from torch.utils.data import IterableDataset
+ 
+ from monai.data.dataset import Dataset
+-from monai.data.utils import iter_patch
++from monai.data.utils import get_valid_patch_size, iter_patch, iter_patch_slices
+ from monai.transforms import apply_transform
+-from monai.utils import NumpyPadMode, ensure_tuple
++from monai.utils import NumpyPadMode, ensure_tuple, ensure_tuple_size
+ 
+ __all__ = ["PatchDataset", "GridPatchDataset"]
+ 
+@@ -26,6 +27,12 @@ __all__ = ["PatchDataset", "GridPatchDataset"]
+ class GridPatchDataset(IterableDataset):
+     """
+     Yields patches from arrays read from an input dataset. The patches are chosen in a contiguous grid sampling scheme.
++
++    Each item of the input dataset must be a sequence of arrays sharing the same spatial layout (the first dimension of
++    each array is treated as the channel dimension). For every grid position, one patch is extracted from each array and
++    the resulting tuple of patches is optionally processed by `transform` (a patch-level transform). If `with_coordinates`
++    is True, each yielded item is a pair ``(patches, coordinates)`` where ``coordinates`` is an array of the spatial
++    start position of the patch in the original (unpadded) array, with one entry per spatial dimension.
+     """
+ 
+     def __init__(
+@@ -34,7 +41,9 @@ class GridPatchDataset(IterableDataset):
+         patch_size: Sequence[int],
+         start_pos: Sequence[int] = (),
+         mode: Union[NumpyPadMode, str] = NumpyPadMode.WRAP,
+-        **pad_opts: Dict,
++        pad_opts: Optional[Dict] = None,
++        transform: Optional[Callable] = None,
++        with_coordinates: bool = True,
+     ) -> None:
+         """
+         Initializes this dataset in terms of the input dataset and patch size. The `patch_size` is the size of the
+@@ -52,13 +61,36 @@ class GridPatchDataset(IterableDataset):
+                 One of the listed string values or a user supplied function. Defaults to ``"wrap"``.
+                 See also: https://numpy.org/doc/1.18/reference/generated/numpy.pad.html
+             pad_opts: padding options, see numpy.pad
++            transform: a patch-level transform applied to the tuple of patches extracted for each grid position
++                (applied after padding and extraction, before coordinates are attached).
++            with_coordinates: if True, yield ``(patches, coordinates)`` pairs, where ``coordinates`` is a numpy array
++                holding the spatial start position of each patch in the original array. Defaults to True.
+         """
+ 
+         self.dataset = dataset
+         self.patch_size = (None,) + tuple(patch_size)
+         self.start_pos = ensure_tuple(start_pos)
+         self.mode: NumpyPadMode = NumpyPadMode(mode)
+-        self.pad_opts = pad_opts
++        self.pad_opts = dict(pad_opts) if pad_opts is not None else {}
++        self.transform = transform
++        self.with_coordinates = with_coordinates
++
++    def _patch_coordinates(self, arr: np.ndarray) -> Generator[np.ndarray, None, None]:
++        """
++        Yield the spatial start coordinates (in the unpadded `arr`) of each grid patch, in the same order as the
++        patches yielded by `iter_patch`.
++        """
++        patch_size_ = get_valid_patch_size(arr.shape, self.patch_size)
++        start_pos = ensure_tuple_size(self.start_pos, arr.ndim)
++
++        # same padding geometry as `iter_patch`
++        start_pos_padded = tuple(s + p for s, p in zip(start_pos, patch_size_))
++        iter_size = tuple(s + p for s, p in zip(arr.shape, patch_size_))
++
++        for slices in iter_patch_slices(iter_size, patch_size_, start_pos_padded):
++            # remove the padding offset, then drop the channel dimension
++            starts: Tuple[int, ...] = tuple(sl.start - p for sl, p in zip(slices, patch_size_))
++            yield np.asarray(starts[1:], dtype=np.int64)
+ 
+     def __iter__(self):
+         worker_info = torch.utils.data.get_worker_info()
+@@ -77,7 +109,17 @@ class GridPatchDataset(IterableDataset):
+ 
+             iters = [iter_patch(a, self.patch_size, self.start_pos, False, self.mode, **self.pad_opts) for a in arrays]
+ 
+-            yield from zip(*iters)
++            if self.with_coordinates:
++                coords = self._patch_coordinates(arrays[0])
++                for patches, location in zip(zip(*iters), coords):
++                    if self.transform is not None:
++                        patches = apply_transform(self.transform, patches, map_items=False)
++                    yield patches, location
++            else:
++                for patches in zip(*iters):
++                    if self.transform is not None:
++                        patches = apply_transform(self.transform, patches, map_items=False)
++                    yield patches
+ 
+ 
+ class PatchDataset(Dataset):
+diff --git a/tests/test_grid_patch_dataset.py b/tests/test_grid_patch_dataset.py
+new file mode 100644
+index 0000000..6ee8009
+--- /dev/null
++++ b/tests/test_grid_patch_dataset.py
+@@ -0,0 +1,66 @@
++# Copyright 2020 - 2021 MONAI Consortium
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#     http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import unittest
++
++import numpy as np
++
++from monai.data import GridPatchDataset
++
++
++class TestGridPatchDataset(unittest.TestCase):
++    def setUp(self):
++        self.image = np.arange(16, dtype=np.float32).reshape(1, 4, 4)
++        self.dataset = [(self.image,)]
++
++    def test_patches_without_coordinates(self):
++        ds = GridPatchDataset(self.dataset, patch_size=(2, 2), with_coordinates=False)
++        patches = list(ds)
++        self.assertEqual(len(patches), 4)
++        for p in patches:
++            self.assertEqual(p[0].shape, (1, 2, 2))
++
++    def test_patches_with_coordinates(self):
++        ds = GridPatchDataset(self.dataset, patch_size=(2, 2), with_coordinates=True)
++        items = list(ds)
++        self.assertEqual(len(items), 4)
++        locations = []
++        for patches, loc in items:
++            self.assertEqual(patches[0].shape, (1, 2, 2))
++            locations.append(tuple(int(v) for v in loc))
++            # the patch content must match the array at the reported location
++            r, c = loc
++            np.testing.assert_array_equal(patches[0], self.image[:, r : r + 2, c : c + 2])
++        self.assertEqual(sorted(locations), [(0, 0), (0, 2), (2, 0), (2, 2)])
++
++    def test_patch_transform(self):
++        def double(patches):
++            return tuple(p * 2 for p in patches)
++
++        ds = GridPatchDataset(self.dataset, patch_size=(2, 2), transform=double, with_coordinates=False)
++        for patches in ds:
++            self.assertEqual(patches[0].shape, (1, 2, 2))
++            self.assertTrue(np.all(patches[0] % 2 == 0))
++
++    def test_transform_and_coordinates(self):
++        ds = GridPatchDataset(
++            self.dataset,
++            patch_size=(2, 2),
++            transform=lambda patches: tuple(p + 1 for p in patches),
++            with_coordinates=True,
++        )
++        for patches, loc in ds:
++            r, c = loc
++            np.testing.assert_array_equal(patches[0], self.image[:, r : r + 2, c : c + 2] + 1)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,1296 @@
+{
+  "current_specification": "# Feature: prepared SPARQL Update (`prepareUpdate`)\n\n## Goals\n- Let callers parse and translate a SPARQL Update request once with `prepareUpdate`, then apply the prepared object to a graph through `Graph.update`, repeatedly and with per-call initial bindings. This mirrors how `prepareQuery` already works for SPARQL queries.\n- Represent a parsed-and-translated update with a single container type that is the Update counterpart of the existing Query container. The container is the one value that flows from translation to evaluation.\n- Leave the existing string-based update path (`processUpdate` and the string branch of the update processor) behaviorally unchanged.\n\n## Scope\n- In scope: the `prepareUpdate` function and its export from the SPARQL plugin package; the Update container type; the return type of the update translation function; the input accepted by the update evaluation function; the update processor's handling of the container; tests for the feature.\n- Out of scope: store-level update APIs and their defaults; the signature of `Graph.update`; plugin registration; the SPARQL-endpoint update store (it accepts only strings); grammar changes; new SPARQL features.\n\n## Assumptions\n- Update parsing and translation already exist. Translation applies `base` and `initNs` through the existing prologue translation step.\n- The prologue translation step can be called with the request's parsed prologue declarations, which may be none, and still returns a Prologue object that carries `base` and `initNs`.\n- `Graph.update` first offers the request to the store's own update method. The in-memory store raises the not-implemented signal, so the request falls through to the registered SPARQL update processor.\n- Existing callers of the update translation function (for example the DAWG test runner) pass its result straight to the update evaluation function. Both sides change together, so those callers keep working.\n\n## Terminology\n- **Update container**: the object returned by the update translation function and by `prepareUpdate`. It holds a prologue and an ordered list of algebra operations.\n- **Translated prologue**: the Prologue object produced by the prologue translation step from the request's prologue data plus `base` and `initNs`. It is not the raw output of the parser.\n- **Algebra list**: the ordered list of translated update operations held by the container. Each operation keeps its own prologue reference, as it does today.\n- **Empty request**: an update string that contains no operations, either empty or consisting only of prologue declarations.\n- **Prepared update**: an Update container returned by `prepareUpdate`.\n\n## Workflows\n1. **Prepare**: the caller calls `prepareUpdate` with the update string, an initial namespace mapping (default empty), and an optional base IRI (default none). The function parses the string, translates the parse result with the update translation function using the base and namespaces, records the original arguments on the result the same way `prepareQuery` does, and returns the Update container. An empty request still produces an Update container, whose algebra list is empty.\n2. **Apply through a graph**: the caller calls `Graph.update` with the prepared object and optional initial bindings. The graph offers it to the store (which declines for memory stores), then to the registered SPARQL update processor. That processor passes the container unchanged to the update evaluation function, which iterates the container's algebra list and executes each operation in order, with initial bindings converted to variables.\n3. **Direct evaluation**: the caller passes a prepared update directly to the update evaluation function together with a graph and optional initial bindings. It runs the same operations as step 2.\n4. **String path (unchanged)**: when the processor receives a string, it parses and translates it into an Update container and then evaluates it. Behavior is identical to the current string path, which does not forward the base IRI on this path.\n5. **Reuse**: evaluating a prepared update never mutates the container or its algebra list. The same prepared update may be applied to several graphs, or several times to one graph.\n6. **Empty request**: translating an empty request yields a container with an empty algebra list. Evaluating that container performs no operations and completes without error, so `Graph.update` and `processUpdate` on an empty update string leave the graph unchanged, as they did before this feature.\n\n## Data model\n- The Update container has exactly two attributes:\n  - `prologue`: a Prologue object (same kind of object as `Query.prologue`), which carries the base IRI and the namespace bindings from `initNs`. For a non-empty request it is the prologue the translation step ends with. For an empty request it is the Prologue object that the same prologue translation step produces from the request's parsed prologue declarations (which may be none), together with `base` and `initNs`. A request consisting only of declarations therefore keeps its PREFIX and BASE entries in `prologue`, even though it has no operations.\n  - `algebra`: the ordered list of translated operations, in request order. It is an empty list for an empty request.\n- The container's prologue must never be the raw parser output for the prologue.\n- Each operation in the algebra list keeps its own prologue attribute, as today.\n- The container is read-only during evaluation.\n\n## API contracts\n- `prepareUpdate`: inputs are the update string, an initial namespace mapping (default empty), and a base IRI (default none). Output is an Update container. The result carries the original-arguments record exactly as `prepareQuery` does. Parse and translation errors propagate unchanged.\n- Update translation function: it always returns an Update container, on every path. For a request that contains operations, the container holds the translated prologue and the algebra list. For an empty request, the container holds a Prologue object built from the request's parsed declarations (if any), `base`, and `initNs`, together with an empty algebra list. The function must not return a bare list on any path, because the evaluation function reads the algebra attribute of its input.\n- Update container constructor: takes the prologue first, then the algebra list, and stores both as attributes. The shape mirrors the Query container.\n- Update evaluation function: its input is an Update container. It iterates the container's `algebra` list, not the container object itself. It accepts the same initial-bindings mapping as today. Per-operation behavior (including the silent flag and re-raising errors) is unchanged. An empty algebra list means no operations are run and no error is raised.\n- Update processor's update method: a string input is translated and then evaluated. An Update container input is passed unchanged to the evaluation function. The processor does not unwrap the container itself.\n- Package export: `prepareUpdate` is exported from the SPARQL plugin package alongside `prepareQuery`.\n- The processing function for update strings (`processUpdate`) keeps its existing parameters and behavior.\n\n## Module architecture\n- The Update container class is defined in the SPARQL types module, beside the Query container.\n- `prepareUpdate` is defined in the processor module, beside `prepareQuery`. It calls the update translation function directly on the parse result, mirroring the way `prepareQuery` calls the query translation function. It must not wrap or re-package a list returned by translation, and it must not add any extra branch for empty requests.\n- The translation layer produces the container. The prologue comes from the translation step.\n- The evaluation function is the single place that unwraps the container. The processor passes the container through. No other layer adds unwrapping, and the container must not gain an iteration shim to make a list-style loop work.\n- No parallel execution path is added. Prepared updates reach evaluation through the existing processor-to-evaluation route.\n- The store layer and the `Graph.update` method are unchanged.\n\n## Implementation constraints\n- Do not store the parser's prologue output on the container. Use the translated prologue from the translation step.\n- Translation must still apply `base` and `initNs` through the prologue translation step, on the empty-request path as well as the non-empty path. On the empty-request path that step receives the request's parsed prologue declarations, so PREFIX and BASE declarations in a declarations-only request are carried into the container. Each operation keeps its existing per-operation translation.\n- Keep the early exit for an empty request, which skips per-operation translation. The early exit must return the Update container described above, not a bare list.\n- Do not add a second accepted input type to the evaluation function.\n- Do not add third-party or new standard-library imports.\n- Change only the code this feature needs. Do not reformat or remove unrelated code. Keep the existing two blank lines between top-level definitions in the processor module, including between the update processor class and the SPARQL processor class.\n- Format new and changed code to the repository's black configuration (line length 88).\n\n## Dependencies\n- The translation module imports the Update name from the SPARQL types module, alongside the names it already imports from there, because it constructs the container.\n- The evaluation module does not import the Update name. It reads attributes only, so an import there would be unused.\n- The processor module must not import the Update name. `prepareUpdate` does not name the type, so an import there would be unused. Its prepare function may omit a return annotation.\n- The SPARQL types module gains no new imports, so no import cycle is introduced.\n- No new plugin or entry-point registration is needed.\n\n## Naming\n- Use `prepareUpdate` and `Update`, mirroring `prepareQuery` and `Query`.\n- Use the attribute names `prologue` and `algebra`, matching the Query container.\n\n## Error handling\n- Parse and translation failures raised by `prepareUpdate` propagate unchanged, the same as on the string path. No new error type is introduced.\n- An empty request is not an error. Translating it and evaluating the result must not raise. An attribute error or similar failure on an empty update is a defect in the early-return path, not an accepted behavior.\n- The evaluation function keeps its current error handling: an operation's failure is re-raised unless the operation is marked silent.\n- Passing a value that is not an Update container to the evaluation function is not a supported input. Do not add a fallback that silently accepts it.\n\n## Documentation\n- `prepareUpdate` and the Update container each get a short docstring in the style of `prepareQuery` and `Query`.\n- The evaluation function's docstring states that it takes an Update container.\n- The update translation function's docstring must describe the Update container it returns on every path. It must not describe a list return.\n- Do not add inline comments that merely restate the code.\n\n## Compatibility\n- The string update path and `processUpdate` produce the same results as before. An empty or prologue-only update string remains a silent no-op through `processUpdate` and `Graph.update`.\n- Code that calls the update translation function and passes the result to the evaluation function keeps working, because both sides now use the container.\n- The SPARQL-endpoint update store accepts only strings. Prepared updates are not supported there, which is not a regression.\n\n## Behavioral acceptance criteria\n- A prepared INSERT DATA update applied with `Graph.update` inserts its triples. Inserting two triples yields a graph of length two.\n- The same prepared update applied to a second graph produces the same result. Applying it twice to one graph is idempotent for INSERT DATA.\n- Prefixes given through `initNs` at prepare time resolve inside the update.\n- Initial bindings passed to `Graph.update` are visible to the operations.\n- Passing a prepared update directly to the evaluation function with a graph applies it without error. It must not raise a \"not iterable\" error.\n- A non-empty request translated by the translation function returns an Update container. Its `prologue` is a Prologue object. Its `algebra` has one entry per operation, in request order.\n- An empty update string, given to `Graph.update` or `processUpdate`, completes without error and leaves the graph unchanged.\n- Translating an empty request returns an Update container whose `prologue` is a Prologue object and whose `algebra` is empty. Evaluating that container does not raise.\n- The string path gives the same results as before.\n\n## Test requirements\n- Add a new test module under `test/` for prepared updates. It must cover: prepare then apply through `Graph.update`; reuse across two graphs and repeated application; `initNs` prefix resolution; direct evaluation through the evaluation function; the container's shape (prologue type and algebra list), including an empty request; and an empty update string through `Graph.update` or `processUpdate`.\n- The no-mutation check must compare a representation of the algebra taken before evaluation against the same representation taken after evaluation. A suitable representation records, for each operation, its name and its textual form as a list of strings. Do not use a generic deep-copy utility on the algebra nodes: the parse-tree node type cannot be deep-copied by the standard copy mechanism, because its constructor requires a name, so the copy raises an error. Comparing the same object references cannot detect mutation.\n- The existing `prepareQuery` test and the DAWG update tests must still pass.\n- Use the repository's test conventions for the new module. Keep the test module free of unused imports and format it to the black line length.\n",
+  "categories": {
+    "Purpose": [
+      "Goals",
+      "Scope",
+      "Assumptions",
+      "Terminology"
+    ],
+    "Behavior": [
+      "Workflows"
+    ],
+    "Data": [
+      "Data model"
+    ],
+    "Interfaces": [
+      "API contracts"
+    ],
+    "Architecture": [
+      "Module architecture",
+      "Implementation constraints",
+      "Dependencies"
+    ],
+    "Conventions": [
+      "Naming",
+      "Validation",
+      "Error handling",
+      "Logging",
+      "Documentation"
+    ],
+    "Quality": [
+      "Performance",
+      "Security",
+      "Reliability",
+      "Usability",
+      "Maintainability"
+    ],
+    "Compatibility": [
+      "Compatibility"
+    ],
+    "Operations": [
+      "Operations"
+    ],
+    "Acceptance": [
+      "Behavioral acceptance criteria",
+      "Test requirements"
+    ]
+  },
+  "requirements": {
+    "patch_and_checks": "Patch applies to the original snapshot (no tests are run).",
+    "file_location": "Code is placed in the required existing module or component.",
+    "api_contract": "API names, visibility, parameters, types, and return contracts match requirements.",
+    "dependency_direction": "Imports and dependency directions respect existing boundaries.",
+    "extension_registration": "Required registration and interface implementation are present.",
+    "approved_dependencies": "No unapproved dependencies are introduced.",
+    "architectural_fit": "Responsibilities belong in the intended layer or component.",
+    "extension_point_adherence": "Existing extension mechanisms are used rather than a parallel path.",
+    "abstraction_integrity": "Domain, transport, persistence, and framework boundaries are preserved.",
+    "convention_fit": "Follow the repository conventions visible in the original and reference code for validation, errors, naming, logging, and tests.",
+    "requirement_intent": "The feature satisfies its behavioral intent and constraints."
+  },
+  "runs": [
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies=true; commands=[] (nothing executed, judged by reading only)",
+            "diff -rq base vs generated (excluding .git): only rdflib/plugins/sparql/{__init__,algebra,processor,sparql,update}.py changed, plus new test/test_sparql_prepared_update.py; no stray files",
+            "generated rdflib/plugins/sparql/algebra.py:757 new line is under 88 chars (black line-length 88 per base black.toml); the >88 lines in algebra.py are pre-existing, outside the patch hunks"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated rdflib/plugins/sparql/processor.py:29 prepareUpdate sits beside prepareQuery (processor.py:20) in the same module, as in reference processor.py:29",
+            "generated rdflib/plugins/sparql/sparql.py:413 Update container sits beside Query (sparql.py:403), matching reference sparql.py:411",
+            "generated rdflib/plugins/sparql/algebra.py:744-770 translateUpdate and update.py:279 evalUpdate stay in their original modules",
+            "generated test/test_sparql_prepared_update.py is in the repo's test/ directory"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated processor.py:29 prepareUpdate(updateString, initNs={}, base=None) has the same signature as reference processor.py:29 and mirrors prepareQuery's (queryString, initNs={}, base=None)",
+            "generated sparql.py:413-420 Update(prologue, algebra) mirrors Query's constructor, and the reference class is identical",
+            "generated algebra.py:758 and :770 translateUpdate always returns an Update container; reference algebra.py:764 does too, but reference algebra.py:752 still returns a bare list for empty requests",
+            "generated update.py:279 evalUpdate iterates update.algebra, matching reference update.py:276",
+            "processUpdate and SPARQLUpdateProcessor.update keep their signatures (processor.py:43, :63-65)"
+          ],
+          "deficiency": "None. The candidate's empty-request path returns an Update instead of a list. This is a deliberate divergence from the reference, not a contract violation: the reference's bare-list return would make evalUpdate fail on '.algebra' and make prepareUpdate('') fail when setting _original_args on a list."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated algebra.py:16 adds Update to the existing 'from rdflib.plugins.sparql.sparql import Prologue, Query, Update' line; no new import edges are introduced",
+            "generated processor.py:14-17 and update.py imports are unchanged; the test imports only public rdflib.plugins.sparql modules"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated rdflib/plugins/sparql/__init__.py:38 'from .processor import prepareQuery, prepareUpdate, processUpdate' exports prepareUpdate exactly as the reference does (reference __init__.py:38)",
+            "the sparql package has no __all__ (grep found none), so the module-level import is the registration point, the same as for prepareQuery"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "diff shows no new third-party imports, packages, or requirements changes; all new code uses existing rdflib internals (Prologue, Update, translatePrologue, evalUpdate)"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "generated sparql.py:413 holds the data container, algebra.py:744-770 holds translation, update.py:279 holds evaluation, processor.py:29-35 holds the public prepare wrapper; each responsibility stays in its existing layer, the same split as the reference",
+            "generated processor.py:33-34 reuses translateUpdate/parseUpdate rather than duplicating parsing logic"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "generated processor.py:29-35 follows the existing prepareQuery pattern (processor.py:20-26): translate then set ret._original_args = (string, initNs, base)",
+            "SPARQLUpdateProcessor.update (processor.py:52-56 base, unchanged) already passes non-string objects straight to evalUpdate, so prepared containers flow through the existing UpdateProcessor extension point with no parallel path",
+            "Graph.update (graph.py:1337 base) falls through Store.update's NotImplementedError (store.py:349-364) to the processor, as it does for strings"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Update is a plain data holder (sparql.py:413-420) with no transport, persistence, or framework coupling",
+            "evalUpdate receives the container through its existing graph/update/initBindings interface (update.py:256, :279)"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "generated processor.py:29-35 docstring 'Parse and translate a SPARQL Update' and ret._original_args mirror prepareQuery (processor.py:20-26); the Update docstring mirrors Query's (sparql.py:403-406)",
+            "generated algebra.py:748-756 keeps the file's existing style for the empty-request branch and the same translatePrologue call shape used at algebra.py:762",
+            "test/test_sparql_prepared_update.py uses unittest.TestCase, which matches the repo's common style (74 of the 141 test_* files in base/test use unittest.TestCase)"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "generated processor.py:29-35 + update.py:279 let a prepared update be applied repeatedly to different graphs (candidate test_reuse_across_graphs_and_repeated_application), and init-ns prefixes resolve at prepare time (translatePrologue, algebra.py:762)",
+            "baseline behavior for an empty update string is a no-op: base algebra.py:748-749 returns [] and evalUpdate iterates nothing. The candidate preserves this: generated algebra.py:756-758 returns Update(prologue, []) with the prologue built from declarations, and evalUpdate iterates an empty algebra",
+            "the reference (algebra.py:751-752) returns a bare list for empty requests, so processUpdate(g,'') and prepareUpdate('') would fail there (update.py:279 '.algebra'; processor.py:34 setting _original_args on a list). This is a reference regression, not a candidate failure; the candidate avoids it",
+            "no tests were run; the empty-request conclusions rest on reading the parser (Prologue is a Group(ZeroOrMore), parser.py:369) and the code paths above"
+          ],
+          "deficiency": "None."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/RDFLib__rdflib-1624/revision-03/run-00/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "test/test_sparql_prepared_update.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: \"patch_applies\": true; \"commands\": [] (no executed checks; none run per brief).",
+            "patch.diff touches rdflib/plugins/sparql/{__init__,algebra,processor,sparql,update}.py and adds test/test_sparql_prepared_update.py; all hunks apply to the base snapshot.",
+            "Reference-only test test/test_sparql_prepare.py is absent from the candidate; per brief this is not a deletion (base has no such file to delete)."
+          ],
+          "deficiency": "None for the criterion as defined (patch applies). Note: by reading, one of the candidate's own added tests (test_sparql_prepared_update.py:77-83) would fail; see requirement_intent. No execution result is asserted here."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "processor.py (generated) :29-35 prepareUpdate sits beside prepareQuery, same module as the reference (reference.diff processor hunk @@ -26).",
+            "sparql.py (generated) :413-422 Update class placed beside Query, same as reference.diff sparql.py hunk @@ -408.",
+            "algebra.py (generated) :744-766 translateUpdate change in place; update.py (generated) :274-278 evalUpdate change in place."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "processor.py (generated) :29 prepareUpdate(updateString, initNs={}, base=None) matches reference signature and prepareQuery (processor.py:20 base).",
+            "sparql.py (generated) :413-422 Update(prologue, algebra) has the same shape and attributes as Query (sparql.py:403-410 base) and the reference Update.",
+            "algebra.py (generated) :752-754 and :766 translateUpdate returns an Update, as reference.diff does; update.py (generated) :278 evalUpdate iterates update.algebra, as reference.diff does.",
+            "Non-string objects pass through graph.py:1353-1356 and processor.py:52-56 unchanged to evalUpdate."
+          ],
+          "deficiency": "None on signature or return type. The content of the returned prologue for declaration-only requests is wrong; that is recorded under requirement_intent to avoid double-counting."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "algebra.py (generated) :16 adds Update to the existing sparql.py import (Prologue, Query); no new module edges.",
+            "processor.py imports are unchanged (base processor.py:9-17)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "__init__.py (generated) :38 exports prepareUpdate next to prepareQuery, matching reference.diff __init__ hunk.",
+            "Graph.update (graph.py:1328-1356 base) and SPARQLUpdateProcessor.update (processor.py:52-56 base) route the Update object through without new registration."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No dependency added to setup or pyproject. The new test uses only stdlib unittest and rdflib (test_sparql_prepared_update.py:1-6)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Parse and translate stay in processor.py / algebra.py (processor.py:29-35, algebra.py:744-766), container in sparql.py, evaluation in update.py, mirroring the query path.",
+            "evalUpdate (update.py:278) consumes the container and does not reach into parsing."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "prepareUpdate reuses the existing translateUpdate pipeline and sets ret._original_args (processor.py:34), the same pattern as prepareQuery (processor.py:25 base).",
+            "No parallel translation or evaluation path is introduced."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Update is a plain container (sparql.py:413-422) like Query; the SPARQL layer owns it and update.py consumes it without leaking parser internals.",
+            "The Graph/store boundary is unchanged: Graph.update still delegates to the processor (graph.py:1341-1356)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Names mirror the query side: prepareUpdate \u2194 prepareQuery, Update \u2194 Query, _original_args pattern (processor.py:29-35, sparql.py:413-422).",
+            "Test style is unittest.TestCase; 73 of the base test modules use unittest.TestCase and 62 use top-level def test_ functions, so both are accepted (base/test)."
+          ],
+          "deficiency": "None material. Minor: prepareUpdate has no `-> Update` return annotation, while prepareQuery has `-> Query` (processor.py:20 base). The reference also omits it, so this is not a failure."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": false,
+          "evidence": [
+            "Core feature works by reading: the non-empty path (algebra.py:755-766) is unchanged except for the return, and prepare\u2192apply goes through graph.py:1353-1356 \u2192 processor.py:52-56 \u2192 update.py:278. Reference test shape prepareUpdate(text, initNs={}) + g.update(q, initBindings={}) is supported.",
+            "Empty request: candidate algebra.py:751-754 handles prepareUpdate(\"\") and processUpdate(\"\") without error. Reference.diff leaves `return res`, so prepareUpdate(\"\") there fails (it sets _original_args on a list). This is a candidate improvement.",
+            "Defect: algebra.py:753 calls translatePrologue(q.prologue, base, initNs) with the whole plist of per-update groups. parserutils.py:226-243 builds q.prologue as a plist of groups, and parserutils.py:82-95 unwraps each single-element token. translatePrologue (algebra.py:684-701) expects ONE group and iterates `for x in p` with `x.name == \"PrefixDecl\"` (:695-699). The group's .name resolves to \"\" (pyparsing 2.4.7 ParseResults.__getattr__, /usr/lib/python3/dist-packages/pyparsing.py:841-845), so no declaration is bound. The correct per-group call is the one used at algebra.py:755-756.",
+            "Consequence: prepareUpdate(\"PREFIX ex: <urn:ex:>\") returns a Prologue with no ex binding. The candidate's own test_declarations_only_request_keeps_prologue (test_sparql_prepared_update.py:77-83) asserts resolvePName(\"ex\",\"x\") == URIRef(\"urn:ex:x\"); by reading, Prologue.resolvePName (sparql.py ~373-377) raises \"Unknown namespace prefix : ex\". So that test would fail. Evaluation is unaffected because there are no operations, but the returned container's prologue is wrong for declaration-only requests. Reference.diff crashes on this input instead, so the candidate's behavior here is its own extension, and that extension is incorrect."
+          ],
+          "deficiency": "Empty-request branch passes q.prologue (plist of groups) to translatePrologue, which expects one group (algebra.py:753 vs 755-756 and 684-701). PREFIX/BASE declarations in a request with no operations are silently dropped, so prepared.prologue lacks them; the candidate's test at test_sparql_prepared_update.py:77-83 asserts the opposite and would fail by reading. Fix: iterate the groups, e.g. `for p in q.prologue: prologue = translatePrologue(p, base, initNs, prologue)`, or handle the empty case without changing the shared pipeline."
+        }
+      ],
+      "passed": false,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/RDFLib__rdflib-1624/revision-03/run-01/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "test/test_sparql_prepared_update.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json:2 records \"patch_applies\": true, and no executable commands were recorded.",
+            "A diff -ru of base against generated shows changes only in rdflib/plugins/sparql/{__init__,algebra,processor,sparql,update}.py plus the new test/test_sparql_prepared_update.py, and these match judge-context/patch.diff line for line. The test file text also matches the patch.",
+            "No tests were run, so this verdict rests on reading the code. Tracing the FEA-Bench test path (test/test_sparql_prepare.py::test_prepare_update) through the candidate code gives the same behaviour as the reference."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/processor.py:29-36 adds prepareUpdate next to prepareQuery (:20-26) in the same module, as the reference does (reference processor.py:29).",
+            "generated/rdflib/plugins/sparql/sparql.py:413-419 adds class Update beside class Query (:403), the same location as the reference (sparql.py:413).",
+            "generated/rdflib/plugins/sparql/update.py:279 changes the loop to iterate update.algebra, in the module that owns evalUpdate."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "prepareUpdate(updateString, initNs={}, base=None) at generated processor.py:29 has the same name, parameters, and defaults as the reference (reference processor.py:29) and as prepareQuery (processor.py:20).",
+            "Update(prologue, algebra) at sparql.py:413-419 matches the reference signature. translateUpdate returns Update on both paths (algebra.py:757 and :769), and evalUpdate consumes update.algebra (update.py:279), as in the reference.",
+            "Divergence: for an empty request the reference returns a bare list (reference algebra.py:751-752 `return res`). The candidate returns an Update with an empty algebra (algebra.py:756-757). Reading the reference, processUpdate(g, \"\") would then reach update.py:279 `update.algebra` on a list and raise AttributeError, whereas the original (base update.py loops over the list) is a no-op. The candidate keeps the original no-op. I judge this an acceptable and better alternative, not a regression. Its effect is that an empty request's return type changes from list to Update, which is consistent with the non-empty case."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated algebra.py:16 imports Update from rdflib.plugins.sparql.sparql, the same module algebra.py already imports Prologue and Query from. That keeps the existing direction.",
+            "processor.py gets no new imports; prepareUpdate reuses translateUpdate and parseUpdate, which are already imported (processor.py:14-17).",
+            "update.py mentions Update only in its docstring (update.py:272), so no new import edge is created."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/__init__.py:38 exports prepareUpdate alongside prepareQuery and processUpdate, matching reference __init__.py:38.",
+            "The sparql package has no __all__ and no star imports (grep of rdflib/plugins/sparql/*.py), so the explicit export is the only registration needed."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "The diff adds no third-party imports and does not touch setup.cfg, pyproject, or any requirements file. The new test uses only unittest plus rdflib modules that already exist."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "The container type lives in sparql.py with Query, parsing and translation stay in processor.py and algebra.py, and evaluation stays in update.py, matching the reference's responsibility split.",
+            "SPARQLUpdateProcessor.update (processor.py:61-65) is unchanged and still routes string input through translateUpdate and then evalUpdate. Graph.update (rdflib/graph.py:1353-1356) still dispatches to the processor."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "prepareUpdate (processor.py:29-36) follows the prepareQuery pattern (processor.py:20-26): parse, translate, then set ret._original_args. It is not a parallel path.",
+            "Empty-request handling reuses translatePrologue (algebra.py:756), the same helper the loop uses (algebra.py:764), rather than building a Prologue by hand."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "The parser (parser.py) is unchanged. Translation stays in algebra.py and evaluation stays in update.py. The Update container is a plain data holder with prologue and algebra attributes (sparql.py:413-419), like Query.",
+            "Store-level dispatch is unchanged: the base Store.update raises NotImplementedError (store.py:349-366), so Graph.update falls through to the processor path (graph.py:1341-1356)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Docstring and default-argument style follow prepareQuery (processor.py:30-32, 29). The `_original_args` pattern is copied exactly (processor.py:34).",
+            "The new line algebra.py:756 is 87 columns. setup.cfg:6 sets max-line-length 88, and .flake8 ignores E501. No new long lines were introduced; the long lines in algebra.py are pre-existing and outside the diff.",
+            "The test module uses unittest.TestCase (test_sparql_prepared_update.py:22). The repo has 73 unittest-style test modules and 62 pytest-function modules, so this style is acceptable. The reference used pytest functions, which is also acceptable.",
+            "Minor style note: the empty-request branch duplicates the translatePrologue call inline (algebra.py:756) instead of restructuring the loop. This is not a convention violation."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "The four requested pieces are present: an Update class (sparql.py:413), prepareUpdate in processor.py (:29), propagation of the pattern (translateUpdate returns Update at algebra.py:757 and :769, evalUpdate consumes it at update.py:279, export at __init__.py:38), and a test file.",
+            "The reference FAIL_TO_PASS path is satisfied by reading: prepareUpdate(\"INSERT DATA {...} ;\") produces an Update, and Graph.update(q) reaches SPARQLUpdateProcessor.update (processor.py:61-65) and then evalUpdate on the algebra list.",
+            "The candidate also fixes an edge the reference leaves broken: an empty or comment-only update remains a no-op (algebra.py:755-757). The candidate's own tests (test_sparql_prepared_update.py:63-80) cover this and were not executed."
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/RDFLib__rdflib-1624/revision-03/run-02/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "test/test_sparql_prepared_update.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies=true, commands=[] (no tests executed, per the experiment setup; judged by reading).",
+            "diff -rq base vs generated (excluding .git) shows exactly five modified files (sparql/__init__.py, algebra.py, processor.py, sparql.py, update.py) and one added file (test/test_sparql_prepare_update.py), matching patch.diff.",
+            "patch.diff hunks match the generated tree: processor.py:29-35 prepareUpdate, sparql.py:413-419 Update class, update.py:279 'for u in update.algebra:', algebra.py:752-767 translateUpdate, __init__.py:38 export."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "prepareUpdate is in rdflib/plugins/sparql/processor.py:29, next to prepareQuery (processor.py:20), the same module the reference uses.",
+            "Update class is in rdflib/plugins/sparql/sparql.py:413, next to Query, matching reference sparql.py:413.",
+            "translateUpdate changes stay in rdflib/plugins/sparql/algebra.py:744-767; evalUpdate change stays in update.py:279; export is in sparql/__init__.py:38 (reference has the same export on the same line)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "prepareUpdate(updateString, initNs={}, base=None) at processor.py:29 mirrors prepareQuery's signature (processor.py:20) and reference processor.py:29.",
+            "Update(prologue, algebra) at sparql.py:413-419 is identical to the reference class.",
+            "translateUpdate returns Update on both paths: algebra.py:755 (empty request) and algebra.py:767 (normal). Reference returns Update only at algebra.py:764 and returns a bare list on the empty path at reference algebra.py:751-752.",
+            "Existing callers remain compatible: processor.py:34-35 and 54-56 pass translateUpdate output straight to evalUpdate; test/test_dawg.py:240-241 calls evalUpdate on the result; test/test_dawg.py:322 passes it to pprintAlgebra, which handles a non-CompValue container without raising (algebra.py:1433-1461)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "algebra.py:16 adds Update to the existing import from rdflib.plugins.sparql.sparql, alongside Prologue and Query. No new module edges are introduced.",
+            "sparql.py defines Update without importing algebra or processor, so there is no new cycle."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "prepareUpdate is exported from rdflib/plugins/sparql/__init__.py:38, same as the reference.",
+            "Neither sparql/__init__.py nor processor.py defines __all__ (grep found none in base), so no export list needs updating.",
+            "The SPARQL update processor path (processor.py:49-56 SPARQLUpdateProcessor) is unchanged and still reaches evalUpdate."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "The only new import is the in-repo Update symbol (algebra.py:16). No third-party or new internal dependencies are added in any changed file."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Container type lives with Query in sparql.py:413, translation stays in algebra.py translateUpdate (algebra.py:744-767), evaluation in update.py evalUpdate (update.py:279), and the convenience wrapper in processor.py:29. This matches the reference's split.",
+            "update.py:272 docstring addition describes the Update input without moving any logic."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "prepareUpdate reuses the existing parseUpdate \u2192 translateUpdate pipeline (processor.py:33) and the same _original_args convention as prepareQuery (processor.py:25 vs 34), with no parallel parse path.",
+            "Graph.update reaches the new container via graph.py:1353-1356 \u2192 SPARQLUpdateProcessor.update (processor.py:61-65) \u2192 evalUpdate, unchanged."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "The layering parser \u2192 algebra \u2192 update/evaluation is preserved. Update holds only prologue and algebra (sparql.py:413-419), with no transport, storage, or framework types.",
+            "evalUpdate still consumes algebra operations and does not reach into parser or store internals beyond what the base already did (update.py:279 onward)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Naming (prepareUpdate, Update) and docstring style follow prepareQuery (processor.py:20-26) and the Query class (sparql.py:403-410).",
+            "The new test file uses plain pytest-style test functions, matching the reference's test style in test/test_sparql_prepare.py.",
+            "Minor non-blocking notes: the empty-request branch duplicates the prologue loop (algebra.py:752-755), and the 'it's update, just a list' fallback in pprintAlgebra (algebra.py:1459-1461) is now effectively unreachable for Update objects. The reference shares that fallback, and neither affects correctness."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Core intent is met: prepareUpdate returns a container with prologue and algebra (processor.py:29-35, sparql.py:413-419), and evalUpdate accepts it (update.py:279). The reference's own test cases (container shape, initNs prefixes, prologue-only declarations) are covered by the candidate's test/test_sparql_prepare_update.py.",
+            "Empty-request handling differs from the reference and is more correct. Reading the parser (parserutils ParamList/Comp merging, parser.py:1496-1499), q.request is absent for '' and the reference's early return (reference algebra.py:751-752) yields a bare list. That makes reference prepareUpdate('') fail at setattr _original_args (processor.py:33-34) and evalUpdate fail at update.py:279 (`.algebra` on a list). Base returned [] and processUpdate('') was a no-op, so the reference regresses that case. The candidate returns Update(prologue, []) at algebra.py:752-755, which keeps the no-op and is consistent with the 'container on every path' intent. I accept this as a valid extension rather than a defect.",
+            "Reference-only test/test_sparql_prepare.py is absent from the candidate; this is not a deletion, since the candidate's diff adds only its own test file."
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/RDFLib__rdflib-1624/revision-03/run-03/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "test/test_sparql_prepare_update.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies=true; no commands recorded; no tests run for this experiment",
+            "Dry-run `patch -p1 --dry-run` of patch.diff against a scratch copy of the base snapshot: checks all 6 files (rdflib/plugins/sparql/{__init__,algebra,processor,sparql,update}.py and test/test_sparql_prepare_update.py) and exits 0",
+            "generated/ also contains a .git directory that is absent from base; it is not a source change"
+          ],
+          "deficiency": "None for applying. Test pass/fail is unverified because no tests were run; no result is claimed for the candidate's test file."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/processor.py:29-35 prepareUpdate, next to prepareQuery at :20-26, matching reference/rdflib/plugins/sparql/processor.py:29-35",
+            "generated/rdflib/plugins/sparql/sparql.py:413-420 Update class, placed beside Query at :403-410 as in reference sparql.py",
+            "generated/rdflib/plugins/sparql/algebra.py:744-770 translateUpdate returns Update",
+            "generated/rdflib/plugins/sparql/update.py:256-279 evalUpdate iterates update.algebra",
+            "generated/rdflib/plugins/sparql/__init__.py:38 export of prepareUpdate"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": false,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/algebra.py:756-758: empty-request branch calls translatePrologue(q.prologue, base, initNs) with the whole q.prologue list, while the loop at :759-760 passes one group p per declaration",
+            "base/rdflib/plugins/sparql/algebra.py:695-698: translatePrologue iterates `for x in p` and tests x.name == 'Base' / 'PrefixDecl'",
+            "/usr/lib/python3/dist-packages/pyparsing.py:841-845 (pyparsing 2.4.7): ParseResults.__getattr__ returns \"\" for an unnamed lookup, so a declaration group's .name is \"\" and no binding is applied",
+            "base/rdflib/plugins/sparql/parserutils.py:216-235: Comp stores prologue as a plist of groups, one per request, so for an empty request q.prologue is [group] and the loop in translatePrologue sees the group, not its declarations",
+            "generated/rdflib/plugins/sparql/algebra.py:49-52 docstring claims the Prologue is 'built from any declarations in the request'",
+            "Candidate tests (test/test_sparql_prepare_update.py:53-58) use parseUpdate('') only, so the declarations-only case is untested"
+          ],
+          "deficiency": "For an update with declarations and no operations (e.g. `PREFIX ex: <urn:ex:>`), translateUpdate returns an Update whose .prologue lacks the declared bindings. This contradicts the candidate's own docstring at algebra.py:49-52. The correct per-declaration path is at :760. Graph results are unaffected because no operations exist, so the effect is limited to the container's prologue. The public signatures and names match the reference. The reference returns a bare list for empty requests (reference algebra.py:52-53), so it defines no prologue for that case; the candidate's Update return there is an improvement, not a violation."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/algebra.py:16 imports Update alongside Prologue and Query from rdflib.plugins.sparql.sparql, the existing direction",
+            "generated/rdflib/plugins/sparql/update.py:256-279 adds no import and uses duck typing via update.algebra, as reference update.py does",
+            "generated/rdflib/plugins/sparql/processor.py:9-17 imports unchanged"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/__init__.py:38 `from .processor import prepareQuery, prepareUpdate, processUpdate`, identical to the reference change",
+            "No new plugin, entry point, or interface is introduced, so no other registration is required"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "Patch adds no third-party dependency; the only new import is the in-repo Update symbol (algebra.py:16)",
+            "generated/test/test_sparql_prepare_update.py imports only unittest and rdflib modules (lines 1-9)"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/sparql.py:413-420: the container sits with the other parsed-and-translated types (Query)",
+            "generated/rdflib/plugins/sparql/algebra.py:744-770: translation stays in the algebra layer",
+            "generated/rdflib/plugins/sparql/processor.py:29-35: the public prepare wrapper stays in the processor layer",
+            "generated/rdflib/plugins/sparql/update.py:256-279: evaluation stays in the update layer"
+          ],
+          "deficiency": "None. The separate empty-request Prologue path at algebra.py:756-758 duplicates the loop's translation and causes the defect recorded under api_contract."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/processor.py:29-35 mirrors prepareQuery (processor.py:20-26), including the ret._original_args convention",
+            "generated/rdflib/plugins/sparql/processor.py:52-56 SPARQLUpdateProcessor.update still routes through evalUpdate, so Graph.update reaches the existing processor path (graph.py:1343-1364; store.py:349-366 raises NotImplementedError for the default store)"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/update.py:279 evaluates the container through its algebra attribute, keeping parse, translate and evaluate layers separate",
+            "No store or transport code is changed; Graph.update dispatch (graph.py:1343-1364) is unchanged",
+            "generated/rdflib/plugins/stores/sparqlstore.py:691 SPARQLStore.update asserts a string query, so a prepared Update cannot be sent to it. The reference has the same limitation, so this does not separate the two implementations."
+          ],
+          "deficiency": "None attributable to the candidate beyond the SPARQLStore limitation shared with the reference."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/processor.py:29 `prepareUpdate(...)` mirrors prepareQuery's naming, signature and docstring style (processor.py:20-26)",
+            "generated/rdflib/plugins/sparql/algebra.py:744 `-> Update` annotation matches prepareQuery's `-> Query` (processor.py:20)",
+            "generated/rdflib/plugins/sparql/sparql.py:413-420 uses the same __init__(prologue, algebra) shape as Query",
+            "test/ has 74 unittest-based test files, and generated/test/test_sparql_prepare_update.py follows that unittest style with a `__main__` guard"
+          ],
+          "deficiency": "None for conventions. The inaccurate docstring claim at algebra.py:49-52 is recorded under api_contract."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/processor.py:29-35 prepareUpdate returns a reusable container, which the candidate tests exercise via Graph.update, evalUpdate and repeated use (test/test_sparql_prepare_update.py:19-40)",
+            "generated/rdflib/plugins/sparql/update.py:279 evalUpdate accepts the container, as the reference does",
+            "generated/test/test_dawg.py:240-241 (unchanged) still passes translateUpdate output to evalUpdate, which now reads .algebra, so the existing caller keeps working",
+            "generated/rdflib/plugins/sparql/algebra.py:756-758 keeps g.update('') and processUpdate(g, '') working. The reference returns a bare list for an empty request (reference algebra.py:52-53), and reference update.py:279 then reads .algebra on it, which would fail. The candidate does not regress this case."
+          ],
+          "deficiency": "None for the required prepare, apply, reuse and initNs behavior. The declarations-only prologue loss at algebra.py:757 is an edge case recorded under api_contract and does not change graph results."
+        }
+      ],
+      "passed": false,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/RDFLib__rdflib-1624/revision-03/run-04/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "test/test_sparql_prepare_update.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json: patch_applies=true, commands=[] (no tests run, as the experiment specifies)",
+            "generated git index (6 files staged) is byte-identical to judge-context/patch.diff",
+            "rdflib/plugins/sparql/algebra.py:744-768, processor.py:29-35, sparql.py:413-420, update.py:278 read as syntactically valid Python"
+          ],
+          "deficiency": "None. Runtime behavior is unverified because no tests were run."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "rdflib/plugins/sparql/processor.py:29-35 prepareUpdate sits beside prepareQuery (processor.py:20-26)",
+            "rdflib/plugins/sparql/sparql.py:413-420 Update class sits beside Query (sparql.py:403-410)",
+            "rdflib/plugins/sparql/algebra.py:755-768 translateUpdate returns the Update container"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "rdflib/plugins/sparql/processor.py:29 prepareUpdate(updateString, initNs={}, base=None) matches the reference signature and the prepareQuery convention",
+            "rdflib/plugins/sparql/sparql.py:413-420 Update(prologue, algebra) matches reference sparql.py Update",
+            "rdflib/plugins/sparql/algebra.py:768 translateUpdate returns Update for non-empty requests, as the reference does",
+            "rdflib/plugins/sparql/update.py:278 evalUpdate iterates update.algebra, as the reference does"
+          ],
+          "deficiency": "No contract break. Minor content defect: on a prologue-only request (for example 'PREFIX ex: <...>'), algebra.py:756 passes q.prologue (a list of groups) to translatePrologue (algebra.py:684-701), which expects one group. Its x.name check then reads '' (pyparsing ParseResults.__getattr__ returns '' for missing names), so PREFIX/BASE declarations are dropped from Update.prologue. The reference returns a bare [] for that case, so no reference contract is violated, and no operations are evaluated."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "rdflib/plugins/sparql/algebra.py:16 adds Update to the existing import from rdflib.plugins.sparql.sparql, which already supplies Prologue and Query",
+            "processor.py, update.py and sparql.py add no new imports",
+            "no module-level name shadowing of Update in algebra.py or sparql.py (grep: only the class definition at sparql.py:413)"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "rdflib/plugins/sparql/__init__.py:38 exports prepareUpdate alongside prepareQuery and processUpdate",
+            "reference rdflib/plugins/sparql/__init__.py:38 makes the same export",
+            "no plugin entry point or registry change is needed for a plain function"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "no new third-party packages in the patch",
+            "test/test_prepared_update.py:1-7 imports only rdflib modules and the stdlib unittest"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "container class in sparql.py:413-420",
+            "translation in algebra.py:744-768",
+            "evaluation in update.py:278",
+            "public wrapper in processor.py:29-35",
+            "layering matches the reference diff"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "processor.py:34 sets ret._original_args, mirroring prepareQuery at processor.py:25",
+            "processor.py:52-56 SPARQLUpdateProcessor.update already routes non-string input to evalUpdate, so Graph.update accepts a prepared object (graph.py:1328-1354) without a parallel path"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Update is a plain data holder mirroring Query (sparql.py:403-420)",
+            "no transport, persistence, or framework logic is added to the SPARQL layer"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": false,
+          "evidence": [
+            "test/test_prepared_update.py:49 `g.update(prepared,initBindings={\"x\": Literal(\"unused\")})` lacks the space after the comma that black enforces (black.toml sets line-length=88; the repo uses black)",
+            "test/test_prepared_update.py:46 test_init_bindings_visible_to_operations asserts only len(g) == 1 and never checks that the bindings are visible to any operation, so the test name overstates what is verified"
+          ],
+          "deficiency": "Minor test-convention lapses: one black-formatting violation and one misleadingly named test. Source-file conventions (docstrings, _original_args, naming, error behavior) follow the repo."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "processor.py:29-35 prepareUpdate returns a reusable Update object",
+            "Graph.update -> processor.py:52-56 -> update.py:278 evaluates the prepared object without re-parsing",
+            "algebra.py:755-756 handles an empty request by returning an Update; the reference returns a bare [] there, and evalUpdate would then raise AttributeError on [].algebra, so the candidate is stronger on this path",
+            "test/test_prepared_update.py:71-76 covers the empty-request path"
+          ],
+          "deficiency": "No blocking gap. Minor: prologue-only PREFIX declarations are not kept on the returned Update.prologue (see api_contract); evaluation is unaffected because there are no operations."
+        }
+      ],
+      "passed": false,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/RDFLib__rdflib-1624/revision-03/run-05/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "test/test_prepared_update.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json: patch_applies true, commands [] (no tests executed; judged by reading per instructions)",
+            "diff -rq base vs generated (excluding .git) shows changes only in rdflib/plugins/sparql/__init__.py, algebra.py, processor.py, sparql.py, update.py and new test/test_prepared_update.py, matching patch.diff",
+            "reference-only test/test_sparql_prepare.py is absent from the candidate; that is not a deleted test because the candidate never had it"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/processor.py:29-34 prepareUpdate placed beside prepareQuery (processor.py:19-26)",
+            "generated/rdflib/plugins/sparql/sparql.py:413-418 class Update placed beside class Query, identical to reference sparql.py:413",
+            "generated/rdflib/plugins/sparql/algebra.py:744-769 translateUpdate builds the container",
+            "generated/rdflib/plugins/sparql/update.py:279 evalUpdate iterates update.algebra, same as reference update.py:276"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/processor.py:29 prepareUpdate(updateString, initNs={}, base=None) mirrors prepareQuery's signature (processor.py:19) and reference processor.py:29",
+            "generated/rdflib/plugins/sparql/sparql.py:413-418 Update(prologue, algebra) matches reference sparql.py:413",
+            "generated/rdflib/plugins/sparql/algebra.py:769 returns Update(prologue, res), matching reference algebra.py:764",
+            "generated/rdflib/plugins/sparql/algebra.py:755-757 empty request returns Update instead of list; reference keeps the list return at algebra.py:752, which breaks g.update('') (update.py:279 reads .algebra on a list). The generated choice is consistent with its own docstring (algebra.py:747-751).",
+            "Intentional return-type change shared with the reference: translateUpdate returns Update and evalUpdate no longer accepts a bare list. In-repo callers (test_dawg.py:219-241, 322) pass the return value straight through and need no change.",
+            "Non-gating edge defect: algebra.py:756 passes the whole q.prologue list to translatePrologue (signature algebra.py:684), while the loop at algebra.py:762 passes per-element p. For a prologue-only update, x.name on the group returns '' (pyparsing ParseResults.__getattr__), so PREFIX/BASE declarations are silently dropped from Update.prologue. Reference has no such branch and no effect on evaluation."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/algebra.py:16 imports Update from rdflib.plugins.sparql.sparql alongside Prologue and Query, the same direction already used",
+            "generated/rdflib/plugins/sparql/processor.py:11-17 imports unchanged; processor already depends on algebra and sparql"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/__init__.py:38 exports prepareUpdate, identical to reference __init__.py:38",
+            "No new plugin or interface is added, so no other registration is required"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No new third-party imports in any changed source file",
+            "test/test_prepared_update.py imports only rdflib modules"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Container type in sparql.py (generated sparql.py:413), translation in algebra.py (translateUpdate), evaluation in update.py (update.py:279), and the prepare wrapper in processor.py (processor.py:29), matching the reference's layering",
+            "Graph.update routing unchanged (graph.py:1337-1360)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "processor.py:33 prepareUpdate reuses the existing parseUpdate and translateUpdate, and processor.py:34 sets _original_args the same way prepareQuery does (processor.py:25)",
+            "processor.py:63-64 SPARQLUpdateProcessor.update still accepts both strings and prepared containers through the existing UpdateProcessor plugin path",
+            "memory.py:173 and memory.py:551 update overrides call super(), which raises NotImplementedError (store.py:362-363), so Graph.update falls through to the processor as before"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Update is a plain data container (sparql.py:413-418), with no store, transport or persistence concerns",
+            "evalUpdate is still the sole consumer of the algebra (update.py:279); no domain logic moved into the processor or graph layer"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "processor.py:29-32 docstring 'Parse and translate a SPARQL Update request' mirrors prepareQuery's 'Parse and translate a SPARQL Query' (processor.py:20-22)",
+            "algebra.py:744-751 docstring follows the translateQuery style ('Return a rdflib.plugins.sparql.sparql.Query object')",
+            "test/test_prepared_update.py uses the repo's pytest function style and test/ placement",
+            "Minor, not a failure: prepareUpdate omits the '-> Update' return annotation that prepareQuery has (processor.py:19); the reference omits it too"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Core behavior works by reading: Graph.update(prepared) -> store NotImplementedError (store.py:362) -> SPARQLUpdateProcessor.update (processor.py:63-64) -> evalUpdate(update.algebra) (update.py:279)",
+            "Reuse across graphs holds because evalUpdate only reads the algebra and never mutates it (update.py:279-300 loop)",
+            "initNs/base are honored through translateUpdate(parseUpdate(...), base, initNs) (processor.py:33)",
+            "Improvement over reference: reference returns a bare list for empty requests (reference algebra.py:752), so g.update('') would raise AttributeError at update.py:279; original was a no-op. Generated keeps the no-op (algebra.py:755-757).",
+            "Non-gating defect: prologue-only input loses declarations (algebra.py:756), noted under api_contract; no effect on evaluation",
+            "Debug-only regression: pprintAlgebra (algebra.py:1433-1441) prints the Update object's repr instead of its algebra; affects test_dawg.py:322-327 inside a bare try, and the reference has the same effect"
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/RDFLib__rdflib-1624/revision-03/run-06/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "test/test_prepared_update.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json: \"patch_applies\": true, \"commands\": [] (no executed commands or tests recorded)",
+            "judge-context/patch.diff is byte-identical to run-07/patch.diff"
+          ],
+          "deficiency": "None for patch applicability. No tests were executed, so the pass/fail status of test/test_sparql_prepared_update.py is unverified by execution; the findings below come from reading the code."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/processor.py:29-35 prepareUpdate, placed beside prepareQuery (processor.py:20-26)",
+            "generated/rdflib/plugins/sparql/sparql.py:413-420 Update class, placed beside Query (sparql.py:403-410)",
+            "generated/rdflib/plugins/sparql/algebra.py:744-765 translateUpdate (the translation layer)",
+            "generated/rdflib/plugins/sparql/update.py:274-278 evalUpdate docstring and loop",
+            "generated/rdflib/plugins/sparql/__init__.py:38 export of prepareUpdate",
+            "generated/test/test_sparql_prepared_update.py:1-91 new test module under test/"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/processor.py:29 prepareUpdate(updateString, initNs={}, base=None) matches prepareQuery's parameter shape (processor.py:20)",
+            "generated/rdflib/plugins/sparql/sparql.py:413-420 Update(prologue, algebra) stores both as attributes, mirroring Query (sparql.py:408-410)",
+            "generated/rdflib/plugins/sparql/algebra.py:752-753 and :765 return an Update on both the empty and non-empty paths",
+            "generated/rdflib/plugins/sparql/update.py:278 evalUpdate signature unchanged; it iterates update.algebra"
+          ],
+          "deficiency": "None on names, signatures, and return types. The declaration content of the empty-request prologue is a requirement_intent defect, not an API-shape defect, so it is recorded under requirement_intent."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/algebra.py:16 imports Update from rdflib.plugins.sparql.sparql alongside Prologue and Query, an existing edge",
+            "generated/rdflib/plugins/sparql/processor.py:9-17 imports unchanged; processor does not import Update",
+            "generated/rdflib/plugins/sparql/update.py:7-10 imports unchanged; evaluation does not import Update",
+            "sparql.py diff hunk is @@ -408,3 +408,13 @@ with no new imports"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/__init__.py:38 from .processor import prepareQuery, prepareUpdate, processUpdate",
+            "base rdflib/plugins/sparql/__init__.py defines no __all__, so the new name is exposed through the existing import",
+            "processor.py:48-56 SPARQLUpdateProcessor remains the registered update processor and passes the container through unchanged; the spec requires no new plugin registration"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "The patch adds no third-party or standard-library imports (diff inspection of algebra.py:16, __init__.py:38)",
+            "test/test_sparql_prepared_update.py:1-7 imports only rdflib modules"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Translation produces the container: generated/rdflib/plugins/sparql/algebra.py:753 and :765",
+            "Evaluation is the single unwrap point: generated/rdflib/plugins/sparql/update.py:278 for u in update.algebra",
+            "The processor passes the container through unchanged: processor.py:52-56 (string branch translates, then evalUpdate on the result)",
+            "prepareUpdate calls translateUpdate and parseUpdate directly on the parse result (processor.py:33), mirroring prepareQuery (processor.py:24)"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "processor.py:34 records ret._original_args = (updateString, initNs, base), the same record prepareQuery uses (processor.py:25)",
+            "Graph.update (rdflib/graph.py:1341-1356 in base, unchanged) reaches the existing SPARQLUpdateProcessor.update (processor.py:52-56) for a non-string argument; no parallel evaluation path was added"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "The container holds translated prologue objects from translatePrologue (algebra.py:753 and :765), not raw parser output",
+            "No store or Graph code changes; the diff touches only the rdflib/plugins/sparql package",
+            "update.py:278 reads attributes only and has no Update import"
+          ],
+          "deficiency": "None. The empty-request path hands the parser's declaration list to the translation step (algebra.py:753), which is that step's designed input, so no boundary is crossed. The defect is one of correctness and is recorded under requirement_intent."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "processor.py:30-32 prepareUpdate docstring follows the one-line style of prepareQuery (processor.py:21-23)",
+            "sparql.py:414-417 Update docstring follows the Query docstring style (sparql.py:404-406)",
+            "update.py:274-275 documents that the argument is an Update container",
+            "Added lines are all within 88 columns (checked with awk over patch.diff); no inline comments that restate code",
+            "test_sparql_prepared_update.py uses the repository's plain-function pytest style (lines 19-91)"
+          ],
+          "deficiency": "None. Minor and not a failure: prepareUpdate omits the -> Update return annotation that prepareQuery carries (processor.py:20); the spec explicitly permits this."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": false,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/algebra.py:752-753 empty-request early exit: return Update(translatePrologue(q.prologue, base, initNs), res)",
+            "rdflib/plugins/sparql/parserutils.py:232-236: an isList param appends one token list per occurrence, so q.prologue is a list with one declaration group per update segment (parser.py:1498-1499 grammar: Update <<= ParamList(\"prologue\", Prologue) + ...)",
+            "tasks/.../base rdflib/plugins/sparql/algebra.py:695-699: translatePrologue iterates `for x in p` and tests x.name against \"Base\" and \"PrefixDecl\"; given the outer list, x is a whole declaration group, so x.name is \"\" (pyparsing ParseResults.__getattr__ default; see pip-vendored results.py:418-424 on this machine) and the declarations are skipped silently",
+            "revision-03/specification.md, Data model and Implementation constraints: declaration-only requests must keep PREFIX and BASE in prologue",
+            "generated/test/test_sparql_prepared_update.py:67-76 and :87-91 exercise only the empty string \"\", never a declaration-only request",
+            "Positive evidence: empty-string no-op is preserved (algebra.py:752-753; update.py:278 over []), and the other acceptance behaviors are covered by test_sparql_prepared_update.py:19-64"
+          ],
+          "deficiency": "Declaration-only requests (e.g. \"PREFIX ex: <...>\" or \"BASE <...>\" with no operations) do not carry their declarations into Update.prologue. The spec requires this (Data model; Implementation constraints). The cause is algebra.py:753 passing the whole q.prologue list instead of a single declaration group to translatePrologue. Empty-string requests are unaffected because their one group is empty. The candidate's tests do not cover this case. The reference does not meet this requirement either: it returns a bare list at algebra.py:751-752, so it fails by raising, not by dropping declarations. Context: the reference also breaks Graph.update(\"\") and processUpdate(g, \"\") (its update.py:276 indexes update.algebra on the empty list), a regression against base that the candidate avoids. This finding comes from code reading only; nothing was executed."
+        }
+      ],
+      "passed": false,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/RDFLib__rdflib-1624/revision-03/run-07/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "test/test_sparql_prepared_update.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies is true, commands is empty, and no execution results are recorded (no tests were run per the experiment setup).",
+            "The generated rdflib source diffs for __init__.py, algebra.py, processor.py, sparql.py and update.py match the patch.diff hunks line-for-line (checked by diffing each file against the original base).",
+            "patch.diff adds test/test_sparql_prepare_update.py (new file, 83 lines); the reference-only test/test_sparql_prepare.py is absent from the candidate, which is a reference-only test, not a deletion."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/processor.py:29 defines prepareUpdate beside prepareQuery, the same module and location as the reference.",
+            "generated/rdflib/plugins/sparql/sparql.py:413 defines class Update beside class Query (sparql.py:403), matching the reference.",
+            "generated/rdflib/plugins/sparql/algebra.py:744-769 holds translateUpdate, and generated/rdflib/plugins/sparql/update.py:277 holds the evalUpdate loop; both are in the same modules as the original."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "processor.py:29 prepareUpdate(updateString, initNs={}, base=None) has the same signature as prepareQuery (original processor.py:20) and the reference prepareUpdate.",
+            "sparql.py:413-419 Update(prologue, algebra) stores .prologue and .algebra, matching the reference container.",
+            "algebra.py:744-769 translateUpdate now returns Update(prologue, res) on both the empty path (line 757) and the normal path (line 769), matching the reference contract for non-empty requests.",
+            "update.py:277 evalUpdate iterates update.algebra, and processor.py:65 SPARQLUpdateProcessor.update passes the container through unchanged.",
+            "Non-blocking: the change of translateUpdate from list to Update breaks any caller that iterates its result as a list. test/test_dawg.py:241 and :322 are the only in-repo callers and still work (evalUpdate accepts the container; pprintAlgebra prints the raw list instead of per-op output, algebra.py:1433-1456). The reference makes the same change."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "algebra.py:16 adds Update to the existing 'from rdflib.plugins.sparql.sparql import Prologue, Query, Update' line; no new import edges are introduced.",
+            "processor.py imports (lines 1-17 in the original) are unchanged; prepareUpdate reuses the already-imported translateUpdate and parseUpdate."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated/rdflib/plugins/sparql/__init__.py:38 exports prepareUpdate alongside prepareQuery, so 'from rdflib.plugins.sparql import prepareUpdate' resolves (test file line 2).",
+            "The reference performs the same export (reference __init__.py:38), so no additional plugin or entry-point registration is required by the reference."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "The patch adds no new third-party packages or imports outside rdflib.plugins.sparql and the existing test imports (rdflib, pytest-style functions).",
+            "No requirements files are changed in the generated diff."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "The container type lives in sparql.py next to Query (sparql.py:403-419), matching the reference placement.",
+            "Translation stays in algebra.py (translateUpdate, 744-769), evaluation stays in update.py (277), and the public wrapper lives in processor.py (29-36) next to prepareQuery, matching the reference architecture."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "processor.py:29-36 prepareUpdate sets ret._original_args = (updateString, initNs, base), mirroring prepareQuery (original processor.py:20-27).",
+            "graph.py:1328-1356 Graph.update passes the Update object to processor.update; the stores' update (store.py:349-362, memory.py:173 and :551) raise NotImplementedError, which graph.py catches before falling through to the UpdateProcessor, so a prepared Update reaches SPARQLUpdateProcessor.update (processor.py:61-65) without any parallel path.",
+            "The existing UpdateProcessor plugin contract is unchanged."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Parsing (parseUpdate), translation (translateUpdate) and evaluation (evalUpdate) keep their original layers; prepareUpdate composes them without leaking evaluation logic into the algebra or parser.",
+            "The Update container holds only prologue and algebra data and has no graph or store dependency."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "prepareUpdate docstring and _original_args follow prepareQuery's convention; Update's docstring mirrors Query's ('A parsed and translated update').",
+            "The candidate test file uses module-level pytest-style test functions, as the reference test does (reference test/test_sparql_prepare.py).",
+            "Non-blocking: pprintAlgebra (algebra.py:1433-1456) now prints an update container's raw list (pp(q.algebra) falls through to print(p)) instead of the original per-operation pretty-print; the reference has this same behavior, so it is not counted as a candidate-specific failure."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "A prepared update is reusable: g.update(prepared) and evalUpdate(g, prepared) both reach evalUpdate over update.algebra (processor.py:61-65, update.py:277).",
+            "Empty requests: generated algebra.py:755-757 returns Update(translatePrologue(q.prologue[0], base, initNs), []), so g.update('') and processUpdate(g, '') remain no-ops, matching the original (original algebra.py:751-752 returned [] and evalUpdate iterated nothing).",
+            "Difference from the reference, not a failure: reference algebra.py:751-752 still returns a bare list for empty requests, which makes evalUpdate fail with AttributeError on update.algebra, so the reference regresses empty-update behavior that the candidate preserves.",
+            "Assumption from reading parserutils.py (ParamValue/Comp), not from execution: for an empty request q.prologue has one (empty) group, so q.prologue[0] is valid."
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/RDFLib__rdflib-1624/revision-03/run-08/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "test/test_sparql_prepare_update.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json:2 records \"patch_applies\": true",
+            "diff -rq of base vs generated shows only the five sparql modules (__init__.py, algebra.py, processor.py, sparql.py, update.py) plus the new test/test_sparql_prepared_update.py; no files removed",
+            "Generated hunks match patch.diff line-for-line (e.g. algebra.py:755-757, processor.py:29-36, sparql.py:413-420, update.py:279)",
+            "No tests were executed per the experiment setup; this verdict is from static reading only"
+          ],
+          "deficiency": "None. Runtime correctness is unverified because no tests were run."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "rdflib/plugins/sparql/sparql.py:413-420 defines Update next to Query, the existing container type",
+            "rdflib/plugins/sparql/processor.py:29-36 defines prepareUpdate beside prepareQuery",
+            "rdflib/plugins/sparql/algebra.py:744-769 holds the translateUpdate change",
+            "rdflib/plugins/sparql/update.py:279 changes evalUpdate to iterate update.algebra"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "processor.py:29 prepareUpdate(updateString, initNs={}, base=None) matches the reference signature (reference diff processor.py hunk) and prepareQuery at processor.py:20",
+            "sparql.py:418-420 Update(prologue, algebra) matches reference sparql.py:71-73",
+            "algebra.py:757 returns an Update for empty requests; the reference returns a list at reference algebra.py:751-752. The generated behaviour is a superset: the reference list return makes evalUpdate fail on .algebra, while the original accepted g.update(\"\")."
+          ],
+          "deficiency": "None. The empty-request return differs from the reference, but the generated choice is the valid one and fixes a reference regression."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "algebra.py:16 imports Update from rdflib.plugins.sparql.sparql alongside the existing Query import, so no new module edge is introduced",
+            "processor.py import block is unchanged apart from existing names"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "rdflib/plugins/sparql/__init__.py:38 exports prepareUpdate via from .processor import prepareQuery, prepareUpdate, processUpdate, matching the reference export",
+            "grep for __all__ in base sparql/__init__.py and processor.py found none, so the import is the full registration"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "The only new names are internal rdflib.plugins.sparql symbols (Update, prepareUpdate); no third-party or new package imports appear in the patch"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Container type in sparql.py:413, translation in algebra.py:744, preparation in processor.py:29, and evaluation in update.py:279, the same layering as the reference",
+            "No parsing or evaluation logic was moved across layers"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "processor.py:29-36 prepareUpdate mirrors prepareQuery (processor.py:20-26 in base), including the _original_args pattern",
+            "processor.py:52-56 SPARQLUpdateProcessor.update is reused unchanged and now receives the Update container, so no parallel path is added"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "No transport, persistence or store code is modified; Graph.update (rdflib/graph.py:1338-1361) still dispatches through the same UpdateProcessor path as the reference",
+            "rdflib/plugins/sparql/update.py:279 consumes only the Update container's algebra, leaving the store boundary intact"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "prepareUpdate uses the camelCase naming and docstring style of prepareQuery (processor.py:20-26)",
+            "test/test_sparql_prepared_update.py uses pytest-style module-level test_ functions, as the repository does",
+            "Minor nit: algebra.py:756-757 re-calls translatePrologue for the empty branch instead of reusing the loop; this is not a convention violation"
+          ],
+          "deficiency": "None blocking. Minor nit noted at algebra.py:756-757."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "A prepared Update is accepted by Graph.update (graph.py:1338-1361 to processor.py:52-56) and by evalUpdate, the same read path as the reference",
+            "The candidate also covers empty and declarations-only requests, which the reference handles incorrectly (reference algebra.py:751-752 with update.py:279)",
+            "test/test_sparql_prepared_update.py:48-52 (test_prepared_update_uses_init_bindings) depends on evalModify with an empty WHERE clause; I did not trace that path, so it is unverified",
+            "No existing test was deleted; the reference-only test/test_sparql_prepare.py is absent from the candidate, but it is not a deletion because the original snapshot did not contain it"
+          ],
+          "deficiency": "None blocking. The init-bindings test is unverified because no tests were run."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/RDFLib__rdflib-1624/revision-03/run-09/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "test/test_sparql_prepared_update.py"
+        ],
+        "api_inspection": []
+      }
+    }
+  ]
+}

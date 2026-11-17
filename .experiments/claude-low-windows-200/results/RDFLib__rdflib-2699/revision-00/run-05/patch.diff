@@ -1,0 +1,198 @@
+diff --git a/rdflib/paths.py b/rdflib/paths.py
+index 6d70ee1..f677d32 100644
+--- a/rdflib/paths.py
++++ b/rdflib/paths.py
+@@ -588,6 +588,75 @@ def neg_path(p: Union[URIRef, AlternativePath, InvPath]) -> NegatedPath:
+     return NegatedPath(p)
+ 
+ 
++def shacl_path(graph: Graph, node: Node) -> Union[URIRef, Path]:
++    """
++    Convert a SHACL property path (the object of a ``sh:path`` triple) into
++    an RDFLib-friendly object.
++
++    A ``URIRef`` is returned when the path is a simple predicate, and a
++    :class:`Path` is returned for complex paths such as
++    ``[sh:inversePath skos:broader]``.
++
++    >>> from rdflib import BNode, Graph
++    >>> from rdflib.namespace import SH, SKOS
++    >>> g = Graph()
++    >>> p = BNode()
++    >>> g.add((p, SH.inversePath, SKOS.broader))
++    <Graph identifier=... (<class 'rdflib.graph.Graph'>)>
++    >>> shacl_path(g, p)
++    Path(~http://www.w3.org/2004/02/skos/core#broader)
++
++    :param graph: The graph containing the SHACL path description.
++    :param node: The node that is the value of ``sh:path``.
++    :raises ValueError: If the node is not a valid SHACL path.
++    """
++    # Imported here to avoid circular imports.
++    from rdflib.collection import Collection
++    from rdflib.namespace import RDF, SH
++
++    if isinstance(node, URIRef):
++        return node
++
++    def _single(predicate: URIRef) -> Optional[Node]:
++        values = list(graph.objects(node, predicate))
++        if len(values) > 1:
++            raise ValueError(f"SHACL path {node!r} has multiple {predicate} values")
++        return values[0] if values else None
++
++    def _list_items(head: Node) -> List[Union[URIRef, Path]]:
++        if head != RDF.nil and (head, RDF.first, None) not in graph:
++            raise ValueError(f"Expected an RDF list for SHACL path element {head!r}")
++        return [shacl_path(graph, item) for item in Collection(graph, head)]
++
++    # Exactly one path-type property must describe a complex path node.
++    kinds = [
++        (SH.inversePath, "inverse"),
++        (SH.alternativePath, "alternative"),
++        (SH.zeroOrMorePath, ZeroOrMore),
++        (SH.oneOrMorePath, OneOrMore),
++        (SH.zeroOrOnePath, ZeroOrOne),
++    ]
++    present = [(pred, kind) for pred, kind in kinds if _single(pred) is not None]
++
++    if len(present) > 1:
++        raise ValueError(f"SHACL path {node!r} has more than one path type")
++
++    if present:
++        pred, kind = present[0]
++        value = _single(pred)
++        assert value is not None
++        if kind == "inverse":
++            return InvPath(shacl_path(graph, value))
++        if kind == "alternative":
++            return AlternativePath(*_list_items(value))
++        return MulPath(shacl_path(graph, value), kind)
++
++    if (node, RDF.first, None) in graph:
++        return SequencePath(*_list_items(node))
++
++    raise ValueError(f"Invalid SHACL path: {node!r}")
++
++
+ if __name__ == "__main__":
+     pass
+ else:
+diff --git a/test/test_path.py b/test/test_path.py
+index 1af0227..60ac462 100644
+--- a/test/test_path.py
++++ b/test/test_path.py
+@@ -5,8 +5,8 @@ from typing import Union
+ 
+ import pytest
+ 
+-from rdflib import RDF, RDFS, Graph, URIRef
+-from rdflib.namespace import DCAT, DCTERMS
++from rdflib import RDF, RDFS, Graph, Namespace, URIRef
++from rdflib.namespace import DCAT, DCTERMS, SH, SKOS
+ from rdflib.paths import (
+     AlternativePath,
+     InvPath,
+@@ -17,10 +17,12 @@ from rdflib.paths import (
+     SequencePath,
+     ZeroOrMore,
+     ZeroOrOne,
++    shacl_path,
+ )
+ 
+ g = Graph()
+ nsm = g.namespace_manager
++EX = Namespace("http://example.org/")
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -142,3 +144,89 @@ def test_hash(lhs: Path, rhs: Path) -> None:
+ def test_dict_key(insert_path: Path, check_path: Path) -> None:
+     d = {insert_path: "foo"}
+     assert d[check_path] == "foo"
++
++
++SHACL_PREFIXES = """
++@prefix sh: <http://www.w3.org/ns/shacl#> .
++@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
++@prefix ex: <http://example.org/> .
++"""
++
++
++@pytest.mark.parametrize(
++    ["turtle", "expected"],
++    [
++        ("ex:shape sh:path skos:broader .", SKOS.broader),
++        ("ex:shape sh:path [ sh:inversePath skos:broader ] .", ~SKOS.broader),
++        (
++            "ex:shape sh:path ( skos:broader skos:narrower ) .",
++            SequencePath(SKOS.broader, SKOS.narrower),
++        ),
++        (
++            "ex:shape sh:path [ sh:alternativePath ( skos:broader skos:narrower ) ] .",
++            AlternativePath(SKOS.broader, SKOS.narrower),
++        ),
++        (
++            "ex:shape sh:path [ sh:zeroOrMorePath skos:broader ] .",
++            MulPath(SKOS.broader, ZeroOrMore),
++        ),
++        (
++            "ex:shape sh:path [ sh:oneOrMorePath skos:broader ] .",
++            MulPath(SKOS.broader, OneOrMore),
++        ),
++        (
++            "ex:shape sh:path [ sh:zeroOrOnePath skos:broader ] .",
++            MulPath(SKOS.broader, ZeroOrOne),
++        ),
++        (
++            "ex:shape sh:path ( [ sh:inversePath skos:broader ] skos:narrower ) .",
++            SequencePath(~SKOS.broader, SKOS.narrower),
++        ),
++        (
++            "ex:shape sh:path [ sh:alternativePath ( skos:broader"
++            " [ sh:oneOrMorePath skos:narrower ] ) ] .",
++            AlternativePath(SKOS.broader, MulPath(SKOS.narrower, OneOrMore)),
++        ),
++    ],
++)
++def test_shacl_path(turtle: str, expected: Union[URIRef, Path]) -> None:
++    g = Graph()
++    g.parse(data=SHACL_PREFIXES + turtle, format="turtle")
++    node = g.value(EX.shape, SH.path)
++    assert node is not None
++    result = shacl_path(g, node)
++    assert result == expected
++    assert type(result) is type(expected)
++
++
++def test_shacl_path_usable_with_graph_methods() -> None:
++    g = Graph()
++    g.parse(
++        data=SHACL_PREFIXES
++        + """
++        ex:shape sh:path [ sh:zeroOrMorePath skos:broader ] .
++        ex:a skos:broader ex:b .
++        ex:b skos:broader ex:c .
++        """,
++        format="turtle",
++    )
++    path = shacl_path(g, g.value(EX.shape, SH.path))
++    assert path == MulPath(SKOS.broader, ZeroOrMore)
++    assert set(g.objects(EX.a, path)) == {EX.a, EX.b, EX.c}
++
++
++@pytest.mark.parametrize(
++    "turtle",
++    [
++        "ex:shape sh:path [ sh:inversePath skos:broader ; sh:zeroOrMorePath skos:narrower ] .",
++        "ex:shape sh:path [ ex:unknown skos:broader ] .",
++        "ex:shape sh:path [ sh:inversePath skos:broader , skos:narrower ] .",
++        "ex:shape sh:path [ sh:alternativePath skos:broader ] .",
++    ],
++)
++def test_shacl_path_invalid(turtle: str) -> None:
++    g = Graph()
++    g.parse(data=SHACL_PREFIXES + turtle, format="turtle")
++    node = g.value(EX.shape, SH.path)
++    with pytest.raises(ValueError):
++        shacl_path(g, node)

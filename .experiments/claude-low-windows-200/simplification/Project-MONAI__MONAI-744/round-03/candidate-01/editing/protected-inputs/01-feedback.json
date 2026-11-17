@@ -1,0 +1,1323 @@
+{
+  "current_specification": "# Generalized Wasserstein Dice Loss\n\n## Goals\n- Add GeneralizedWassersteinDiceLoss to MONAI's losses package. It is a Dice-type overlap loss that discounts each voxel's true-positive contribution by a Wasserstein distance between the predicted class distribution and the ground-truth label, using a class-distance matrix. Class weights follow generalized Dice (inverse volume).\n- Usage matches existing segmentation losses: raw logits in, integer class-index label maps as targets, scalar loss out.\n- Export the class from the losses package and define a lowercase alias in the dice module.\n\n## Scope\nIn scope:\n- One new class in the dice module, placed after the existing generalized Dice class.\n- Two new imports in the dice module: numpy and the torch functional module.\n- The package export in the losses package initializer.\n- The lowercase module-level alias.\n- One new unit test module.\n\nOut of scope:\n- Any change to existing loss classes, the LossReduction enum, or shared utilities.\n- Weight-type, masking, sigmoid, softmax, or one-hot option flags on the new class.\n- Sphinx pages under docs/source. Code docstrings are in scope.\n- New third-party packages.\n\n## Assumptions\n- Input is a floating-point logits tensor shaped batch, classes, then zero or more spatial dimensions.\n- Input and target both carry a leading batch axis, with matching batch sizes. Unbatched label maps are outside the contract; do not accept, reshape, or work around them.\n- Target is an integer class-index tensor shaped batch plus spatial dimensions, or batch, 1, spatial dimensions. Both forms are accepted.\n- The distance matrix is square, C by C, where C is the input channel count. Entries are nonnegative. It is a 2D torch tensor or 2D numpy array.\n- Label values lie in 0 to C minus 1. The reference does not check this.\n\n## Terminology\n- Distance matrix M: the C by C class-distance matrix after optional max normalization.\n- Wasserstein distance map W_s(v): for sample s and voxel v with ground-truth label y_s(v), the sum over classes k of M[y_s(v), k] times p_k,s(v), where p_k,s(v) is the softmax probability of class k at that voxel. Computed for every sample.\n- Volume V(b, c): the number of voxels in sample b whose label is c.\n- Class weight alpha(b, c): 1 divided by (V(b, c) + 1). A class absent from a sample has weight 1.\n- Generalized true positives TP_b: for each sample b, the sum over every sample index s in the batch and every voxel v of alpha(b, y_b(v)) times (1 minus W_s(v)). The weight uses sample b's own labels and volumes; the distance term comes from every sample s. This cross-sample coupling is the reference behavior. For a batch of one, s ranges over sample b only.\n- Denominator D_b: the same sum with (2 minus W_s(v)) in place of (1 minus W_s(v)), with the same cross-sample coupling.\n\n## Workflows\nConstruction:\n1. Pass reduction to the parent loss initializer through the shared LossReduction conversion, so the stored value is the enum's string value. Invalid reduction values fail here, before the matrix check.\n2. Check that the matrix is square; otherwise raise an error (see Error handling).\n3. If the matrix is a numpy array, convert it to a torch tensor.\n4. If the maximum entry is not exactly 1, divide the whole matrix by its maximum.\n5. Store the normalized matrix as m and its size as num_classes.\n\nForward (input, target, smooth with default 1e-5):\n1. Flatten the input to batch by classes by N, where N is the product of the spatial sizes. Flatten the target to batch by N, accepting both target shapes.\n2. Apply softmax over the class dimension. Input is always treated as logits.\n3. Compute W for every sample and voxel using m, moved to the probabilities' device at call time. The result has shape batch by N.\n4. Compute alpha from per-sample class counts. Classes with zero voxels receive weight 1, not a sentinel value.\n5. Compute TP_b and D_b for each sample b with the cross-sample rule: take b's per-voxel alpha map from its own labels, pair it with the distance maps of all samples s, form the product with (1 minus W) for TP or (2 minus W) for D over the (b, s, voxel) combinations, and sum over s and voxel. This gives one value per sample.\n6. For each sample b, compute the score (2 times TP_b plus smooth) divided by (D_b plus smooth). The per-sample loss is 1 minus that score.\n7. Return the mean of the per-sample losses as a scalar tensor. The reduction setting is stored but not applied inside forward.\n\nThe four helper methods in API contracts carry out steps 3 to 5; forward calls them.\n\n## Data model\n- Stored state: the normalized matrix m (C by C torch tensor), num_classes, and the reduction string.\n- Input: float logits shaped batch, classes, spatial dimensions.\n- Target: integer class-index labels shaped batch, spatial dimensions, or batch, 1, spatial dimensions. One-hot targets are not part of the contract.\n- Output: one scalar tensor.\n\n## API contracts\n- The class GeneralizedWassersteinDiceLoss inherits from the same torch loss base class as the sibling loss classes.\n- The constructor takes exactly two parameters, in this order:\n  - dist_matrix, first, required, with no default. It accepts a 2D torch tensor or a 2D numpy array.\n  - reduction, second, default MEAN. It accepts a LossReduction member or its string value. It is passed to the parent and stored, but it does not change forward's return value, which is always the batch mean.\n- No other constructor parameters. Changing the position of reduction breaks callers.\n- forward takes input, target, and smooth with default 1e-5. smooth belongs to forward, as in the sibling Generalized Dice loss. forward returns a scalar tensor.\n- Public helper methods:\n  - wasserstein_distance_map: takes flattened probabilities (batch, classes, N) and flattened target (batch, N); returns per-voxel distances for every sample (batch, N).\n  - compute_weights_generalized_true_positives: takes flattened target; returns per-sample, per-class alpha weights (batch, classes).\n  - compute_generalized_true_positive: takes alpha, flattened target, and the full batch distance map (batch, N); returns one TP value per sample (shape batch), using the cross-sample rule.\n  - compute_denominator: takes the same arguments as compute_generalized_true_positive; returns one D value per sample (shape batch), using the cross-sample rule.\n- Instance attributes: m and num_classes.\n- The module-level name generalized_wasserstein_dice refers to the class. It is defined in the dice module only and is not added to the losses package exports.\n- The losses package exports GeneralizedWassersteinDiceLoss.\n\n## Module architecture\n- Location: the dice module, after the generalized Dice class and before the module-level alias block.\n- The class is self-contained. It does not call other loss classes or add module-level helper functions.\n- The losses package initializer imports the new class from the dice module next to the existing dice-module exports. Existing exported names are unchanged.\n\n## Implementation constraints\n- Use vectorized tensor operations over batch and voxels. Do not loop over voxels or samples in Python.\n- Use class-index labels only as gather or indexing keys; they must be integer typed.\n- Compute alpha from counts only, with no sentinel or large constant weights for empty classes.\n- Do not add shape, dtype, or label-range validation inside forward. Inputs reach the computation unchanged.\n- Do not add sigmoid, one-hot conversion, or weight-type options.\n- Do not apply reduction inside forward, and do not reproduce the sibling classes' reduction branches.\n- The TP and D helpers must couple samples as described in Terminology.\n\n## Dependencies\n- The dice module newly imports numpy and the torch functional module. Both are existing MONAI dependencies; no new package is introduced.\n- Use torch's functional one-hot for label counting.\n\n## Naming\n- Class: GeneralizedWassersteinDiceLoss, matching sibling classes.\n- Module alias: generalized_wasserstein_dice, matching the generalized_dice pattern.\n- Methods: the snake_case names in API contracts. Attributes: m and num_classes.\n- Parameters: dist_matrix, reduction, smooth, input, target, and the reference helper parameter names (alpha, flat_target, flat_proba, wasserstein_distance_map).\n\n## Validation\n- The constructor checks only that the matrix is square.\n- Reduction is validated only through the shared LossReduction conversion.\n- forward performs no dtype, device, shape, or label validation. Invalid inputs fail in the tensor operations.\n\n## Error handling\n- A non-square distance matrix raises ValueError with the message \"Dist Matrix is invalid.\"\n- An invalid reduction value raises the ValueError from the LossReduction conversion.\n- Errors from tensor operations inside forward propagate unchanged.\n\n## Documentation\n- The class docstring states the purpose and cites Fidon et al., Generalised Wasserstein Dice Score, MICCAI BrainLes 2017, and Sudre et al., Generalised Dice overlap, MICCAI DLMIA 2017. It notes that the weighting follows the generalized Dice loss.\n- Each helper has a short docstring with an Args section in sibling style.\n- The docstrings of compute_generalized_true_positive and compute_denominator state that the sum runs over every sample's distance map, so each value depends on the whole batch.\n- The constructor docstring documents the distance matrix (square, tensor or numpy), names reduction as the reduction mode, lists the ValueError under Raises, and states that the loss is the batch mean regardless of reduction. It must not list \"none\" or \"sum\" as output modes.\n- Keep every added line within 120 columns.\n- Do not edit docs/source/losses.rst. Existing autodoc entries stay as they are.\n\n## Performance\n- Cost is proportional to batch times batch times voxels for the cross-sample TP and D terms, plus batch times classes times voxels for the other steps.\n- Use gather-style indexing in three places: the distance helper picks each voxel's distance row from the matrix by its label; the TP and D helpers pick each voxel's alpha by its label. No per-voxel loops.\n- Move the matrix to the probability device on each forward call.\n\n## Reliability\n- smooth is added to the numerator and denominator to avoid division by zero.\n- Softmax keeps probabilities in [0, 1]. The loss approaches 0 when every sample is confidently correct and 1 when every sample is confidently wrong.\n\n## Maintainability\n- Keep the four helper methods as separate steps so each stage can be checked on its own. Their docstrings describe each stage's formula, including the batch-wide sum for TP and D.\n\n## Compatibility\n- The change is additive. No existing class signature, export, or alias changes.\n- The positional order of the constructor (distance matrix, then reduction) is a public contract.\n\n## Operations\n- No runtime configuration or environment variables. Output is on the same device as the input logits.\n\n## Behavioral acceptance criteria\n- Binary 2D case: a batch of one, with a 4 by 4 target label map whose inner 2 by 2 block is label 1 and the rest is label 0, shape batch 1, 4, 4. Use a 2 by 2 distance matrix that is 0 on the diagonal and 1 off it. Logits equal 1000 times the one-hot of the target, class axis at channel position 1 (shape batch 1, classes 2, 4, 4): the loss is 0 to 3 decimal places. The same target with an added size-1 channel dimension (shape batch 1, 1, 4, 4) gives the same result. Logits equal 1000 times the one-hot of the flipped target give a loss of 1 to 3 decimal places.\n- Empty class case: a 4 by 4 all-zero target with two classes, batch size 1. Correct logits (1000 times the one-hot, class axis at channel position 1) give a loss of 0 to 3 decimal places. Flipped logits give 1 to 3 decimal places.\n- Batch-coupling case (batch of two): with the same 2 by 2 distance matrix, sample 0 has an all-zero 2 by 2 target and sample 1 has an all-one 2 by 2 target. Logits for both samples are 1000 times the one-hot of class 0 at every voxel; sample 0 is correct and sample 1 is wrong. The expected loss is approximately 0.333 to 3 decimal places. Each sample's TP is 0.8 and D is 2.4 under the cross-sample rule. A per-sample-only computation gives 0.5 and fails this criterion.\n- A numpy distance matrix and an equivalent tensor give the same loss.\n- A distance matrix whose maximum is 2 (zero on the diagonal, 2 off it) gives the same loss as its max-normalized form.\n- A non-square distance matrix raises ValueError at construction.\n- The returned value is a scalar. Changing reduction (mean, sum, or none) does not change it.\n- The module-level alias generalized_wasserstein_dice is the same object as the class.\n\n## Test requirements\n- Add tests/test_generalized_wasserstein_dice_loss.py, following the per-loss test convention of the sibling tests: 2020 MONAI Consortium license header, unittest, a test class, and a main guard.\n- The module has two tests: the binary 2D case and the empty class case, with the scenarios and 3-decimal tolerance above.\n- Targets are integer label maps, not one-hot tensors. Every label map passed to the loss, and every label map used to build predictions, has a leading batch axis (size 1) before any one-hot step. Never pass an unbatched two-dimensional label map to the loss or a test helper.\n- Prediction helpers follow the reference test order: take the batched integer label map, one-hot encode it with the number of classes, move the class axis (currently last) to channel position 1, then scale by 1000 and cast to float. The result has shape batch, classes, spatial dimensions.\n- For the optional class-dimension target variant, insert a size-1 axis after the batch axis. Do not change the prediction layout for that case.\n- Tests must not use tensor methods introduced after the minimum supported torch version (1.4).\n- Tests are part of the patch; the harness does not require running them.",
+  "current_words": 2284,
+  "minimum_candidate_words": 1599,
+  "maximum_candidate_words": 2055,
+  "categories": {
+    "Purpose": [
+      "Goals",
+      "Scope",
+      "Assumptions",
+      "Terminology"
+    ],
+    "Behavior": [
+      "Workflows"
+    ],
+    "Data": [
+      "Data model"
+    ],
+    "Interfaces": [
+      "API contracts"
+    ],
+    "Architecture": [
+      "Module architecture",
+      "Implementation constraints",
+      "Dependencies"
+    ],
+    "Conventions": [
+      "Naming",
+      "Validation",
+      "Error handling",
+      "Logging",
+      "Documentation"
+    ],
+    "Quality": [
+      "Performance",
+      "Security",
+      "Reliability",
+      "Usability",
+      "Maintainability"
+    ],
+    "Compatibility": [
+      "Compatibility"
+    ],
+    "Operations": [
+      "Operations"
+    ],
+    "Acceptance": [
+      "Behavioral acceptance criteria",
+      "Test requirements"
+    ]
+  },
+  "original": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Project-MONAI__MONAI-744/base",
+  "reference": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Project-MONAI__MONAI-744/reference",
+  "requirements": {
+    "patch_and_checks": "Patch applies to the original snapshot (no tests are run).",
+    "file_location": "Code is placed in the required existing module or component.",
+    "api_contract": "API names, visibility, parameters, types, and return contracts match requirements.",
+    "dependency_direction": "Imports and dependency directions respect existing boundaries.",
+    "extension_registration": "Required registration and interface implementation are present.",
+    "approved_dependencies": "No unapproved dependencies are introduced.",
+    "architectural_fit": "Responsibilities belong in the intended layer or component.",
+    "extension_point_adherence": "Existing extension mechanisms are used rather than a parallel path.",
+    "abstraction_integrity": "Domain, transport, persistence, and framework boundaries are preserved.",
+    "convention_fit": "Follow the repository conventions visible in the original and reference code for validation, errors, naming, logging, and tests.",
+    "requirement_intent": "The feature satisfies its behavioral intent and constraints."
+  },
+  "runs": [
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "Dry run of patch.diff with -p1 against a scratch copy of tasks/Project-MONAI__MONAI-744/base reported 'checking file' for monai/losses/__init__.py, monai/losses/dice.py and tests/test_generalized_wasserstein_dice_loss.py with exit 0; checks.json:2 records patch_applies true.",
+            "patch.diff:1-244 touches only monai/losses/__init__.py, monai/losses/dice.py and the new test file; no existing tests are deleted.",
+            "Generated tree differs from base only in the same three files (diff -rq), so patch.diff matches the generated output. No tests were run, as stated in the task."
+          ],
+          "deficiency": "none"
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:302-437 places GeneralizedWassersteinDiceLoss directly after GeneralizedDiceLoss, the same module and location as the reference (reference.diff hunk @@ -297,5 +299,171 @@).",
+            "generated/monai/losses/__init__.py:10-18 exports the class from the existing .dice import block.",
+            "tests/test_generalized_wasserstein_dice_loss.py is at the same path as the reference test."
+          ],
+          "deficiency": "none"
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "dice.py:316-320 __init__(dist_matrix, reduction=LossReduction.MEAN), matching the reference signature.",
+            "dice.py:344 forward(input, target, smooth=1e-5) returns a scalar (dice.py:366), matching the reference.",
+            "Helper names and attribute names (m, num_classes, wasserstein_distance_map, compute_weights_generalized_true_positives, compute_generalized_true_positive, compute_denominator) match the reference (reference.diff:128-202).",
+            "dice.py:442 defines the generalized_wasserstein_dice alias, as the reference does (reference.diff:207).",
+            "Minor, non-blocking difference: dice.py:380 casts the distance matrix to flat_proba.dtype, whereas the reference keeps the matrix dtype (reference.diff:135, 152). With the float64 matrix produced by np.array in the reference test, the reference returns a float64 loss and this patch returns float32. Values agree up to float32 rounding of the matrix entries. The stated contract (scalar loss) is unaffected."
+          ],
+          "deficiency": "none"
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "dice.py:15-19 adds numpy and torch.nn.functional alongside the existing torch and monai imports; monai.utils LossReduction and Weight were already imported at base dice.py:19.",
+            "No new monai-internal import edges are introduced; the reference adds the same numpy and F imports (reference.diff:30-32)."
+          ],
+          "deficiency": "none"
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/__init__.py:10-18 exports GeneralizedWassersteinDiceLoss through the existing from .dice import block, and every original name from base __init__.py:12 is retained.",
+            "The generalized_wasserstein_dice alias (dice.py:442) is not re-exported from __init__, which matches the reference (reference.diff __init__ hunk exports only the class)."
+          ],
+          "deficiency": "none"
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No new package is added. numpy is a declared core dependency (tasks/.../base/requirements.txt:2 numpy>=1.17; setup.cfg:16) and is already imported in other MONAI modules (monai/data/utils.py).",
+            "torch and torch.nn.functional are already in use by monai/losses/dice.py."
+          ],
+          "deficiency": "none"
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "The loss lives in monai/losses, next to DiceLoss (base dice.py:22) and GeneralizedDiceLoss (base dice.py:181), and reuses LossReduction, the same way its siblings do (base dice.py:68, 221).",
+            "Pure tensor computation with no I/O, configuration or framework coupling."
+          ],
+          "deficiency": "none"
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "dice.py:333 uses super().__init__(reduction=LossReduction(reduction).value), matching base dice.py:68 and 221.",
+            "dice.py:442 uses the same alias pattern as base dice.py:440-441 (dice = Dice = DiceLoss; generalized_dice = GeneralizedDiceLoss).",
+            "No parallel registry or loss-factory path is introduced."
+          ],
+          "deficiency": "none"
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "All logic stays in tensor operations inside dice.py:368-437; there is no transport, persistence or framework leakage.",
+            "The test file uses only the public monai.losses export (test file import line)."
+          ],
+          "deficiency": "none"
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Style matches the file: super().__init__ (dice.py:333), Args/Raises docstrings, and a ValueError message reused from the reference (dice.py:335-336).",
+            "__init__.py:10-18 keeps the case-sensitive sorted import order used by the original line; all lines are within the 120-column limit (base pyproject.toml:2). The one 128-column line in dice.py (line 36) is pre-existing DiceLoss docstring text.",
+            "Test file follows the sibling test convention (license header, unittest.TestCase, __main__ guard; compare tests/test_generalized_dice_loss.py).",
+            "Accepted per the reference: dice.py:325-326 accepts reduction but ignores it, and dice.py:366 always returns the mean, as reference.diff:126 does. The docstring discloses this. Sibling GeneralizedDiceLoss does honour reduction, so this is a known divergence from the sibling, not a regression against the reference."
+          ],
+          "deficiency": "none"
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Wasserstein distance: dice.py:380-382 computes sum_k M[y,k]*p_k by row indexing, which equals the reference's gather construction (reference.diff:135-155).",
+            "Class weights: dice.py:396-397 gives 1/(V+1) from one-hot counts, which equals reference.diff:199-202.",
+            "True positive and denominator: dice.py:415-417 and 435-437 use the batch-coupled broadcast (B,B,N) sum over s, matching reference.diff:168-191 including the cross-sample dependence.",
+            "Loss: dice.py:365-366 gives 1 - (2TP+smooth)/(D+smooth), averaged over the batch, matching reference.diff:124-126.",
+            "Test expectations hold on reading (not executed): a perfect one-hot prediction gives about 0 and a flipped one gives 1 for the binary case and the empty-class case, and the extra class dimension is handled by reshape(batch, -1) (dice.py:358)."
+          ],
+          "deficiency": "none"
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-744/round-02/candidate-02/run-00/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_generalized_wasserstein_dice_loss.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies=true, commands=[] (no executed tests for this experiment).",
+            "diff -rq base vs generated (excluding .git) shows exactly three changed paths: monai/losses/__init__.py, monai/losses/dice.py, and new tests/test_generalized_wasserstein_dice_loss.py, matching patch.diff. No stray files.",
+            "generated/monai/losses/dice.py:302-438 contains the new class and alias; generated/monai/losses/__init__.py:12-20 contains the export."
+          ],
+          "deficiency": "None blocking. Verified by reading only; no test execution was performed."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:302 places GeneralizedWassersteinDiceLoss beside GeneralizedDiceLoss (base dice.py:181), the same module the reference uses (reference/monai/losses/dice.py:302).",
+            "generated/monai/losses/__init__.py:12-20 exports the class, matching reference/monai/losses/__init__.py.",
+            "generated/tests/test_generalized_wasserstein_dice_loss.py is at the same path as the reference test."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "Constructor (dist_matrix, reduction=LossReduction.MEAN) at generated/monai/losses/dice.py:318-321 matches reference/monai/losses/dice.py:~331 (same parameters and default).",
+            "forward(input, target, smooth=1e-5) returns a scalar via torch.mean at generated dice.py:347 and :368; reference returns wass_dice_loss.mean() at reference dice.py:388.",
+            "Public helper names wasserstein_distance_map, compute_weights_generalized_true_positives, compute_generalized_true_positive, compute_denominator are present at generated dice.py:370, 385, 399, 417, matching the reference. Alias generalized_wasserstein_dice at generated dice.py:438 matches reference dice.py alias.",
+            "reduction is validated through LossReduction(reduction).value at generated dice.py:333 and is accepted but never applied in forward. The reference behaves the same way (reference dice.py:388 always returns the mean), so this is shared behavior, not a regression.",
+            "Minor, non-blocking: the candidate's Raises section (generated dice.py:330) documents 'reduction={reduction} is invalid. Valid options are: none, mean or sum.' The code never raises that message; LossReduction(...) raises the enum's own ValueError. The reference documents only the dist-matrix error.",
+            "Minor, non-blocking: generated dice.py:381 casts self.m to flat_proba.dtype, so a float64 numpy dist matrix yields a float32 loss. The reference promotes to float64 through m_extended * flat_proba (reference dice.py:414). The return is a scalar tensor in both, and the dtype difference is not part of any documented contract."
+          ],
+          "deficiency": "No blocking deficiency. Minor: the Raises docstring at generated dice.py:330 lists a ValueError message the code does not produce. Output dtype differs from the reference for float64 dist matrices (float32 here, float64 in reference); not a documented contract."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:15-17 adds only `import numpy as np`, `import torch.nn.functional as F` and uses existing torch imports.",
+            "No new monai-internal imports are introduced; the existing `from monai.networks import one_hot` and `from monai.utils import LossReduction` (dice.py:~17-18) are unchanged.",
+            "reference/monai/losses/dice.py imports the same numpy and torch.nn.functional modules."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/__init__.py:12-20 exports GeneralizedWassersteinDiceLoss, matching the reference export.",
+            "generated/monai/losses/dice.py:438 defines the lowercase alias generalized_wasserstein_dice, matching reference/monai/losses/dice.py's alias. Neither implementation exports that alias from __init__, so this is not a deviation."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "requirements.txt in base declares numpy>=1.17 and torch>=1.4.",
+            "33 modules under base monai/ already use `import numpy as np`.",
+            "No new third-party package is introduced; torch.nn.functional is part of torch."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "The loss is implemented in the dice loss module next to GeneralizedDiceLoss (generated dice.py:181-~300 in base layout; new class at generated dice.py:302).",
+            "The class is pure tensor math with no I/O, configuration, or persistence concerns, consistent with the sibling losses."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Subclasses torch.nn.modules.loss._Loss like siblings (generated dice.py:302) and passes reduction through LossReduction(reduction).value (generated dice.py:333), as base dice.py:68 and dice.py:221 do.",
+            "forward returns a torch.mean reduction at generated dice.py:368, the same pattern siblings use for reduction handling."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Pure torch/numpy tensor computation in generated dice.py:347-433 with no transport, persistence, or framework coupling.",
+            "numpy input is converted at the constructor boundary (generated dice.py:338-339), keeping the forward path tensor-only."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Constructor validates square shape and raises ValueError('Dist Matrix is invalid.') at generated dice.py:335-336, consistent with reference/monai/losses/dice.py:~345.",
+            "Docstrings use the Args/Returns/Raises layout used in base dice.py. Line length stays within the 120-character limit configured in setup.cfg:41 (the only >120 line in the touched files is pre-existing dice.py:36).",
+            "Import block in generated __init__.py:12-20 is ordered as isort expects (capitalized names before lowercase), and it is within the 120-character limit (setup.cfg:56).",
+            "The test uses plain unittest, as the reference test does. base tests/test_generalized_dice_loss.py uses parameterized TEST_CASES, but the reference does not follow that either, so this is not a deviation from the reference."
+          ],
+          "deficiency": "No blocking deficiency. Minor: the Raises entry at generated dice.py:330 documents a non-existent error message (see api_contract). The new test does not exercise the numpy dist_matrix path that the docstring at dice.py:323 advertises, while the reference test does."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Wasserstein distance: candidate wasserstein_distance_map at generated dice.py:381-383 computes sum_k M[y,k]*p_k via m[flat_target] (B,N,C). Reference computes the same quantity through the gather at reference dice.py:371-414. Both give M[y(v),k] p_k summed over k.",
+            "Weights: candidate alpha = 1/(V+1) at generated dice.py:396-397; reference alpha = 1/(volumes+1) at reference dice.py:463. Absent classes get weight 1 in both.",
+            "Batch coupling: candidate einsum('bn,sn->b') at generated dice.py:415 and :433 sums over every sample s, matching the reference's (B,1,N)*(B,N) broadcast summed over dims [1,2] (reference dice.py:436, :453). This cross-sample coupling is intentional in the reference and documented in the candidate.",
+            "Loss: candidate mean(1 - (2TP+smooth)/(D+smooth)) at generated dice.py:367-368, matching reference dice.py:386-388.",
+            "Hand-checked test expectations: with logits 1000*onehot(y), W=0, so TP=sum alpha and D=2*TP, giving loss 0. With flipped logits, W=1, TP=0, and loss is about 1. The candidate tests (tests/test_generalized_wasserstein_dice_loss.py:37-58) assert exactly these values."
+          ],
+          "deficiency": "None blocking. The equivalence is established by algebra and reading, not by execution."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-744/round-02/candidate-02/run-01/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_generalized_wasserstein_dice_loss.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json:2 reports patch_applies: true; commands is empty because no tests were run.",
+            "patch.diff:2 and :22 index lines name base blobs c9ab109 and 86823f2; `git hash-object` on the base monai/losses/__init__.py and dice.py returned c9ab1099fd2... and 86823f22ae0..., so the patch matches the snapshot.",
+            "The staged diff in generated/ (monai/losses/__init__.py, monai/losses/dice.py, tests/test_generalized_wasserstein_dice_loss.py) is identical to patch.diff, and the patch has no removed lines other than the original import line at patch.diff:9."
+          ],
+          "deficiency": "none"
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated monai/losses/dice.py:302-444 holds the new GeneralizedWassersteinDiceLoss class and alias, in the same module as the reference (reference dice.py:302-469).",
+            "The export is in monai/losses/__init__.py (patch.diff:9-18), and the test is in tests/ (patch.diff:182-260), matching the reference layout."
+          ],
+          "deficiency": "none"
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "Constructor (generated dice.py:319-322) takes dist_matrix and reduction=LossReduction.MEAN, matching reference dice.py:338 and the signature at reference :338.",
+            "forward(input, target, smooth=1e-5) returns a scalar mean (generated dice.py:419, return at 439; reference dice.py:362, return at 388).",
+            "Helper names wasserstein_distance_map, compute_weights_generalized_true_positives, compute_generalized_true_positive, compute_denominator are public and match the reference (generated 349, 365, 379, 399; reference 390, 456, 420, 439).",
+            "Minor divergence: generated dice.py:343 casts numpy input with .float(), while reference dice.py:357 keeps numpy's float64. A float64 matrix therefore yields float32 output in the candidate and float64 in the reference. The requirements do not specify dtype, so this is noted rather than failed."
+          ],
+          "deficiency": "none (minor dtype difference for float64 numpy matrices; not a stated requirement)"
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "New imports are numpy, torch, and torch.nn.functional (patch.diff:29-31), in the same module that already imports torch and monai.networks/monai.utils.",
+            "No new monai cross-package import is added."
+          ],
+          "deficiency": "none"
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "monai/losses/__init__.py exports GeneralizedWassersteinDiceLoss (patch.diff:14), matching the reference export.",
+            "Alias generalized_wasserstein_dice = GeneralizedWassersteinDiceLoss is at generated dice.py:444, same as reference dice.py:469, following the existing generalized_dice alias pattern (base dice.py:179-180)."
+          ],
+          "deficiency": "none"
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "numpy is already a declared dependency (base requirements.txt:2 numpy>=1.17).",
+            "parameterized, used by the new test, is declared in base requirements-dev.txt:4 and used by base tests/test_dice_loss.py:16 and :115.",
+            "No new dependency is introduced."
+          ],
+          "deficiency": "none"
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "The loss sits next to DiceLoss, MaskedDiceLoss, and GeneralizedDiceLoss in monai/losses/dice.py, the same place as the reference.",
+            "The class is self-contained tensor math with no changes outside monai/losses and tests."
+          ],
+          "deficiency": "none"
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Subclasses torch _Loss and calls super().__init__(reduction=LossReduction(reduction).value) (generated dice.py:338), the same pattern as base dice.py:221 and the reference.",
+            "Reduction behavior: base GeneralizedDiceLoss.forward honors reduction (base dice.py:288-297), but the candidate forward always returns the batch mean (generated dice.py:439) and the reference does the same (reference dice.py:388). The candidate docstring says so (generated dice.py:329-330). Because the reference is the behavioral source of truth, this is not counted as a failure, but it departs from the sibling convention."
+          ],
+          "deficiency": "none against the reference (sibling-convention note: reduction is stored but not applied in forward, matching the reference)"
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "The loss is pure torch computation: no I/O, no framework or transport boundary is crossed.",
+            "Device handling uses self.m.to(flat_proba.device) (generated dice.py:~359)."
+          ],
+          "deficiency": "none"
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Error text 'Dist Matrix is invalid.' matches the reference (generated dice.py:341; reference :353).",
+            "Docstrings use the Args/Raises style of base dice.py:201-220.",
+            "Test uses unittest plus parameterized.expand, as in base tests/test_dice_loss.py:114-115.",
+            "No added line exceeds 120 characters and no trailing whitespace (repo limit base setup.cfg:41 and pyproject.toml:2).",
+            "Minor: the Raises entry for reduction (generated dice.py:335) describes a ValueError that actually comes from the LossReduction enum. This is the same wording as base dice.py:219."
+          ],
+          "deficiency": "none (minor docstring nit)"
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Per-voxel distance W_s(v)=sum_k M[y,k]*p_k: generated dice.py:349-363 matches reference dice.py:390-418.",
+            "Weights alpha=1/(V+1): generated dice.py:365-377 matches reference dice.py:456-467.",
+            "TP and denominator use the same (B,1,N)x(1,B,N) broadcast and sum over s and v: generated dice.py:379-417 matches reference dice.py:420-454.",
+            "forward is 1-(2TP+s)/(D+s) averaged over the batch: generated dice.py:430-439 matches reference dice.py:375-388.",
+            "I hand-traced the test expectations (correct prediction ~0, flipped ~1, empty class) through the candidate's code and they hold.",
+            "Shared risk, not a candidate-only defect: TP_b and D_b sum over all samples' distance maps (generated dice.py:383-384 documents this as intended; the reference has the same broadcast). For batch size > 1, sample b's loss depends on other samples' predictions, which likely departs from the per-sample formulation in the cited paper. Because the reference is the behavioral source of truth, this passes, but it is worth flagging."
+          ],
+          "deficiency": "none against the reference; the shared cross-sample coupling for batch size > 1 is a risk for the maintainers"
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-744/round-02/candidate-02/run-02/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_generalized_wasserstein_dice_loss.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json: patch_applies=true; commands=[] (no tests executed, per the no-run instruction).",
+            "git hash-object on base monai/losses/__init__.py -> c9ab1099..., and dice.py -> 86823f22..., matching the 'index' lines of patch.diff.",
+            "diff -rq base vs generated (excluding .git): only monai/losses/__init__.py and monai/losses/dice.py differ, plus tests/test_generalized_wasserstein_dice_loss.py is added.",
+            "patch.diff has exactly one removed line (the original 'from .dice import ...' line in monai/losses/__init__.py); diff of base vs generated dice.py shows 0 removed lines."
+          ],
+          "deficiency": "None. Pass rests on static apply/hash/diff evidence only; no test execution was performed."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:302 defines GeneralizedWassersteinDiceLoss in the same module as GeneralizedDiceLoss (generated/monai/losses/dice.py:183), matching the reference location (reference/monai/losses/dice.py:~300).",
+            "Export added at generated/monai/losses/__init__.py:12-20."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "Class name GeneralizedWassersteinDiceLoss (generated/monai/losses/dice.py:302); __init__(dist_matrix, reduction=LossReduction.MEAN) at :316-319, matching reference/monai/losses/dice.py:338.",
+            "forward(input, target, smooth=1e-5) at generated/monai/losses/dice.py:414, matching reference :362; returns scalar torch.mean(1.0 - score) at :434, matching reference :388.",
+            "Alias generalized_wasserstein_dice = GeneralizedWassersteinDiceLoss at generated/monai/losses/dice.py:439, matching the reference alias.",
+            "Helper method names and signatures match the reference: wasserstein_distance_map :345, compute_weights_generalized_true_positives :361, compute_generalized_true_positive :375, compute_denominator :395 (reference :390, :456, :420, :439)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:15-16 adds 'import numpy as np' and 'import torch.nn.functional as F'; the reference adds the same imports to the same module.",
+            "No new monai-internal imports. The module still depends only on monai.networks and monai.utils, as in base dice.py:18-19."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/__init__.py:12-20 exports GeneralizedWassersteinDiceLoss, matching reference/monai/losses/__init__.py.",
+            "generated/monai/losses/dice.py:439 registers the generalized_wasserstein_dice alias, matching reference/monai/losses/dice.py.",
+            "docs/source/losses.rst is not updated; the reference does not update it either, so this is not counted."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "requirements.txt declares torch>=1.4 and numpy>=1.17, so numpy and torch are already approved dependencies.",
+            "No new packages are introduced; numpy is not otherwise used in base monai/losses, but it is declared in requirements.txt and the reference imports it too."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "The loss sits beside GeneralizedDiceLoss (generated/monai/losses/dice.py:183) and reuses the module's LossReduction import (base dice.py:19).",
+            "Responsibility is confined to the loss computation; there is no logic added to the package init or elsewhere."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Subclasses torch _Loss like the sibling losses (generated/monai/losses/dice.py:302).",
+            "Reduction validated via LossReduction(reduction).value at :334, the same pattern as base DiceLoss (dice.py:68) and GeneralizedDiceLoss (dice.py:221).",
+            "No parallel registry or dispatch mechanism is introduced."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Pure tensor math in forward and helper methods (generated/monai/losses/dice.py:345-434); no I/O, persistence, or transport concerns.",
+            "The numpy-to-torch conversion is contained in the constructor (:336-341)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "super().__init__ call style (generated/monai/losses/dice.py:334) matches base dice.py:68; ValueError for the non-square matrix (:337-338) matches the module's error style.",
+            "New code is within the 120-character limit (setup.cfg:41 max-line-length=120). The only >120-char line in edited files is pre-existing dice.py:36 (V-Net citation).",
+            "Test file uses unittest and the repo license header, matching the reference test style.",
+            "Non-counted observation: reduction is stored but forward always returns the batch mean (:434), unlike DiceLoss/GeneralizedDiceLoss (base dice.py:135-142, 288-295). The reference behaves the same (reference forward returns wass_dice_loss.mean()), and the candidate documents this in its docstring."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Distance map: candidate gathers rows M[y] at generated/monai/losses/dice.py:358-359, which equals the reference's M[label, k] gather (reference dice.py:390-~415), giving W_s(v) = sum_k M[y_s(v),k] p_k,s(v) in both.",
+            "Generalized TP and denominator: candidate broadcasts alpha_map (B,1,N) against (1,B,N) at :391-393 and :410-412, summing over all samples' distance maps. The reference does the same broadcast at reference dice.py:433-436 and :450-453, so batch>1 results match.",
+            "Weights alpha = 1/(V+1): candidate :372-373; reference :456-460.",
+            "Loss: candidate 1 - (2TP+smooth)/(D+smooth), averaged (:430-434); reference :382-388.",
+            "Single-sample and multi-sample behavior are identical, so there is no per-sample vs cross-sample divergence."
+          ],
+          "deficiency": "None."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-744/round-02/candidate-02/run-03/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_generalized_wasserstein_dice_loss.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json: \"patch_applies\": true; no commands executed, no api_inspection entries.",
+            "Generated tree vs base (diff -rq --exclude=.git) differs only in monai/losses/__init__.py, monai/losses/dice.py, and the new tests/test_generalized_wasserstein_dice_loss.py, i.e. exactly base + patch.diff.",
+            "patch.diff hunks: @@ -9,6 +9,14 @@ (losses/__init__.py) and @@ -297,5 +299,142 @@ (losses/dice.py); the test file is a new-file hunk with no conflict against base."
+          ],
+          "deficiency": "None. No tests were run for this experiment, so runtime success is not established; the judgment is from reading the code."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:302 defines GeneralizedWassersteinDiceLoss after GeneralizedDiceLoss (class at base dice.py:181) and before the alias block (base dice.py:300-301), the same placement as the reference.diff.",
+            "generated/monai/losses/__init__.py:12-20 exports the class from .dice, as the reference does.",
+            "Test is placed at tests/test_generalized_wasserstein_dice_loss.py, matching the reference's test filename."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:318 __init__(self, dist_matrix, reduction: Union[LossReduction, str] = LossReduction.MEAN), same parameter names and defaults as reference.diff.",
+            "generated/monai/losses/dice.py:414 forward(self, input, target, smooth: float = 1e-5) -> torch.Tensor, matching the reference signature.",
+            "Helper method names and parameter names match the reference: wasserstein_distance_map(flat_proba, flat_target) at dice.py:346; compute_weights_generalized_true_positives(flat_target) at dice.py:364; compute_generalized_true_positive(alpha, flat_target, wasserstein_distance_map) at dice.py:378; compute_denominator(...) at dice.py:396.",
+            "Attributes self.m and self.num_classes (dice.py:343, and num_classes set in __init__) match the reference's attribute names.",
+            "Return contract: dice.py:435 returns (1.0 - score).mean(), a scalar, same as reference.",
+            "Alias generalized_wasserstein_dice = GeneralizedWassersteinDiceLoss at dice.py:440, same as reference."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py imports numpy as np and torch.nn.functional as F at the top of the module, the same additions as reference.diff.",
+            "No new cross-package imports; the losses package still imports only from monai.networks and monai.utils, as base dice.py does."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "Export added in generated/monai/losses/__init__.py:12-20.",
+            "Alias generalized_wasserstein_dice registered at generated/monai/losses/dice.py:440, matching reference.diff.",
+            "Existing exports Dice, DiceLoss, GeneralizedDiceLoss, MaskedDiceLoss, dice, generalized_dice are all still present in __init__.py:12-20, so nothing was removed."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "numpy and torch are already runtime dependencies used throughout monai; the class uses only these plus torch.nn.functional, which the reference also uses.",
+            "Test imports parameterized (tests/test_generalized_wasserstein_dice_loss.py:17); requirements-dev.txt lists parameterized, and base tests such as tests/test_densenet.py already use it."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "The loss lives in monai/losses/dice.py next to the other Dice family losses, and subclasses torch's _Loss like its siblings (generated/monai/losses/dice.py:302).",
+            "Computation stays in the loss module; no training or data-pipeline responsibilities are introduced."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Uses the same reduction handling as the existing losses: super().__init__(reduction=LossReduction(reduction).value) at generated/monai/losses/dice.py:332, matching base dice.py:221 for GeneralizedDiceLoss.",
+            "Uses the existing LossReduction and Union imports from base dice.py:12-19, with no parallel reduction mechanism.",
+            "Follows the established _Loss subclass pattern and the alias-registration pattern at the bottom of the file."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Uses F.one_hot directly (generated dice.py:375), as reference.diff does, rather than monai.networks.one_hot. The loss is pure tensor math with no transport, persistence, or framework boundary crossings.",
+            "Device handling is local: m = self.m.to(flat_proba.device) at generated dice.py:359."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Google-style docstrings with Args:/Raises: sections, matching base dice.py (e.g. base dice.py:200-220 for GeneralizedDiceLoss).",
+            "Line length: no added line exceeds 120 characters (setup.cfg:41 max-line-length = 120; awk scan of patch.diff found none).",
+            "Import ordering in generated/monai/losses/__init__.py:12-20 follows isort order_by_type (classes before functions), which is stricter than the reference's ordering.",
+            "Test uses the repo's parameterized.expand(TEST_CASES) convention with [params, data, expected] rows (test file:80-84).",
+            "Minor, not blocking: the class stores reduction but forward always returns the mean (dice.py:414-435). Base GeneralizedDiceLoss honors reduction (base dice.py:288-292). The reference behaves the same way and the reference is the source of truth, so this is not counted against the candidate; the candidate's docstring at dice.py:~308 documents it explicitly.",
+            "Minor, not blocking: test helper make_prediction has an unused add_channel=False parameter (tests/test_generalized_wasserstein_dice_loss.py:24, patch.diff:207)."
+          ],
+          "deficiency": "No blocking deficiency. Two minor issues: the reduction parameter is stored but not applied in forward, which is shared with the reference and documented by the candidate; and an unused add_channel parameter in the test helper."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Per-voxel Wasserstein map W_s(v) = sum_k M[y_s(v),k]*p_k,s(v): candidate dice.py:359-362 uses m[flat_target] with (rows * p.permute(0,2,1)).sum(-1). This equals the reference's gather over m_extended followed by sum over classes, traced by hand from reference.diff.",
+            "Class weights alpha = 1/(V+1): candidate dice.py:375-376 (one_hot sum over voxels, then 1/(counts+1)) matches reference compute_weights_generalized_true_positives.",
+            "TP and denominator: candidate dice.py:393-394 and 411-412 compute gather(alpha) (B,N) times (1-W) or (2-W) with broadcasting to (B,B,N), then sum over dims (1,2). This gives the same per-sample cross-batch sums as the reference's (B,1,N) * (B,N) broadcast.",
+            "Final loss: dice.py:434-435, score = (2*TP+smooth)/(D+smooth), loss = mean(1-score), same as reference.",
+            "Candidate test expectations check out by hand against the formula: correct prediction gives 0.0, flipped gives 1.0 (smooth-sized deviation), with the empty-class cases handled by alpha=1 for absent classes. Not executed."
+          ],
+          "deficiency": "None. Behavior matches the reference for valid inputs. The reference's gather-based map and the candidate's indexed map are numerically the same. Reference-only tests (for example the reference's two test methods) are absent from the candidate, but the candidate provides its own five-case test, so no tests were deleted."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-744/round-02/candidate-02/run-04/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_generalized_wasserstein_dice_loss.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies=true; commands=[] (no execution, per experiment setup)",
+            "Diff of generated tree vs base snapshot: only monai/losses/__init__.py, monai/losses/dice.py, and new tests/test_generalized_wasserstein_dice_loss.py differ; matches judge-context/patch.diff exactly",
+            "generated/monai/losses/dice.py:302-440 contains the class and alias as the patch describes; no existing class body modified"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:302 places GeneralizedWassersteinDiceLoss beside GeneralizedDiceLoss, the same module as reference/monai/losses/dice.py:302",
+            "generated/tests/test_generalized_wasserstein_dice_loss.py is at the same path the reference uses"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:315-318 __init__(dist_matrix, reduction=LossReduction.MEAN) matches reference/monai/losses/dice.py:338 parameter names and defaults",
+            "Method names wasserstein_distance_map (343), compute_weights_generalized_true_positives (361), compute_generalized_true_positive (375), compute_denominator (395), forward(input, target, smooth=1e-5) (415) match reference lines 390, 456, 420, 439, 362",
+            "generated/monai/losses/dice.py:435 returns torch.mean(1.0 - score), a scalar tensor, matching reference/monai/losses/dice.py:388",
+            "reduction is accepted and validated via LossReduction (dice.py:332) but not applied in forward; reference/monai/losses/dice.py:388 has the same behavior, and the candidate documents it at dice.py:324-325"
+          ],
+          "deficiency": "None. The reduction-not-applied behavior is shared with the reference, so it is not a candidate failure. Note that it departs from the original DiceLoss/GeneralizedDiceLoss convention (base dice.py:135-144, 288-297)."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:15-16 adds only `import numpy as np` and `import torch.nn.functional as F`; no new monai-internal imports",
+            "generated/monai/losses/__init__.py:12-20 imports only from .dice, same as the existing pattern"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/__init__.py:16 exports GeneralizedWassersteinDiceLoss from monai.losses, matching reference/monai/losses/__init__.py import list",
+            "generated/monai/losses/dice.py:440 adds alias generalized_wasserstein_dice, matching reference/monai/losses/dice.py:469",
+            "Neither the reference nor the candidate exports the alias from __init__; both are consistent"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "requirements.txt:2 declares numpy>=1.17; torch is already a core dependency",
+            "requirements-dev.txt:4 declares parameterized, which the new test uses and which existing tests (e.g. tests/test_generalized_dice_loss.py) already import",
+            "No new packages introduced"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:302-440 keeps the loss in the losses package with pure torch tensor ops, matching the reference's placement",
+            "No I/O, logging, or cross-package logic added"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:302 subclasses _Loss; generated/monai/losses/dice.py:332 uses super().__init__(reduction=LossReduction(reduction).value), the same pattern as base dice.py:221 and reference dice.py:350",
+            "Alias registration follows the existing dice = Dice = DiceLoss / generalized_dice pattern (dice.py:439-440)"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:343-359 and 372 use only torch indexing and one_hot; no transport, persistence, or framework leakage",
+            "generated/monai/losses/dice.py:16 imports torch.nn.functional alongside the existing torch imports, matching the reference (reference dice.py:15)"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Error text 'Dist Matrix is invalid.' (generated dice.py:330-331, 336) matches reference dice.py:340-341 wording; docstring Raises sections mirror base dice.py:225-227",
+            "Tests use parameterized.expand (generated/tests/test_generalized_wasserstein_dice_loss.py:76, 81) like base tests/test_generalized_dice_loss.py, and include the 2020 MONAI copyright header",
+            "Lines stay within max-line-length=120 (setup.cfg:41); the only >120 line in dice.py (line 36) is pre-existing in base",
+            "Shared deviation: reduction is not applied in forward (see api_contract)"
+          ],
+          "deficiency": "None. The reduction handling deviates from the original file's convention, but the reference does the same, so it is accepted."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Wasserstein map: generated dice.py:358-359 computes sum_k M[y,k]*p_k via m[flat_target] and a sum over classes; this equals reference dice.py:370-385 (gather of M rows by label, then sum over classes)",
+            "Weights: generated dice.py:372-373 gives 1/(V+1) per sample and class; this equals reference dice.py:456-466 (one_hot volumes, 1/(volumes+1))",
+            "True positive and denominator: generated dice.py:391-392 and 411-412 build the (B,B,N) sum with weights alpha[b, y_b(v)], matching reference dice.py:420-437 and 439-455",
+            "Forward: generated dice.py:434-435 is (2*TP+smooth)/(D+smooth) then mean(1-score), matching reference dice.py:381-388",
+            "By reading, the test expectations hold: correct predictions give 0, flipped predictions give about 1 (within atol 1e-3), and the empty-class cases behave the same. Tests were not run."
+          ],
+          "deficiency": "None. The reduction option is accepted but has no effect on the output, which matches the reference, not the original DiceLoss/GeneralizedDiceLoss behavior. It is documented in the candidate's docstring."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-744/round-02/candidate-02/run-05/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_generalized_wasserstein_dice_loss.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json: patch_applies=true; commands=[] (no tests executed, as stated for this experiment).",
+            "diff -rq base vs generated (monai/, tests/): only monai/losses/__init__.py and monai/losses/dice.py differ, plus tests/test_generalized_wasserstein_dice_loss.py is added. No other files changed.",
+            "generated/monai/losses/dice.py:302-440 matches the patch.diff hunk '@@ -297,5 +299,142 @@'. No original lines removed other than the __init__.py import line, which is rewritten with all original names retained."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:302 defines GeneralizedWassersteinDiceLoss beside GeneralizedDiceLoss in the existing dice module, the same location as reference/monai/losses/dice.py:302.",
+            "generated/monai/losses/__init__.py:12-20 exports the class, matching reference/monai/losses/__init__.py:12-20."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "Constructor: generated dice.py:316-320 is __init__(dist_matrix, reduction=LossReduction.MEAN), matching reference dice.py:338.",
+            "forward: generated dice.py:415 is forward(input, target, smooth=1e-5) returning a scalar mean, matching reference dice.py:362 and :388.",
+            "Helper names and parameters match the reference: wasserstein_distance_map (generated :346, reference :390), compute_weights_generalized_true_positives (:362, reference :456), compute_generalized_true_positive (:376, reference :420), compute_denominator (:396, reference :439).",
+            "Lowercase alias generated dice.py:440 matches reference dice.py:469. The reference __init__ does not export the alias either, so there is no gap.",
+            "Non-blocking difference: for a 1-D dist_matrix the patch raises ValueError at generated dice.py:337 (len check first). The reference would hit IndexError on shape[1]. This is stricter validation, not a contract conflict."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated dice.py:15-21 adds only numpy and torch.nn.functional imports. The monai imports (monai.networks one_hot, monai.utils LossReduction, Weight) are unchanged.",
+            "Same import set as the reference (reference dice.py:15-18), so no new edges in the dependency graph."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/__init__.py:16 registers GeneralizedWassersteinDiceLoss in the package exports, matching reference __init__.py:19.",
+            "generated dice.py:302 subclasses torch _Loss, the same base as DiceLoss and GeneralizedDiceLoss.",
+            "generated dice.py:440 registers the lowercase alias, matching reference dice.py:469."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No new third-party package is introduced. numpy and torch are already used by monai/losses and the reference adds the same numpy/torch.nn.functional imports.",
+            "The new test imports `parameterized`, which is listed in requirements-dev.txt:4 and is used by many existing tests in base/tests (e.g. test_compute_roc_auc.py, test_dataset.py)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "The loss is a pure tensor computation placed in the losses module next to GeneralizedDiceLoss (generated dice.py:302), the same placement as the reference.",
+            "It reuses the existing LossReduction enum (generated dice.py:335) instead of adding a new reduction mechanism."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "generated dice.py:335 calls super().__init__(reduction=LossReduction(reduction).value), the same pattern as DiceLoss at base dice.py:68-70 and GeneralizedDiceLoss at base dice.py:221.",
+            "It follows the _Loss subclass plus forward pattern of the existing losses, with no parallel registry or separate code path."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "All logic is tensor math inside monai/losses/dice.py. No transport, persistence, or framework boundary is crossed.",
+            "The device handling (generated dice.py:357 m = self.m.to(flat_proba.device)) keeps the distance matrix on the input's device, as the reference does (reference dice.py:~393 torch.clone(self.m).to(device))."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Google-style docstrings with Args/Returns/Raises sections (generated dice.py:321-334, 347-356, 363-372, 379-390, 415-424), matching the repo's style at base dice.py:48-67.",
+            "Line length stays within the 120-character limit (setup.cfg:41, pyproject.toml:2). The only line over 120 characters is generated dice.py:36, pre-existing DiceLoss docstring text shifted by the two new imports.",
+            "Imports in __init__.py:12-20 are alphabetized in the isort style used by the original line, and the multi-line import is black-formatted.",
+            "ValueError for an invalid matrix (generated dice.py:337-338) follows the repo's ValueError message convention (base dice.py:70-71).",
+            "The test follows the repo's parameterized.expand + TEST_CASES pattern (patch.diff test section), which matches the existing tests in base/tests."
+          ],
+          "deficiency": "None. Note: the reduction docstring's 'ValueError: reduction=... is invalid' is raised by LossReduction, the same as the existing classes. This is not a deficiency."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Per-voxel Wasserstein distance W_s(v)=sum_k M[y(v),k]*p_k: generated dice.py:357-360 (m[flat_target] gives (B,N,C), multiplied by the probabilities and summed over classes). Reference dice.py:390-401 builds the same M[y(v),k] via gather, so the values match.",
+            "Class weights alpha=1/(V+1), with absent classes weight 1: generated dice.py:373-374 vs reference dice.py:461-463.",
+            "Cross-sample coupling: generated dice.py:391-394 forms (B,1,N)*(1,B,N) and sums over dims (1,2), giving (B,). Reference dice.py:432-436 produces the same (B,B,N) broadcast and sum over [1,2]. The patch documents this at generated dice.py:380-381.",
+            "Denominator with (2-W): generated dice.py:411-413 vs reference dice.py:439-453.",
+            "Smoothing and batch mean: generated dice.py:434-435 vs reference dice.py:385-388.",
+            "Target shape: generated dice.py:427 target.reshape(batch,-1) accepts (B,H,W) and (B,1,H,W), as reference dice.py:~370 view(B,-1) does.",
+            "Test expectations (hand-computed, not executed): correct prediction gives W=0, TP=D/2, loss 0. Flipped prediction gives W=1, TP=0, loss ~1. Empty-class cases give the same limits, consistent with the TEST_CASES in patch.diff.",
+            "reduction is stored but forward always returns the mean. This is identical to the reference (dice.py:388), so it is not a deviation."
+          ],
+          "deficiency": "None."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-744/round-02/candidate-02/run-06/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_generalized_wasserstein_dice_loss.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json: patch_applies=true, commands=[] (no tests executed; behavior judged by reading)",
+            "diff -rq base vs generated (excluding .git): only monai/losses/__init__.py and monai/losses/dice.py differ, and tests/test_generalized_wasserstein_dice_loss.py is added; no other files changed",
+            "generated/monai/losses/dice.py:302-440 contains the new class and aliases; generated/monai/losses/__init__.py:12-20 contains the new export"
+          ],
+          "deficiency": "None. Caveat: no execution evidence beyond patch application; test pass/fail was not established."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:302 places GeneralizedWassersteinDiceLoss next to GeneralizedDiceLoss (dice.py:183) in the existing losses module",
+            "generated/monai/losses/__init__.py:12-20 exports it from the package, matching reference __init__.py (reference class at dice.py:302)",
+            "generated/tests/test_generalized_wasserstein_dice_loss.py is in tests/, matching the reference test location"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "Class name and constructor match reference: generated/monai/losses/dice.py:315-319 (dist_matrix, reduction=LossReduction.MEAN) vs reference dice.py:338",
+            "forward(input, target, smooth=1e-5) at generated dice.py:414 matches reference dice.py:362; helper names and signatures match reference (generated dice.py:344, 361, 375, 395 vs reference 390, 456, 420, 439)",
+            "Return shapes match reference: wasserstein map (B,N) dice.py:359; alpha (B,C) dice.py:373; TP and denominator (B,) dice.py:393, 412; loss scalar dice.py:435",
+            "Alias generalized_wasserstein_dice at generated dice.py:440 matches reference dice.py:469",
+            "reduction is accepted and validated via LossReduction (dice.py:332) but not applied; generated dice.py:435 always returns torch.mean, identical to reference dice.py:388 (wass_dice_loss.mean()). This is accepted-but-not-rendered, matching the reference.",
+            "Minor, non-blocking: generated dice.py:356 casts the distance matrix to the probability dtype, so float64 matrices yield float32 outputs, whereas the reference yields float64. The contract (shape, scalar, mean reduction) is unchanged."
+          ],
+          "deficiency": "None blocking. Non-blocking differences: reduction is accepted but not applied (same as reference), and the output dtype follows the probabilities rather than the float64 distance matrix."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:15-21 adds only numpy, torch.nn.functional and keeps existing monai.networks / monai.utils imports",
+            "No new monai-internal imports and no new cross-package edges"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "Package export: generated/monai/losses/__init__.py:12-20 (GeneralizedWassersteinDiceLoss imported; reference __init__.py adds the same class)",
+            "Lowercase alias: generated/monai/losses/dice.py:440 follows the original pattern at dice.py:438-439 (dice = Dice = DiceLoss; generalized_dice = GeneralizedDiceLoss)",
+            "The lowercase alias is not re-exported from monai.losses. The reference's __init__.py also omits it, so this is not a deficiency relative to the reference."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "numpy is already a declared dependency: base/setup.cfg:16 and base/requirements.txt:2 (numpy>=1.17)",
+            "torch and torch.nn.functional are already used by monai/losses/dice.py",
+            "No new packages introduced"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "The loss is implemented as a pure-tensor torch.nn module (_Loss subclass) inside the losses module, generated/monai/losses/dice.py:302",
+            "No I/O, persistence, or framework-specific logic added; the reference is also a pure loss module"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Subclasses torch _Loss and initializes via super().__init__(reduction=LossReduction(reduction).value), matching the sibling pattern (generated dice.py:332 vs original dice.py:221)",
+            "Uses the existing LossReduction enum and Union[LossReduction, str] annotation like siblings (dice.py:318)",
+            "Reduction handling diverges from GeneralizedDiceLoss (original dice.py:288-295 applies mean/sum/none), but matches the reference (reference dice.py:388 always means). Not a deviation from the required reference behavior."
+          ],
+          "deficiency": "None against the reference. Repo-level note only: the reduction option is accepted and documented as non-rendering (dice.py:325), which is honest, but it is not the sibling convention."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Changes are confined to monai/losses/ and tests/; no leakage into other layers",
+            "docs/source/losses.rst:30-35 lists GeneralizedDiceLoss but was not updated; the reference also does not update docs, so this is not a required change"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Google-style Args/Raises docstrings and typed signatures match the repo (generated dice.py:320-331, 414-423)",
+            "Validation message 'Dist Matrix is invalid.' (generated dice.py:335) matches reference dice.py:353; invalid reduction is reported via LossReduction, as in siblings",
+            "Test file has the repo license header, unittest.TestCase, and an __main__ guard, like base tests/test_generalized_dice_loss.py (generated/tests/test_generalized_wasserstein_dice_loss.py:1-16, 53-54)",
+            "Line length: the only line over 120 chars in changed files is generated dice.py:36, which is pre-existing in the DiceLoss docstring and not part of the patch"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Wasserstein map W_s(v)=sum_k M[y(v),k]*p_k: generated dice.py:356-359 (m[flat_target] times permuted probs, summed over classes) matches the reference's gather-based map (reference dice.py:390-418)",
+            "alpha = 1/(V+1) per sample and class: generated dice.py:372-373 matches reference dice.py:456-463",
+            "TP and denominator sum over all sample distance maps via (B,B,N) broadcast: generated dice.py:390-393 and 410-412 match reference dice.py:420-453 (broadcast (B,1,N)*(B,N))",
+            "Loss = mean(1 - (2TP+s)/(D+s)): generated dice.py:434-435 matches reference dice.py:384-388",
+            "By hand, the candidate and reference test cases yield ~0 for correct predictions and ~1 for flipped ones (empty-class and binary 2D), but this was not executed"
+          ],
+          "deficiency": "None."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-744/round-02/candidate-02/run-07/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_generalized_wasserstein_dice_loss.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies=true, commands=[] (no tests executed, per experiment setup).",
+            "`patch --dry-run -p1 -i patch.diff` run in base/: checks monai/losses/__init__.py, monai/losses/dice.py, tests/test_generalized_wasserstein_dice_loss.py; exit 0.",
+            "`diff -rq base generated`: only monai/losses/__init__.py, monai/losses/dice.py differ and tests/test_generalized_wasserstein_dice_loss.py is added; generated tree matches patch.diff.",
+            "Candidate test expectations hand-traced (not executed): generated/tests/test_generalized_wasserstein_dice_loss.py:37-58. Correct predictions give TP=D/2 so loss=0; flipped predictions give W=1, TP=0, loss = 1 - smooth/(D+smooth) ~ 1-1e-5, inside atol 1e-3."
+          ],
+          "deficiency": "None. Pass is by reading only; nothing was executed."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:302 class GeneralizedWassersteinDiceLoss placed beside GeneralizedDiceLoss (base/monai/losses/dice.py:181), same as reference/monai/losses/dice.py:302.",
+            "Alias generated/monai/losses/dice.py:447 (reference: reference/monai/losses/dice.py:469).",
+            "Test at generated/tests/test_generalized_wasserstein_dice_loss.py, same path as the reference test."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "Class name, constructor (dist_matrix, reduction=LossReduction.MEAN) at generated/monai/losses/dice.py:320-323; forward(input, target, smooth=1e-5) at generated/monai/losses/dice.py:420; reference forward at reference/monai/losses/dice.py:362.",
+            "Method names match the reference: wasserstein_distance_map (generated 350; reference 390), compute_weights_generalized_true_positives (generated 367; reference 456), compute_generalized_true_positive (generated 381; reference 420), compute_denominator (generated 401; reference 439).",
+            "Return shapes match: distance map (B,N) generated 350-365; alpha (B,C) generated 367-379; TP and denominator (B,) generated 381-418; scalar loss generated 442; reference returns .mean() at reference/monai/losses/dice.py:388.",
+            "Benign output-dtype divergence: generated/monai/losses/dice.py:362 casts the matrix to the input dtype, while reference/monai/losses/dice.py:397 and 414 keep the numpy float64 matrix, so the reference promotes the output to float64. This is not a contract violation."
+          ],
+          "deficiency": "None blocking. Minor divergence: output dtype for float64 numpy dist_matrix is float32 here and float64 in the reference."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:15 adds `import numpy as np`; generated/monai/losses/dice.py:17 adds `import torch.nn.functional as F`.",
+            "No new monai-internal imports. monai/losses/__init__.py only re-exports the new class (generated __init__.py:12-19).",
+            "Original imports at base/monai/losses/dice.py:12-21 are preserved."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "Export added in generated/monai/losses/__init__.py:12-19 (matches reference export).",
+            "Alias `generalized_wasserstein_dice = GeneralizedWassersteinDiceLoss` at generated/monai/losses/dice.py:447 (reference: reference/monai/losses/dice.py:469).",
+            "All original exports retained: base/monai/losses/__init__.py line 12 names Dice, DiceLoss, GeneralizedDiceLoss, MaskedDiceLoss, dice, generalized_dice are all still in the reformatted import.",
+            "docs/source/losses.rst lists GeneralizedDiceLoss via autoclass but neither the reference nor the patch adds a docs entry, so this is not a requirement."
+          ],
+          "deficiency": "None required by the reference. Optional gap: no docs/source/losses.rst entry for the new class."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "requirements.txt declares numpy>=1.17 and torch>=1.4, so the new numpy and torch.nn.functional imports need no new packages.",
+            "requirements-dev.txt:4 declares `parameterized`, used by the candidate test and existing tests (e.g. tests/test_list_data_collate.py).",
+            "No new packages introduced."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Loss is a `_Loss` subclass in monai/losses/dice.py (generated/monai/losses/dice.py:302), same placement as GeneralizedDiceLoss (base/monai/losses/dice.py:181).",
+            "forward is pure tensor math with no I/O, configuration, or framework coupling."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Reduction handled via `super().__init__(reduction=LossReduction(reduction).value)` at generated/monai/losses/dice.py:337, same as base/monai/losses/dice.py:68 and 221.",
+            "Exposed through the module's existing alias pattern (generated/monai/losses/dice.py:445-447) and the existing __init__ export list, not a parallel path."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Only torch and numpy tensor operations are used (generated/monai/losses/dice.py:350-442).",
+            "No transport, persistence, or framework boundary is crossed."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Docstrings follow the Args/Raises style of DiceLoss (base/monai/losses/dice.py:48-64) and GeneralizedDiceLoss (base/monai/losses/dice.py:201-218), including the `ValueError: reduction={reduction} is invalid` line.",
+            "Test file uses unittest plus parameterized and the same Apache header as existing tests, consistent with tests/ conventions.",
+            "Line length: the only line over 120 is generated/monai/losses/dice.py:36, which is the pre-existing Milletari citation (base/monai/losses/dice.py:34); setup.cfg:41 sets max-line-length=120.",
+            "Naming follows the reference (reference/monai/losses/dice.py:302-469)."
+          ],
+          "deficiency": "None blocking. Minor: forward slices `target[:, 0]` whenever target.dim()==input.dim() (generated/monai/losses/dice.py:430-432). This is an unvalidated shortcut that silently accepts a (B,C,...) one-hot target, which the reference's view path rejects (reference/monai/losses/dice.py:372)."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Math matches the reference term by term: distance map generated 350-365 vs reference 390-415; alpha generated 367-379 vs reference 456-465; TP generated 381-399 vs reference 420-437; denominator generated 401-418 vs reference 439-455; score and mean generated 441-442 vs reference 386-388.",
+            "Cross-sample coupling matches: both sum over a (B,B,N) broadcast, so each sample's TP and D depend on the whole batch.",
+            "reduction is stored and the output is always the batch mean, same as the reference (reference/monai/losses/dice.py:388 .mean()).",
+            "Benign differences: stricter dist_matrix dim check (generated/monai/losses/dice.py:340-342 vs reference/monai/losses/dice.py:352), which is an improvement over the reference's IndexError on 1-D input; float32 cast (generated 362) vs reference float64 promotion; silent channel slice (generated 430-432)."
+          ],
+          "deficiency": "None blocking. The silent target[:, 0] slice on invalid (B,C,...) targets is a robustness gap relative to the reference, which errors on them."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-744/round-02/candidate-02/run-08/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_generalized_wasserstein_dice_loss.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: \"patch_applies\": true, \"commands\": [] (no tests executed, per experiment setup)",
+            "patch.diff touches exactly monai/losses/__init__.py, monai/losses/dice.py, and new file tests/test_generalized_wasserstein_dice_loss.py",
+            "diff -rq base vs generated (excluding .git) reports only those three paths: __init__.py and dice.py modified, test file added; no files removed"
+          ],
+          "deficiency": "None. Patch applies cleanly to the base snapshot. Tests were not run; test expectations were checked by reading only."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:302 defines GeneralizedWassersteinDiceLoss beside GeneralizedDiceLoss, the same module the reference uses (reference.diff: monai/losses/dice.py hunk @@ -297,5 +299,171 @@)",
+            "generated/monai/losses/__init__.py:12-20 exports the class from .dice",
+            "generated/tests/test_generalized_wasserstein_dice_loss.py is at tests/ root, matching the reference test location"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:318-322 __init__(dist_matrix, reduction=LossReduction.MEAN) matches reference signature (reference.diff: __init__(self, dist_matrix, reduction: Union[LossReduction, str] = LossReduction.MEAN)); candidate only adds type annotations",
+            "generated/monai/losses/dice.py:346, 362, 376, 396 provide wasserstein_distance_map, compute_weights_generalized_true_positives, compute_generalized_true_positive, compute_denominator with the same parameter lists as the reference helpers",
+            "generated/monai/losses/dice.py:416 forward(input, target, smooth=1e-5) matches reference; returns a scalar batch mean at line 438, same as reference's wass_dice_loss.mean()",
+            "generated/monai/losses/dice.py:443 alias generalized_wasserstein_dice = GeneralizedWassersteinDiceLoss matches reference"
+          ],
+          "deficiency": "None. The candidate's broader dist_matrix annotation (Union[Tensor, ndarray]) is compatible with the reference's behavior."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "patch.diff hunk @@ -12,7 +12,9 @@ adds `import numpy as np` and `import torch.nn.functional as F` to generated/monai/losses/dice.py:15-17",
+            "dice.py continues to import monai.utils and monai.networks as before (no new upward or cross-package imports)"
+          ],
+          "deficiency": "None. Same import set as the reference diff."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/__init__.py:12-20 adds GeneralizedWassersteinDiceLoss to the monai.losses export list, and all previously exported names (Dice, DiceLoss, GeneralizedDiceLoss, MaskedDiceLoss, dice, generalized_dice) are still present",
+            "generated/monai/losses/dice.py:443 adds the lowercase alias, following the existing pattern at base dice.py:300-301",
+            "Reference.diff exports the class from monai/losses/__init__.py but not the lowercase alias, so the candidate matches the reference registration exactly"
+          ],
+          "deficiency": "None. Docs (base docs/source/losses.rst:30-35) list GeneralizedDiceLoss but the reference does not add a docs entry for the new class either, so this is not a required change."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "base requirements.txt lists torch>=1.4 and numpy>=1.17; the candidate uses only torch, numpy, and torch.nn.functional (generated/monai/losses/dice.py:15-17)",
+            "No new packages or pyproject/requirements changes in patch.diff"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "The loss lives in monai/losses alongside DiceLoss and GeneralizedDiceLoss, which is the intended layer (reference places it there too)",
+            "Subclasses torch _Loss (generated/monai/losses/dice.py:302) and uses monai.utils.LossReduction (dice.py:335), the same pattern as base dice.py:68 and 221"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "generated/monai/losses/dice.py:335 uses super().__init__(reduction=LossReduction(reduction).value), matching base DiceLoss.__init__ at dice.py:68 and GeneralizedDiceLoss at dice.py:221",
+            "Registration uses the existing module-level alias pattern (dice.py:441-443, base dice.py:300-301) rather than a parallel mechanism",
+            "No new base class, registry, or parallel loss dispatch is introduced"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "The class is pure tensor math on its inputs (generated/monai/losses/dice.py:358-438) with no I/O, config, or framework coupling",
+            "Device handling uses self.m.to(flat_proba.device) (dice.py:358), which keeps the distance matrix in the input's device domain"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Validation messages mirror the reference and base style: \"Dist Matrix is invalid.\" (dice.py:338) and the reduction ValueError documented in the docstring (dice.py:331), matching base DiceLoss (dice.py:64)",
+            "Test file uses unittest.TestCase with the Apache copyright header, matching repo tests (generated/tests/test_generalized_wasserstein_dice_loss.py:1-10, 32)",
+            "Line length is within the repo limit of 120 (setup.cfg:41). The only line over 120 in generated/monai/losses/dice.py is line 36, which is the pre-existing Milletari docstring line from base dice.py:34",
+            "Naming and docstring structure follow the file (snake_case helpers, Args/Returns blocks)"
+          ],
+          "deficiency": "Minor, non-blocking: forward has no target-vs-input shape assertion like base DiceLoss (dice.py:113-115). At generated/monai/losses/dice.py:428-429, a one-hot target whose dim equals input.dim() is silently reduced to channel 0 instead of raising. The reference would raise on that shape (its view/gather path is shape-mismatched), so the candidate is more permissive for out-of-contract input. This is a validation gap, not a contract violation, since the documented target is integer class indices."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Distance matrix handling matches reference: numpy\u2192torch conversion (dice.py:339-340), max normalization (341-342), and square check before conversion (337-338)",
+            "Wasserstein map W_s(v)=sum_k M[y,k]*p_k: candidate uses m[flat_target] and sums over classes (dice.py:358-360); traced equal to reference's gather-based wasserstein_distance_map",
+            "Class weights alpha=1/(V+1) with absent classes at 1 (dice.py:373-374), matching reference compute_weights_generalized_true_positives",
+            "TP and denominator use (1-W) and (2-W) with alpha gathered per voxel (dice.py:392-394, 412-414). Candidate's (B,1,N)*(1,B,N) broadcast gives the same (B,B,N) batch-coupled sum as reference's alpha_extended*(1-wass) broadcast, so the batch-coupling quirk is reproduced; the candidate documents it at dice.py:380-382 and 400-402",
+            "Score and mean (dice.py:437-438) match reference (wass_dice_loss.mean()); reduction is stored but not applied to forward output, same as reference",
+            "Candidate test expectations (test file lines 33-61: correct\u21920, flipped\u21921, empty class) agree with a by-hand trace of the formulas; not executed"
+          ],
+          "deficiency": "None blocking. Note that the batch-coupled TP/denominator is a faithful copy of the reference's behavior, not per-sample as in the cited paper. Since the reference is the source of truth, this is correct for the task."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/simplification/Project-MONAI__MONAI-744/round-02/candidate-02/run-09/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_generalized_wasserstein_dice_loss.py"
+        ],
+        "api_inspection": []
+      }
+    }
+  ]
+}

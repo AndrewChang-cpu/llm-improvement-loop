@@ -1,0 +1,920 @@
+diff --git a/astropy/time/core.py b/astropy/time/core.py
+index 32c0af6..86afee4 100644
+--- a/astropy/time/core.py
++++ b/astropy/time/core.py
+@@ -11,7 +11,7 @@ import enum
+ import operator
+ import os
+ import threading
+-from datetime import date, datetime, timedelta, timezone
++from datetime import date, datetime, timezone
+ from time import strftime
+ from warnings import warn
+ 
+@@ -35,6 +35,7 @@ from .formats import (
+     TimeDatetime,
+     TimeFromEpoch,  # noqa: F401
+     TimeJD,
++    TimeNumeric,
+     TimeUnique,
+ )
+ from .time_helper.function_helpers import CUSTOM_FUNCTIONS, UNSUPPORTED_FUNCTIONS
+@@ -499,8 +500,7 @@ class TimeBase(ShapedLikeNDArray):
+         inputs.  This handles coercion into the correct shapes and
+         some basic input validation.
+         """
+-        if precision is None:
+-            precision = 3
++        # A precision of None is passed through, and the format applies its default.
+         if in_subfmt is None:
+             in_subfmt = "*"
+         if out_subfmt is None:
+@@ -558,15 +558,19 @@ class TimeBase(ShapedLikeNDArray):
+         the corresponding TimeFormat class to convert the input values into
+         the internal jd1 and jd2.
+ 
+-        If format is `None` and the input is a string-type or object array then
+-        guess available formats and stop when one matches.
++        If format is `None` then guess the format: every `TimeUnique` format is
++        tried in registry order, and the first one that accepts the input wins.
+         """
+-        if format is None and (
+-            val.dtype.kind in ("S", "U", "O", "M") or val.dtype.names
+-        ):
+-            # Input is a string, object, datetime, or a table-like ndarray
+-            # (structured array, recarray). These input types can be
+-            # uniquely identified by the format classes.
++        if format is not None and not isinstance(format, str):
++            raise TypeError("format must be a string")
++
++        if format is None:
++            if val.size == 0 and (val2 is None or val2.size == 0):
++                raise ValueError(
++                    "cannot guess format from input values with zero-size array"
++                )
++
++            # Only formats that can uniquely identify their input are guessed.
+             formats = [
+                 (name, cls)
+                 for name, cls in self.FORMATS.items()
+@@ -574,19 +578,14 @@ class TimeBase(ShapedLikeNDArray):
+             ]
+ 
+             # AstropyTime is a pseudo-format that isn't in the TIME_FORMATS registry,
+-            # but try to guess it at the end.
+-            formats.append(("astropy_time", TimeAstropyTime))
+-
+-        elif not (isinstance(format, str) and format.lower() in self.FORMATS):
+-            if format is None:
+-                raise ValueError(
+-                    "No time format was given, and the input is not unique"
+-                )
+-            else:
+-                raise ValueError(
+-                    f"Format {format!r} is not one of the allowed formats "
+-                    f"{sorted(self.FORMATS)}"
+-                )
++            # but try to guess it at the end. This applies to Time only.
++            if isinstance(self, Time):
++                formats.append(("astropy_time", TimeAstropyTime))
++        elif not format.lower() in self.FORMATS:
++            raise ValueError(
++                f"Format {format!r} is not one of the allowed formats "
++                f"{sorted(self.FORMATS)}"
++            )
+         else:
+             formats = [(format, self.FORMATS[format])]
+ 
+@@ -598,21 +597,24 @@ class TimeBase(ShapedLikeNDArray):
+             except UnitConversionError:
+                 raise
+             except (ValueError, TypeError) as err:
+-                # If ``format`` specified then there is only one possibility, so raise
++                # If ``format`` is specified there is only one possibility, so raise
+                 # immediately and include the upstream exception message to make it
+                 # easier for user to see what is wrong.
+-                if len(formats) == 1:
++                if format is not None:
+                     raise ValueError(
+                         f"Input values did not match the format class {format}:"
+                         + os.linesep
+                         + f"{err.__class__.__name__}: {err}"
+                     ) from err
+-                else:
+-                    problems[name] = err
++                problems[name] = err
++
++        details = os.linesep.join(
++            f"- '{name}': {err}" for name, err in problems.items()
++        )
+         raise ValueError(
+             "Input values did not match any of the formats where the format "
+-            f"keyword is optional: {problems}"
+-        ) from problems[formats[0][0]]
++            "keyword is optional:" + os.linesep + details
++        ) from next(iter(problems.values()))
+ 
+     @property
+     def writeable(self):
+@@ -2724,7 +2726,7 @@ class TimeDelta(TimeBase):
+     The allowed values for ``format`` can be listed with::
+ 
+       >>> list(TimeDelta.FORMATS)
+-      ['sec', 'jd', 'datetime']
++      ['sec', 'jd', 'datetime', 'quantity_str']
+ 
+     Note that for time differences, the scale can be among three groups:
+     geocentric ('tai', 'tt', 'tcg'), barycentric ('tcb', 'tdb'), and rotational
+@@ -2753,13 +2755,24 @@ class TimeDelta(TimeBase):
+         "jd" is assumed and values are interpreted as days.
+         A deprecation warning is raised in this case. To avoid the warning,
+         either specify the format or add units to the input values.
++        If not given, the format is guessed from the input. A string in the
++        ``quantity_str`` form, such as ``'2.5hr'``, is guessed as that format.
+     scale : str, optional
+         Time scale of input value(s), must be one of the following values:
+         ('tdb', 'tt', 'ut1', 'tcg', 'tcb', 'tai'). If not given (or
+         ``None``), the scale is arbitrary; when added or subtracted from a
+         ``Time`` instance, it will be used without conversion.
++    precision : int, optional
++        Decimal precision when outputting seconds as floating point (int
++        value between -99 and 99 inclusive). Default: 3.
++    in_subfmt : str, optional
++        Unix wildcard pattern to select subformats for parsing string input
++        time delta values. Default: ``'*'``.
++    out_subfmt : str, optional
++        Unix wildcard pattern to select subformats for outputting time delta
++        values. Default: ``'*'``.
+     copy : bool, optional
+-        Make a copy of the input values
++        Make a copy of the input values. Keyword-only.
+     """
+ 
+     SCALES = TIME_DELTA_SCALES
+@@ -2789,31 +2802,48 @@ class TimeDelta(TimeBase):
+ 
+         return self
+ 
+-    def __init__(self, val, val2=None, format=None, scale=None, copy=False):
++    def __init__(
++        self,
++        val,
++        val2=None,
++        format=None,
++        scale=None,
++        *,
++        precision=None,
++        in_subfmt=None,
++        out_subfmt=None,
++        copy=False,
++    ):
+         if isinstance(val, TimeDelta):
+             if scale is not None:
+                 self._set_scale(scale)
+         else:
+-            format = format or self._get_format(val)
+-            self._init_from_vals(val, val2, format, scale, copy)
++            self._init_from_vals(
++                val,
++                val2,
++                format,
++                scale,
++                copy,
++                precision,
++                in_subfmt,
++                out_subfmt,
++            )
++
++            # Numeric input without a unit or an explicit format is read as days.
++            if (
++                format is None
++                and getattr(val, "unit", None) is None
++                and isinstance(self._time, TimeNumeric)
++            ):
++                warn(
++                    "Numerical value without unit or explicit format passed to"
++                    " TimeDelta, assuming days",
++                    TimeDeltaMissingUnitWarning,
++                )
+ 
+             if scale is not None:
+                 self.SCALES = TIME_DELTA_TYPES[scale]
+ 
+-    @staticmethod
+-    def _get_format(val):
+-        if isinstance(val, timedelta):
+-            return "datetime"
+-
+-        if getattr(val, "unit", None) is None:
+-            warn(
+-                "Numerical value without unit or explicit format passed to"
+-                " TimeDelta, assuming days",
+-                TimeDeltaMissingUnitWarning,
+-            )
+-
+-        return "jd"
+-
+     def replicate(self, *args, **kwargs):
+         out = super().replicate(*args, **kwargs)
+         out.SCALES = self.SCALES
+@@ -3054,7 +3084,7 @@ class TimeDelta(TimeBase):
+           tm.to_value(unit='hr', equivalencies=[])
+ 
+         The built-in `~astropy.time.TimeDelta` options for ``format`` are:
+-        {'jd', 'sec', 'datetime'}.
++        {'jd', 'sec', 'datetime', 'quantity_str'}.
+ 
+         For the two numerical formats 'jd' and 'sec', the available ``subfmt``
+         options are: {'float', 'long', 'decimal', 'str', 'bytes'}. Here, 'long'
+@@ -3065,6 +3095,11 @@ class TimeDelta(TimeBase):
+         are represented accurately.  Default: as set by ``out_subfmt`` (which by
+         default picks the first available for a given format, i.e., 'float').
+ 
++        For the 'quantity_str' format, the ``subfmt`` options are: {'multi',
++        'yr', 'd', 'hr', 'min', 's'}. 'multi' is the default and prints the
++        non-zero components among days, hours, minutes, and seconds. The other
++        options print a single value in that unit.
++
+         Parameters
+         ----------
+         format : str, optional
+@@ -3096,6 +3131,13 @@ class TimeDelta(TimeBase):
+         if not (args or kwargs):
+             raise TypeError("to_value() missing required format or unit argument")
+ 
++        allowed_kwargs = ("format", "subfmt", "unit", "equivalencies")
++        for name in kwargs:
++            if name not in allowed_kwargs:
++                raise TypeError(
++                    f"TimeDelta.to_value() got an unexpected keyword argument '{name}'"
++                )
++
+         # TODO: maybe allow 'subfmt' also for units, keeping full precision
+         # (effectively, by doing the reverse of quantity_day_frac)?
+         # This way, only equivalencies could lead to possible precision loss.
+@@ -3105,6 +3147,16 @@ class TimeDelta(TimeBase):
+             # Super-class will error with duplicate arguments, etc.
+             return super().to_value(*args, **kwargs)
+ 
++        if "subfmt" in kwargs:
++            if args:
++                raise ValueError(
++                    "cannot specify 'subfmt' and positional argument that is not a "
++                    "valid format"
++                )
++            # Output in the current format. Any other keyword (e.g. 'unit') is
++            # passed on to the base signature, which rejects it with a TypeError.
++            return super().to_value(self.format, **kwargs)
++
+         # With positional arguments, we try parsing the first one as a unit,
+         # so that on failure we can give a more informative exception.
+         if args:
+diff --git a/astropy/time/formats.py b/astropy/time/formats.py
+index 1d01871..b9651c7 100644
+--- a/astropy/time/formats.py
++++ b/astropy/time/formats.py
+@@ -42,6 +42,7 @@ __all__ = [
+     "TimeDeltaFormat",
+     "TimeDeltaSec",
+     "TimeDeltaJD",
++    "TimeDeltaQuantityString",
+     "TimeEpochDateString",
+     "TimeBesselianEpochString",
+     "TimeJulianEpochString",
+@@ -141,12 +142,14 @@ class TimeFormat:
+     _default_scale = "utc"  # As of astropy 0.4
+     subfmts = ()
+     _registry = TIME_FORMATS
++    # Inclusive (min, max) range accepted for ``precision``.
++    _precision_limits = (0, 9)
+ 
+     def __init__(
+         self, val1, val2, scale, precision, in_subfmt, out_subfmt, from_jd=False
+     ):
+         self.scale = scale  # validation of scale done later with _check_scale
+-        self.precision = precision
++        self.precision = 3 if precision is None else precision
+         self.in_subfmt = in_subfmt
+         self.out_subfmt = out_subfmt
+ 
+@@ -276,9 +279,12 @@ class TimeFormat:
+ 
+     @precision.setter
+     def precision(self, val):
+-        # Verify precision is 0-9 (inclusive)
+-        if not isinstance(val, int) or val < 0 or val > 9:
+-            raise ValueError("precision attribute must be an int between 0 and 9")
++        # Verify precision is within the class limits (inclusive)
++        low, high = self._precision_limits
++        if not isinstance(val, int) or val < low or val > high:
++            raise ValueError(
++                f"precision attribute must be an int between {low} and {high}"
++            )
+         self._precision = val
+ 
+     @lazyproperty
+@@ -2086,6 +2092,7 @@ class TimeDeltaFormat(TimeFormat):
+     """Base class for time delta representations."""
+ 
+     _registry = TIME_DELTA_FORMATS
++    _precision_limits = (-99, 99)
+ 
+     def _check_scale(self, scale):
+         """
+@@ -2122,7 +2129,7 @@ class TimeDeltaSec(TimeDeltaNumeric):
+     unit = 1.0 / erfa.DAYSEC  # for quantity input
+ 
+ 
+-class TimeDeltaJD(TimeDeltaNumeric):
++class TimeDeltaJD(TimeDeltaNumeric, TimeUnique):
+     """Time delta in Julian days (86400 SI seconds)."""
+ 
+     name = "jd"
+@@ -2175,6 +2182,199 @@ class TimeDeltaDatetime(TimeDeltaFormat, TimeUnique):
+         return self.mask_if_needed(iterator.operands[-1])
+ 
+ 
++# Unit names of the quantity_str format. Each one is also a valid astropy unit name.
++_QUANTITY_STR_UNITS = ("yr", "d", "hr", "min", "s")
++_QUANTITY_STR_NUMBER = r"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
++_QUANTITY_STR_RE = re.compile(
++    r"\s*(?P<sign>[+-])?\s*"
++    + "".join(
++        rf"(?:(?P<{unit}>{_QUANTITY_STR_NUMBER})\s*{unit}\s*)?"
++        for unit in _QUANTITY_STR_UNITS
++    )
++    + r"\s*"
++)
++
++
++def _parse_quantity_str(text):
++    """Parse one quantity_str element into (whole days, fraction of a day)."""
++    match = _QUANTITY_STR_RE.fullmatch(text)
++    if match is None or all(
++        match.group(unit) is None for unit in _QUANTITY_STR_UNITS
++    ):
++        raise ValueError(f"Time delta '{text}' does not match quantity_str format")
++
++    values = {
++        unit: float(match.group(unit)) if match.group(unit) is not None else 0.0
++        for unit in _QUANTITY_STR_UNITS
++    }
++    days = values["yr"] * 365.25 + values["d"]
++    frac = values["hr"] / 24.0 + values["min"] / 1440.0 + values["s"] / 86400.0
++    if match.group("sign") == "-":
++        days, frac = -days, -frac
++    return days, frac
++
++
++def _quantity_str_multi(days, frac, precision):
++    """Render a non-negative two-part total as multi-component text."""
++    # Split the total into whole days and the remaining fraction of a day,
++    # keeping the rounding error of the sum in the fraction.
++    total, error = two_sum(days, frac)
++    whole = float(np.floor(total))
++    rest = (total - whole) + error
++    if rest < 0.0:
++        whole -= 1.0
++        rest += 1.0
++    elif rest >= 1.0:
++        whole += 1.0
++        rest -= 1.0
++
++    secs = max(rest * 86400.0, 0.0)
++    hours = float(np.floor(secs / 3600.0))
++    secs = max(secs - hours * 3600.0, 0.0)
++    minutes = float(np.floor(secs / 60.0))
++    secs = max(secs - minutes * 60.0, 0.0)
++
++    # Round the seconds first, then carry upwards.
++    sec_r = round(secs, precision)
++    if sec_r >= 60.0:
++        sec_r -= 60.0
++        minutes += 1.0
++    if minutes >= 60.0:
++        minutes -= 60.0
++        hours += 1.0
++    if hours >= 24.0:
++        hours -= 24.0
++        whole += 1.0
++
++    parts = []
++    if whole:
++        parts.append(f"{int(whole)}d")
++    if hours:
++        parts.append(f"{int(hours)}hr")
++    if minutes:
++        parts.append(f"{int(minutes)}min")
++    if sec_r:
++        parts.append(f"{sec_r!r}s")
++    return " ".join(parts) if parts else "0.0s"
++
++
++def _quantity_str_element(days, frac, subfmt, precision):
++    """Render one two-part total in the given (resolved) subformat."""
++    sign = "-" if days + frac < 0 else ""
++    if sign:
++        days, frac = -days, -frac
++
++    if subfmt == "multi":
++        return sign + _quantity_str_multi(days, frac, precision)
++
++    # Units per day, from astropy's own conversion.
++    scale = (1.0 * u.day).to_value(u.Unit(subfmt))
++    value = round(float(days * scale + frac * scale), precision)
++    return f"{sign}{value!r}{subfmt}"
++
++
++class TimeDeltaQuantityString(TimeDeltaFormat, TimeUnique):
++    """
++    Time delta as a string of physical quantities, such as ``'2.5hr'``.
++
++    The string is an optional sign followed by components. Each component is a
++    non-negative number, optional whitespace, and one of the unit names ``yr``
++    (years), ``d`` (days), ``hr`` (hours), ``min`` (minutes), or ``s`` (seconds).
++    Unit names are lowercase and case-sensitive. Each unit appears at most once,
++    in the order ``yr``, ``d``, ``hr``, ``min``, ``s``, and at least one component
++    is required. Numbers may use an exponent, as in ``'3e7s'``. The sign applies
++    to the whole delta, and a single leading ``+`` gives the same value as no sign.
++    Examples of valid strings are ``'1s'``, ``'2.5hr'``, ``'3e7s'``, and
++    ``'2yr 3d 4hr 5min 6.789s'``. Strings with no unit, such as ``'1.0'``, are
++    not in this format. They are read as days by the ``jd`` format.
++
++    The units are physical, not calendar units. One year is 365.25 days, one day
++    is 24 hours, one hour is 60 minutes, and one minute is 60 seconds. Leap
++    seconds are not handled. Years are never calendar years. Adding one year to
++    2000-01-01 00:00:00 gives 2000-12-31 06:00:00, not 2001-01-01 00:00:00.
++
++    Values are stored as two float64 values, whole days and the fraction of a
++    day, so fractional seconds are kept over long spans.
++
++    The output subformats are ``multi``, ``yr``, ``d``, ``hr``, ``min``, and
++    ``s``. The ``*`` wildcard resolves to ``multi``. The ``multi`` subformat
++    prints only the non-zero components among days, hours, minutes, and seconds,
++    and a zero delta prints as ``0.0s``. The other subformats print one value in
++    the named unit. The ``precision`` attribute sets the number of digits printed
++    for the seconds (or for the single value) and can be from -99 to 99.
++
++    The default output, ``multi``, is not final. The exact text may change. See
++    issue 15485 for the status of this format.
++
++    Examples
++    --------
++    >>> from astropy.time import TimeDelta
++    >>> print(TimeDelta("2.5hr").value)
++    2hr 30min
++    >>> print(TimeDelta("1yr").value)
++    365d 6hr
++    >>> print(TimeDelta("3e7s").value)
++    347d 5hr 20min
++    >>> print(TimeDelta("30000010s", out_subfmt="d").value)
++    347.222d
++    >>> print(TimeDelta("30000010s").to_value(subfmt="yr"))
++    0.951yr
++    >>> print(TimeDelta("-1yr 2d 23hr 10min 5.6s", out_subfmt="d").value)
++    -368.215d
++    """
++
++    name = "quantity_str"
++    subfmts = (
++        ("multi", None, None, None),
++        ("yr", None, None, None),
++        ("d", None, None, None),
++        ("hr", None, None, None),
++        ("min", None, None, None),
++        ("s", None, None, None),
++    )
++
++    def _check_val_type(self, val1, val2):
++        if val2 is not None:
++            raise ValueError(
++                f"{self.name} objects do not accept a val2 but you provided {val2}"
++            )
++        # Zero-size input of any dtype is accepted and gives a zero-size result.
++        if val1.size and val1.dtype.kind not in "US":
++            raise TypeError(f"Input values for {self.name} class must be strings")
++        return val1, None
++
++    def set_jds(self, val1, val2):
++        self._check_scale(self._scale)  # Validate scale.
++        days = np.empty(val1.size, dtype=np.float64)
++        frac = np.empty(val1.size, dtype=np.float64)
++        for index, item in enumerate(val1.flat):
++            text = item.decode("ascii") if isinstance(item, bytes) else str(item)
++            days[index], frac[index] = _parse_quantity_str(text)
++        self.jd1, self.jd2 = day_frac(
++            days.reshape(val1.shape), frac.reshape(val1.shape)
++        )
++
++    def to_value(self, parent=None, out_subfmt=None):
++        if out_subfmt is None:
++            out_subfmt = self.out_subfmt
++        # Unrecognized names fall back to "*", which resolves to "multi".
++        subfmt = self._select_subfmts(self._get_allowed_subfmt(out_subfmt))[0][0]
++
++        # Masked elements hold NaN in jd2; they are formatted as zero and masked.
++        jd1 = self.jd1
++        jd2 = self.jd2_filled
++        texts = [
++            _quantity_str_element(float(days), float(frac), subfmt, self.precision)
++            for days, frac in zip(np.ravel(jd1), np.ravel(jd2))
++        ]
++        out = np.array(texts, dtype=str).reshape(jd1.shape)
++        return self.mask_if_needed(out)
++
++    @property
++    def value(self):
++        return self.to_value()
++
++
+ def _validate_jd_for_storage(jd):
+     if isinstance(jd, (float, int)):
+         return np.array(jd, dtype=float)
+diff --git a/astropy/time/tests/test_basic.py b/astropy/time/tests/test_basic.py
+index 39edda8..82218e2 100644
+--- a/astropy/time/tests/test_basic.py
++++ b/astropy/time/tests/test_basic.py
+@@ -2363,7 +2363,10 @@ def test_hash_time_delta():
+ def test_get_time_fmt_exception_messages():
+     with pytest.raises(ValueError) as err:
+         Time(10)
+-    assert "No time format was given, and the input is" in str(err.value)
++    assert "Input values did not match any of the formats where" in str(err.value)
++
++    with pytest.raises(TypeError, match="format must be a string"):
++        Time("2000:001", format=1)
+ 
+     with pytest.raises(ValueError) as err:
+         Time("2000:001", format="not-a-format")
+diff --git a/astropy/time/tests/test_delta.py b/astropy/time/tests/test_delta.py
+index e4e85b4..fb2eea2 100644
+--- a/astropy/time/tests/test_delta.py
++++ b/astropy/time/tests/test_delta.py
+@@ -2,6 +2,7 @@
+ import functools
+ import itertools
+ import operator
++import warnings
+ from datetime import timedelta
+ from decimal import Decimal
+ 
+@@ -20,6 +21,7 @@ from astropy.time import (
+     TimeDelta,
+     TimeDeltaMissingUnitWarning,
+ )
++from astropy.time.formats import TimeDeltaQuantityString
+ from astropy.utils import iers
+ 
+ allclose_jd = functools.partial(np.allclose, rtol=2.0**-52, atol=0)
+@@ -685,3 +687,231 @@ def test_no_units_warning():
+     # table column with units
+     table = Table({"t": [1, 2, 3] * u.s})
+     assert np.all(TimeDelta(table["t"]).to_value(u.s) == [1, 2, 3])
++
++
++def test_quantity_str_basic_parse_multi():
++    cases = {
++        "1s": "1.0s",
++        "1min": "1min",
++        "2.5hr": "2hr 30min",
++        "3.000001e7s": "347d 5hr 20min 10.0s",
++        "3.e7s": "347d 5hr 20min",
++        "3e7s": "347d 5hr 20min",
++        "1.0123456789012345s": "1.012s",
++        "  100.0 d1.0123456789012345 s ": "100d 1.012s",
++        "2yr 3d 4hr 5min 6.789s": "733d 16hr 5min 6.789s",
++        "2.5yr 3.5d 4.5hr 5.5min 6.789s": "916d 19hr 35min 36.789s",
++    }
++    for text, expected in cases.items():
++        dt = TimeDelta(text)
++        assert dt.format == "quantity_str"
++        assert dt.value == expected
++
++
++def test_quantity_str_sign():
++    assert TimeDelta("+2.5hr").value == "2hr 30min"
++    assert TimeDelta("-2.5hr").value == "-2hr 30min"
++    assert TimeDelta("-2.5hr").jd == -TimeDelta("2.5hr").jd
++    assert TimeDelta("-1yr 2d 23hr 10min 5.6s").to_value(subfmt="d") == "-368.215d"
++
++
++def test_quantity_str_subformats_out_subfmt():
++    assert TimeDelta("1yr 3.6d", out_subfmt="d").value == "368.85d"
++    assert TimeDelta("-1yr 2d 23hr 10min 5.6s", out_subfmt="d").value == "-368.215d"
++    assert TimeDelta("40hr", out_subfmt="multi").value == "1d 16hr"
++    assert TimeDelta("40hr", out_subfmt="d").value == "1.667d"
++    assert (
++        TimeDelta("40hr", out_subfmt="d", precision=9).value == "1.666666667d"
++    )
++
++
++@pytest.mark.parametrize(
++    "subfmt, expected",
++    [
++        ("multi", "347d 5hr 20min 10.0s"),
++        ("yr", "0.951yr"),
++        ("d", "347.222d"),
++        ("hr", "8333.336hr"),
++        ("min", "500000.167min"),
++        ("s", "30000010.0s"),
++    ],
++)
++def test_quantity_str_subformats(subfmt, expected):
++    dt = TimeDelta("30000010s")
++    assert TimeDelta("30000010s", out_subfmt=subfmt).value == expected
++    assert dt.to_value(subfmt=subfmt) == expected
++    assert dt.to_value("quantity_str", subfmt) == expected
++    # From a Quantity, using an explicit input format.
++    dt_q = TimeDelta(30000010.0 * u.s, format="jd")
++    assert dt_q.to_value("quantity_str", subfmt) == expected
++
++
++def test_quantity_str_unknown_subfmt_falls_back_to_multi():
++    # The internal output path coerces an unrecognized name to '*', i.e. multi.
++    dt = TimeDelta("30000010s")
++    assert dt._time.to_value(out_subfmt="nonsense") == "347d 5hr 20min 10.0s"
++
++
++def test_quantity_str_precision():
++    assert TimeDelta("21.123456789012345s").value == "21.123s"
++    assert TimeDelta("21.123456789012345s", precision=-1).value == "20.0s"
++    assert TimeDelta("21.123456789012345s", precision=12).value == (
++        "21.123456789012s"
++    )
++    assert TimeDelta("100.0d 1.0123456789012345s", precision=9).value == (
++        "100d 1.012345679s"
++    )
++    assert TimeDelta(
++        "100.0d 1.0123456789012345s", precision=9, out_subfmt="d"
++    ).value == ("100.000011717d")
++    with pytest.raises(ValueError, match=r"between -99 and 99"):
++        TimeDelta("1s", format="quantity_str", precision=100)
++
++
++def test_quantity_str_two_part_internal_precision():
++    dt = TimeDelta("100000000d 1.0123456789012345s")
++    assert dt.jd1 == 100000000
++    assert dt.jd2 * 86400 == pytest.approx(1.0123456789012345, rel=1e-12)
++    assert (
++        TimeDelta("100000000d 1.0123456789012345s", precision=9).value
++        == "100000000d 1.012345679s"
++    )
++
++
++def test_quantity_str_zero():
++    assert TimeDelta("0d").value == "0.0s"
++    assert TimeDelta("0s").value == "0.0s"
++
++
++def test_quantity_str_overflow_carry():
++    assert TimeDelta("1d 23hr 59min 59.9999s").value == "2d"
++    assert (
++        TimeDelta("1d 23hr 59min 59.9999s", precision=9).value
++        == "1d 23hr 59min 59.9999s"
++    )
++    assert TimeDelta("1d 23hr 58min 59.9999s").value == "1d 23hr 59min"
++    assert TimeDelta("1d 23hr 59min 60.0001s").value == "2d"
++    assert TimeDelta("2d 0.0001s", precision=9).value == "2d 0.0001s"
++
++
++@pytest.mark.parametrize(
++    "text",
++    [
++        "",
++        "   ",
++        "+",
++        "1.0s 2.0s",
++        "1.0s 2.0",
++        "1.0s 2min",
++        "++1.0s",
++        "2min +1s",
++        "2d -1s",
++        "1sec",
++    ],
++)
++def test_quantity_str_invalid_explicit_format(text):
++    with pytest.raises(
++        ValueError, match=r"Input values did not match the format class quantity_str"
++    ):
++        TimeDelta(text, format="quantity_str")
++
++
++@pytest.mark.parametrize(
++    "text",
++    ["", "   ", "+", "1.0s 2.0s", "1.0s 2.0", "1.0s 2min", "++1.0s", "2min +1s"],
++)
++def test_quantity_str_invalid_guessed(text):
++    with pytest.raises(
++        ValueError,
++        match=r"Input values did not match any of the formats where the format "
++        r"keyword is optional",
++    ):
++        TimeDelta(text)
++
++
++def test_quantity_str_invalid_element_message():
++    with pytest.raises(ValueError, match=r"does not match quantity_str format"):
++        TimeDelta("1.0s 2.0", format="quantity_str")
++
++
++def test_quantity_str_bytes_input():
++    assert TimeDelta(b"2.5hr").value == "2hr 30min"
++    assert TimeDelta(b"2.5hr", format="quantity_str").value == "2hr 30min"
++
++
++def test_quantity_str_non_string_input_direct():
++    # Constructed directly with valid subformat names.
++    with pytest.raises(TypeError, match=r"must be strings"):
++        TimeDeltaQuantityString(np.array([1.0]), None, None, None, "*", "*")
++
++    # Through TimeDelta, the explicit-format failure is a ValueError.
++    with pytest.raises(ValueError, match=r"did not match the format class"):
++        TimeDelta(1.0, format="quantity_str")
++
++
++def test_quantity_str_val2_error():
++    with pytest.raises(ValueError, match=r"val2"):
++        TimeDelta("1s", "2s")
++    with pytest.raises(ValueError, match=r"do not accept a val2"):
++        TimeDelta("1s", "2s", format="quantity_str")
++
++
++def test_quantity_str_zero_size():
++    with pytest.raises(
++        ValueError, match=r"cannot guess format from input values with zero-size array"
++    ):
++        TimeDelta([])
++    dt = TimeDelta([], format="quantity_str")
++    assert dt.shape == (0,)
++    assert dt.value.shape == (0,)
++
++
++def test_quantity_str_is_guessed_and_listed():
++    assert list(TimeDelta.FORMATS) == ["sec", "jd", "datetime", "quantity_str"]
++    assert TimeDelta("2.5hr").format == "quantity_str"
++    assert TimeDelta(timedelta(days=1)).format == "datetime"
++    assert TimeDelta(1.0 * u.s).format == "jd"
++
++
++def test_to_value_keyword_validation():
++    dt = TimeDelta("1s")
++    with pytest.raises(TypeError, match=r"unexpected keyword argument 'foo'"):
++        dt.to_value(foo=1)
++    with pytest.raises(TypeError):
++        dt.to_value(subfmt="s", unit=u.s)
++    with pytest.raises(TypeError):
++        dt.to_value("sec", unit=u.s)
++    with pytest.raises(ValueError, match=r"cannot specify 'subfmt'"):
++        dt.to_value(u.s, subfmt="s")
++
++
++def test_unitless_numeric_string_is_days_with_warning():
++    with pytest.warns(TimeDeltaMissingUnitWarning, match=r"assuming days"):
++        dt1 = TimeDelta("1.0")
++    assert dt1.format == "jd"
++    assert dt1.jd == 1.0
++    assert dt1.value == 1.0
++
++    with pytest.warns(TimeDeltaMissingUnitWarning):
++        dt2 = TimeDelta("2.5")
++    assert dt2.format == "jd"
++    assert dt2.jd == 2.5
++
++
++def test_unitless_numeric_with_format_or_unit_has_no_warning():
++    with warnings.catch_warnings(record=True) as record:
++        warnings.simplefilter("always")
++        TimeDelta("1.0", format="jd")
++        TimeDelta(1.0, format="jd")
++        TimeDelta(1.0 * u.s)
++        TimeDelta("2.5hr")
++        TimeDelta(timedelta(days=1))
++    missing_unit = [
++        w for w in record if issubclass(w.category, TimeDeltaMissingUnitWarning)
++    ]
++    assert not missing_unit
++
++
++def test_time_delta_positional_copy_rejected():
++    with pytest.raises(TypeError):
++        TimeDelta(1.0, None, None, None, 3)
+diff --git a/astropy/time/tests/test_quantity_interaction.py b/astropy/time/tests/test_quantity_interaction.py
+index 52dda8c..2ca685c 100644
+--- a/astropy/time/tests/test_quantity_interaction.py
++++ b/astropy/time/tests/test_quantity_interaction.py
+@@ -151,7 +151,11 @@ class TestTimeDeltaQuantity:
+             dt.to_value("parrot")
+         with pytest.raises(TypeError):
+             dt.to_value("sec", unit=u.s)
+-        with pytest.raises(TypeError):
++        with pytest.raises(
++            ValueError,
++            match=r"cannot specify 'subfmt' and positional argument "
++            r"that is not a valid format",
++        ):
+             # TODO: would be nice to make this work!
+             dt.to_value(u.s, subfmt="str")
+ 
+diff --git a/docs/changes/time/15264.api.rst b/docs/changes/time/15264.api.rst
+new file mode 100644
+index 0000000..bfb8452
+--- /dev/null
++++ b/docs/changes/time/15264.api.rst
+@@ -0,0 +1,5 @@
++The ``precision``, ``in_subfmt``, ``out_subfmt``, and ``copy`` arguments of
++`~astropy.time.TimeDelta` are now keyword-only when a `~astropy.time.TimeDelta`
++is constructed from a value. ``val``, ``val2``, ``format``, and ``scale`` remain
++positional. Format guessing for `~astropy.time.TimeDelta` now tries every
++``TimeUnique`` delta format, which includes ``jd``.
+diff --git a/docs/changes/time/15264.feature.rst b/docs/changes/time/15264.feature.rst
+new file mode 100644
+index 0000000..47f02d6
+--- /dev/null
++++ b/docs/changes/time/15264.feature.rst
+@@ -0,0 +1,5 @@
++Added a ``quantity_str`` format to `~astropy.time.TimeDelta` for physical time
++deltas written as strings such as ``'2.5hr'`` or ``'2yr 3d 4hr 5min 6.789s'``.
++Such strings are guessed as this format without an explicit format. The output
++subformats are ``multi``, ``yr``, ``d``, ``hr``, ``min``, and ``s``. The default
++output of this format is not final (see issue 15485).
+diff --git a/docs/time/index.rst b/docs/time/index.rst
+index b2ba8cd..322013c 100644
+--- a/docs/time/index.rst
++++ b/docs/time/index.rst
+@@ -329,6 +329,7 @@ that have them is:
+ Format           Subformats
+ ================ ========================================
+ ``jd``           float, long, decimal, str, bytes
++``quantity_str`` multi, yr, d, hr, min, s
+ ``sec``          float, long, decimal, str, bytes
+ ================ ========================================
+ 
+@@ -1212,13 +1213,29 @@ day is exactly 86400 seconds. Hence, the scale cannot be UTC.
+ 
+ The available time formats are:
+ 
+-=========  ===================================================
+-Format     Class
+-=========  ===================================================
+-sec        :class:`~astropy.time.TimeDeltaSec`
+-jd         :class:`~astropy.time.TimeDeltaJD`
+-datetime   :class:`~astropy.time.TimeDeltaDatetime`
+-=========  ===================================================
++============  ===================================================
++Format        Class
++============  ===================================================
++sec           :class:`~astropy.time.TimeDeltaSec`
++jd            :class:`~astropy.time.TimeDeltaJD`
++datetime      :class:`~astropy.time.TimeDeltaDatetime`
++quantity_str  :class:`~astropy.time.TimeDeltaQuantityString`
++============  ===================================================
++
++The ``quantity_str`` format is described in the following section.
++
++TimeDelta quantity_str Format
++^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
++
++The ``quantity_str`` format represents a physical time delta as a string of
++components, such as ``'2.5hr'`` or ``'2yr 3d 4hr 5min 6.789s'``. Each component
++is a non-negative number, optional whitespace, and one of the units ``yr``,
++``d``, ``hr``, ``min``, or ``s``. The string may begin with a sign. Such strings
++are recognized without an explicit format, so ``TimeDelta('2.5hr')`` is valid.
++The units are physical, not calendar units: one year is 365.25 days. Years are
++never calendar years, so adding one year to 2000-01-01 00:00:00 does not give
++2001-01-01 00:00:00. See :class:`~astropy.time.TimeDeltaQuantityString` for the
++full grammar. The default output is not final (see issue 15485).
+ 
+ Examples
+ ^^^^^^^^
+diff --git a/docs/whatsnew/6.0.rst b/docs/whatsnew/6.0.rst
+index a0ef90e..8498e58 100644
+--- a/docs/whatsnew/6.0.rst
++++ b/docs/whatsnew/6.0.rst
+@@ -334,6 +334,27 @@ metadata is accessible on the column level:
+     OrderedDict([('ucd', 'phys.SFR'), ('utype', 'none')])
+ 
+ 
++Physical time delta string format for TimeDelta
++===============================================
++
++A new ``quantity_str`` format for `~astropy.time.TimeDelta` represents a physical
++time delta as a string of components, such as ``'2.5hr'`` or
++``'2yr 3d 4hr 5min 6.789s'``. The units are years (``yr``), days (``d``), hours
++(``hr``), minutes (``min``), and seconds (``s``). The units are physical, not
++calendar units: one year is 365.25 days. Strings in this form are accepted
++without an explicit format. The output subformats ``multi``, ``yr``, ``d``,
++``hr``, ``min``, and ``s`` select the output, and ``precision`` applies to the
++selected subformat.
++
++The ``precision``, ``in_subfmt``, ``out_subfmt``, and ``copy`` arguments of
++`~astropy.time.TimeDelta` are now keyword-only when a `~astropy.time.TimeDelta`
++is constructed from a value. Positional use of these arguments is no longer
++accepted.
++
++The default output of the ``quantity_str`` format is not final, and it may
++change in a later release. See issue 15485 for the status of this format.
++
++
+ Full change log
+ ===============
+ 

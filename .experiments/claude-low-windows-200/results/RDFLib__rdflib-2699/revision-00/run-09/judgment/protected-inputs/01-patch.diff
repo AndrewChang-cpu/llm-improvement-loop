@@ -1,0 +1,226 @@
+diff --git a/rdflib/paths.py b/rdflib/paths.py
+index 6d70ee1..15124e2 100644
+--- a/rdflib/paths.py
++++ b/rdflib/paths.py
+@@ -588,6 +588,90 @@ def neg_path(p: Union[URIRef, AlternativePath, InvPath]) -> NegatedPath:
+     return NegatedPath(p)
+ 
+ 
++def shacl_path_to_rdflib(
++    graph: Graph, node: Node
++) -> Union[URIRef, Path]:
++    """
++    Convert the value of a SHACL ``sh:path`` (a node in ``graph``) into an
++    RDFLib-friendly object.
++
++    The result is a :class:`~rdflib.term.URIRef` when the path is simply a
++    predicate, otherwise a :class:`Path` (inverse, sequence, alternative or
++    cardinality path) built from the SHACL path structure.
++
++    >>> from rdflib import Graph, Namespace, BNode, URIRef
++    >>> from rdflib.namespace import RDF, SH
++    >>> ex = Namespace("http://example.org/")
++    >>> g = Graph()
++    >>> inv = BNode()
++    >>> _ = g.add((inv, SH.inversePath, ex.broader))
++    >>> shacl_path_to_rdflib(g, inv)
++    Path(~http://example.org/broader)
++    >>> shacl_path_to_rdflib(g, ex.name)
++    rdflib.term.URIRef('http://example.org/name')
++
++    :raises ValueError: if ``node`` is not a valid SHACL path.
++    """
++    from rdflib.namespace import RDF, SH
++
++    if not isinstance(node, Node) or node == RDF.nil:
++        raise ValueError(f"Not a valid SHACL path node: {node!r}")
++    if isinstance(node, URIRef):
++        return node
++
++    def _list_items(head: Node) -> List[Node]:
++        items: List[Node] = []
++        seen: Set[Node] = set()
++        current: Node = head
++        while current != RDF.nil:
++            if current in seen:
++                raise ValueError(f"Cyclic RDF list in SHACL path: {head!r}")
++            seen.add(current)
++            first = graph.value(current, RDF.first)
++            rest = graph.value(current, RDF.rest)
++            if first is None or rest is None:
++                raise ValueError(f"Malformed RDF list in SHACL path: {head!r}")
++            items.append(first)
++            current = rest
++        return items
++
++    inverse = _single_value(graph, node, SH.inversePath)
++    if inverse is not None:
++        return InvPath(shacl_path_to_rdflib(graph, inverse))
++
++    alternatives = _single_value(graph, node, SH.alternativePath)
++    if alternatives is not None:
++        return AlternativePath(
++            *(shacl_path_to_rdflib(graph, i) for i in _list_items(alternatives))
++        )
++
++    for pred, mod in (
++        (SH.zeroOrMorePath, ZeroOrMore),
++        (SH.oneOrMorePath, OneOrMore),
++        (SH.zeroOrOnePath, ZeroOrOne),
++    ):
++        inner = _single_value(graph, node, pred)
++        if inner is not None:
++            return MulPath(shacl_path_to_rdflib(graph, inner), mod)
++
++    if graph.value(node, RDF.first) is not None:
++        items = _list_items(node)
++        if not items:
++            raise ValueError("Empty sequence in SHACL path")
++        if len(items) == 1:
++            return shacl_path_to_rdflib(graph, items[0])
++        return SequencePath(*(shacl_path_to_rdflib(graph, i) for i in items))
++
++    raise ValueError(f"Not a valid SHACL path: {node!r}")
++
++
++def _single_value(graph: Graph, node: Node, predicate: URIRef) -> Optional[Node]:
++    values = list(graph.objects(node, predicate))
++    if len(values) > 1:
++        raise ValueError(f"Multiple values for {predicate} in SHACL path {node!r}")
++    return values[0] if values else None
++
++
+ if __name__ == "__main__":
+     pass
+ else:
+diff --git a/test/test_path.py b/test/test_path.py
+index 1af0227..d047c95 100644
+--- a/test/test_path.py
++++ b/test/test_path.py
+@@ -6,7 +6,7 @@ from typing import Union
+ import pytest
+ 
+ from rdflib import RDF, RDFS, Graph, URIRef
+-from rdflib.namespace import DCAT, DCTERMS
++from rdflib.namespace import DCAT, DCTERMS, SH
+ from rdflib.paths import (
+     AlternativePath,
+     InvPath,
+@@ -142,3 +142,117 @@ def test_hash(lhs: Path, rhs: Path) -> None:
+ def test_dict_key(insert_path: Path, check_path: Path) -> None:
+     d = {insert_path: "foo"}
+     assert d[check_path] == "foo"
++
++
++def _shacl_graph(turtle: str) -> Graph:
++    g = Graph()
++    g.parse(data=turtle, format="turtle")
++    return g
++
++
++SHACL_PREFIXES = """
++@prefix sh: <http://www.w3.org/ns/shacl#> .
++@prefix ex: <http://example.org/> .
++@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
++"""
++
++
++def test_shacl_path_uriref() -> None:
++    from rdflib.paths import shacl_path_to_rdflib
++
++    g = _shacl_graph(SHACL_PREFIXES + "ex:shape sh:path skos:broader .")
++    result = shacl_path_to_rdflib(g, g.value(URIRef("http://example.org/shape"), SH.path))
++    assert result == URIRef("http://www.w3.org/2004/02/skos/core#broader")
++    assert not isinstance(result, Path)
++
++
++def test_shacl_path_inverse() -> None:
++    from rdflib.paths import shacl_path_to_rdflib
++
++    g = _shacl_graph(
++        SHACL_PREFIXES + "ex:shape sh:path [ sh:inversePath skos:broader ] ."
++    )
++    result = shacl_path_to_rdflib(g, g.value(URIRef("http://example.org/shape"), SH.path))
++    assert isinstance(result, InvPath)
++    assert result == ~URIRef("http://www.w3.org/2004/02/skos/core#broader")
++
++
++def test_shacl_path_sequence() -> None:
++    from rdflib.paths import shacl_path_to_rdflib
++
++    g = _shacl_graph(
++        SHACL_PREFIXES
++        + "ex:shape sh:path ( ex:a [ sh:inversePath ex:b ] ex:c ) ."
++    )
++    result = shacl_path_to_rdflib(g, g.value(URIRef("http://example.org/shape"), SH.path))
++    assert isinstance(result, SequencePath)
++    a, b, c = (URIRef(f"http://example.org/{x}") for x in "abc")
++    assert result == SequencePath(a, InvPath(b), c)
++
++
++def test_shacl_path_alternative() -> None:
++    from rdflib.paths import shacl_path_to_rdflib
++
++    g = _shacl_graph(
++        SHACL_PREFIXES
++        + "ex:shape sh:path [ sh:alternativePath ( ex:a ex:b ) ] ."
++    )
++    result = shacl_path_to_rdflib(g, g.value(URIRef("http://example.org/shape"), SH.path))
++    assert isinstance(result, AlternativePath)
++    a, b = URIRef("http://example.org/a"), URIRef("http://example.org/b")
++    assert result == AlternativePath(a, b)
++
++
++@pytest.mark.parametrize(
++    "predicate, mod",
++    [
++        ("sh:zeroOrMorePath", ZeroOrMore),
++        ("sh:oneOrMorePath", OneOrMore),
++        ("sh:zeroOrOnePath", ZeroOrOne),
++    ],
++)
++def test_shacl_path_modifiers(predicate: str, mod: str) -> None:
++    from rdflib.paths import shacl_path_to_rdflib
++
++    g = _shacl_graph(
++        SHACL_PREFIXES + f"ex:shape sh:path [ {predicate} skos:broader ] ."
++    )
++    result = shacl_path_to_rdflib(g, g.value(URIRef("http://example.org/shape"), SH.path))
++    assert isinstance(result, MulPath)
++    assert result.mod == mod
++    assert result == MulPath(URIRef("http://www.w3.org/2004/02/skos/core#broader"), mod)
++
++
++def test_shacl_path_nested_and_usable_with_graph() -> None:
++    from rdflib.paths import shacl_path_to_rdflib
++
++    g = _shacl_graph(
++        SHACL_PREFIXES
++        + """
++        ex:shape sh:path [ sh:inversePath [ sh:oneOrMorePath ex:knows ] ] .
++        ex:alice ex:knows ex:bob .
++        ex:bob ex:knows ex:carol .
++        """
++    )
++    path = shacl_path_to_rdflib(g, g.value(URIRef("http://example.org/shape"), SH.path))
++    assert isinstance(path, InvPath)
++    carol = URIRef("http://example.org/carol")
++    bob = URIRef("http://example.org/bob")
++    alice = URIRef("http://example.org/alice")
++    assert set(g.objects(carol, path)) == {bob, alice}
++
++
++@pytest.mark.parametrize(
++    "turtle",
++    [
++        "ex:shape sh:path _:x . ",
++        "ex:shape sh:path ( ) .",
++    ],
++)
++def test_shacl_path_invalid(turtle: str) -> None:
++    from rdflib.paths import shacl_path_to_rdflib
++
++    g = _shacl_graph(SHACL_PREFIXES + turtle)
++    node = g.value(URIRef("http://example.org/shape"), SH.path)
++    with pytest.raises(ValueError):
++        shacl_path_to_rdflib(g, node)

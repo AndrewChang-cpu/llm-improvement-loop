@@ -1,0 +1,202 @@
+diff --git a/rdflib/paths.py b/rdflib/paths.py
+index 6d70ee1..45d56e8 100644
+--- a/rdflib/paths.py
++++ b/rdflib/paths.py
+@@ -588,6 +588,74 @@ def neg_path(p: Union[URIRef, AlternativePath, InvPath]) -> NegatedPath:
+     return NegatedPath(p)
+ 
+ 
++def parse_shacl_path(graph: Graph, node: Node) -> Union[URIRef, Path]:
++    """
++    Parse a SHACL path, as found in the object of a ``sh:path`` triple,
++    into an RDFLib-friendly path.
++
++    A simple predicate (a URIRef) is returned as-is. Complex paths are
++    returned as :class:`Path` instances, as described in
++    https://www.w3.org/TR/shacl/#property-paths
++
++    >>> from rdflib import Graph, Namespace
++    >>> from rdflib.namespace import SH
++    >>> ex = Namespace("http://example.org/")
++    >>> g = Graph().parse(data='''
++    ... @prefix sh: <http://www.w3.org/ns/shacl#> .
++    ... @prefix ex: <http://example.org/> .
++    ... ex:s sh:path [ sh:inversePath ex:broader ] .
++    ... ''', format="turtle")
++    >>> p = parse_shacl_path(g, g.value(ex.s, SH.path))
++    >>> p.n3(g.namespace_manager)
++    '^ex:broader'
++
++    :param graph: graph containing the SHACL path description
++    :param node: the node that is the value of ``sh:path``
++    :raises ValueError: if the node does not describe a valid SHACL path
++    """
++    # imported here to avoid circular imports
++    from rdflib.collection import Collection
++    from rdflib.namespace import RDF, SH
++
++    if isinstance(node, URIRef) and node != RDF.nil:
++        return node
++
++    def _single(prop: URIRef) -> Node:
++        values = list(graph.objects(node, prop))
++        if len(values) != 1:
++            raise ValueError(
++                "SHACL path node %r must have exactly one %s, found %d"
++                % (node, prop, len(values))
++            )
++        return values[0]
++
++    def _list_items(list_node: Node) -> List[Union[URIRef, Path]]:
++        if list_node == RDF.nil:
++            raise ValueError("SHACL path list must not be empty")
++        return [parse_shacl_path(graph, item) for item in Collection(graph, list_node)]
++
++    if (node, SH.inversePath, None) in graph:
++        return InvPath(parse_shacl_path(graph, _single(SH.inversePath)))
++
++    if (node, SH.alternativePath, None) in graph:
++        items = _list_items(_single(SH.alternativePath))
++        return AlternativePath(*items)
++
++    for prop, mod in (
++        (SH.zeroOrMorePath, ZeroOrMore),
++        (SH.oneOrMorePath, OneOrMore),
++        (SH.zeroOrOnePath, ZeroOrOne),
++    ):
++        if (node, prop, None) in graph:
++            return MulPath(parse_shacl_path(graph, _single(prop)), mod)
++
++    if (node, RDF.first, None) in graph or node == RDF.nil:
++        items = _list_items(node)
++        return SequencePath(*items)
++
++    raise ValueError("Not a valid SHACL path: %r" % (node,))
++
++
+ if __name__ == "__main__":
+     pass
+ else:
+diff --git a/test/test_path.py b/test/test_path.py
+index 1af0227..5120459 100644
+--- a/test/test_path.py
++++ b/test/test_path.py
+@@ -142,3 +142,118 @@ def test_hash(lhs: Path, rhs: Path) -> None:
+ def test_dict_key(insert_path: Path, check_path: Path) -> None:
+     d = {insert_path: "foo"}
+     assert d[check_path] == "foo"
++
++
++SHACL_PREFIX = """
++@prefix sh: <http://www.w3.org/ns/shacl#> .
++@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
++@prefix ex: <http://example.org/> .
++"""
++
++
++@pytest.mark.parametrize(
++    ["turtle_path", "expected_n3"],
++    [
++        ("skos:broader", "<http://www.w3.org/2004/02/skos/core#broader>"),
++        (
++            "[ sh:inversePath skos:broader ]",
++            "^<http://www.w3.org/2004/02/skos/core#broader>",
++        ),
++        (
++            "[ sh:zeroOrMorePath skos:broader ]",
++            "<http://www.w3.org/2004/02/skos/core#broader>*",
++        ),
++        (
++            "[ sh:oneOrMorePath skos:broader ]",
++            "<http://www.w3.org/2004/02/skos/core#broader>+",
++        ),
++        (
++            "[ sh:zeroOrOnePath skos:broader ]",
++            "<http://www.w3.org/2004/02/skos/core#broader>?",
++        ),
++        (
++            "[ sh:alternativePath ( skos:broader skos:narrower ) ]",
++            "<http://www.w3.org/2004/02/skos/core#broader>|"
++            "<http://www.w3.org/2004/02/skos/core#narrower>",
++        ),
++        (
++            "( skos:broader skos:narrower )",
++            "<http://www.w3.org/2004/02/skos/core#broader>/"
++            "<http://www.w3.org/2004/02/skos/core#narrower>",
++        ),
++        (
++            "[ sh:inversePath [ sh:zeroOrMorePath skos:broader ] ]",
++            "^<http://www.w3.org/2004/02/skos/core#broader>*",
++        ),
++    ],
++)
++def test_parse_shacl_path(turtle_path: str, expected_n3: str) -> None:
++    from rdflib.paths import parse_shacl_path
++    from rdflib.namespace import SH
++
++    g = Graph().parse(
++        data=SHACL_PREFIX + "ex:shape sh:path " + turtle_path + " .",
++        format="turtle",
++    )
++    node = g.value(URIRef("http://example.org/shape"), SH.path)
++    parsed = parse_shacl_path(g, node)
++    assert parsed.n3() == expected_n3
++
++
++def test_parse_shacl_path_simple_is_uriref() -> None:
++    from rdflib.paths import parse_shacl_path
++    from rdflib.namespace import SH
++
++    g = Graph().parse(
++        data=SHACL_PREFIX + "ex:shape sh:path skos:broader .",
++        format="turtle",
++    )
++    node = g.value(URIRef("http://example.org/shape"), SH.path)
++    parsed = parse_shacl_path(g, node)
++    assert isinstance(parsed, URIRef)
++    assert parsed == URIRef("http://www.w3.org/2004/02/skos/core#broader")
++
++
++def test_parse_shacl_path_types() -> None:
++    from rdflib.paths import parse_shacl_path
++    from rdflib.namespace import SH
++
++    g = Graph().parse(
++        data=SHACL_PREFIX
++        + "ex:shape sh:path [ sh:inversePath skos:broader ] .",
++        format="turtle",
++    )
++    node = g.value(URIRef("http://example.org/shape"), SH.path)
++    parsed = parse_shacl_path(g, node)
++    assert isinstance(parsed, InvPath)
++    assert isinstance(parsed.arg, URIRef)
++
++
++def test_parse_shacl_path_eval() -> None:
++    from rdflib.paths import parse_shacl_path
++    from rdflib.namespace import SH
++
++    g = Graph().parse(
++        data=SHACL_PREFIX
++        + """
++        ex:shape sh:path [ sh:inversePath skos:broader ] .
++        ex:a skos:broader ex:b .
++        """,
++        format="turtle",
++    )
++    node = g.value(URIRef("http://example.org/shape"), SH.path)
++    path = parse_shacl_path(g, node)
++    assert list(g.objects(URIRef("http://example.org/b"), path)) == [
++        URIRef("http://example.org/a")
++    ]
++
++
++def test_parse_shacl_path_invalid() -> None:
++    from rdflib import BNode
++    from rdflib.paths import parse_shacl_path
++
++    g = Graph()
++    with pytest.raises(ValueError):
++        parse_shacl_path(g, BNode())
++    with pytest.raises(ValueError):
++        parse_shacl_path(g, RDF.nil)

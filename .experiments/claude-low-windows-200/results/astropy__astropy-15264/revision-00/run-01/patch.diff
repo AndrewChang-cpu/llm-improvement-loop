@@ -1,0 +1,158 @@
+diff --git a/astropy/time/formats.py b/astropy/time/formats.py
+index 1d01871..18071a2 100644
+--- a/astropy/time/formats.py
++++ b/astropy/time/formats.py
+@@ -49,6 +49,7 @@ __all__ = [
+     "TIME_DELTA_FORMATS",
+     "TimezoneInfo",
+     "TimeDeltaDatetime",
++    "TimeDeltaQuantityString",
+     "TimeDatetime64",
+     "TimeYMDHMS",
+     "TimeNumeric",
+@@ -2175,6 +2176,145 @@ class TimeDeltaDatetime(TimeDeltaFormat, TimeUnique):
+         return self.mask_if_needed(iterator.operands[-1])
+ 
+ 
++# Number of days in one unit of each component of the quantity_str format.
++# Calendar-free physical units: 1 yr = 365.25 d, 1 d = 24 hr, etc.
++_QUANTITY_STR_DAYS = {
++    "yr": 365.25,
++    "d": 1.0,
++    "hr": 1.0 / 24.0,
++    "min": 1.0 / 1440.0,
++    "s": 1.0 / 86400.0,
++}
++
++_QUANTITY_STR_NUM = r"(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
++# Single regex describing the full input format. Components must appear in the
++# fixed order yr, d, hr, min, s, each optional, with optional whitespace.
++_QUANTITY_STR_RE = re.compile(
++    r"\s*(?P<sign>[-+]?)\s*"
++    rf"(?:(?P<yr>{_QUANTITY_STR_NUM})\s*yr\s*)?"
++    rf"(?:(?P<d>{_QUANTITY_STR_NUM})\s*d\s*)?"
++    rf"(?:(?P<hr>{_QUANTITY_STR_NUM})\s*hr\s*)?"
++    rf"(?:(?P<min>{_QUANTITY_STR_NUM})\s*min\s*)?"
++    rf"(?:(?P<s>{_QUANTITY_STR_NUM})\s*s\s*)?"
++)
++
++
++class TimeDeltaQuantityString(TimeDeltaFormat):
++    """Time delta as a string with one or more Quantity-like components.
++
++    Input is a sequence of components, each a number followed by a time unit,
++    in the fixed order yr, d, hr, min, s, e.g. ``"[-+]? 1yr 2d 3hr 4min 5.6s"``.
++    Components are optional and whitespace is optional. A leading sign applies
++    to the whole time delta. The units are physical (yr = 365.25 d, d = 24 hr,
++    hr = 60 min, min = 60 s), not calendar intervals.
++
++    Allowed output subformats are:
++
++    - 'multi': multiple components, separated by single spaces (default)
++    - 'yr', 'd', 'hr', 'min', 's': a single component in that unit
++
++    This format is not intended for high-precision applications since the
++    internal calculations use 64-bit floating point numbers.
++    """
++
++    name = "quantity_str"
++
++    # Each entry is (name, unused input regex, unit in days or None for multi).
++    subfmts = (
++        ("multi", None, None),
++        ("yr", None, _QUANTITY_STR_DAYS["yr"]),
++        ("d", None, _QUANTITY_STR_DAYS["d"]),
++        ("hr", None, _QUANTITY_STR_DAYS["hr"]),
++        ("min", None, _QUANTITY_STR_DAYS["min"]),
++        ("s", None, _QUANTITY_STR_DAYS["s"]),
++    )
++
++    def _check_val_type(self, val1, val2):
++        if val1.dtype.kind not in ("S", "U") and val1.size:
++            raise TypeError(f"Input values for {self.name} class must be strings")
++        if val2 is not None:
++            raise ValueError(
++                f"{self.name} objects do not accept a val2 but you provided {val2}"
++            )
++        return val1, None
++
++    @staticmethod
++    def _parse_string(timestr):
++        """Parse one string, returning (integer-days part, fractional-days part)."""
++        match = _QUANTITY_STR_RE.fullmatch(timestr.strip())
++        if match is None or all(
++            match.group(name) is None for name in ("yr", "d", "hr", "min", "s")
++        ):
++            raise ValueError(f"Time {timestr!r} does not match quantity_str format")
++
++        groups = match.groupdict()
++
++        def get(name):
++            return float(groups[name]) if groups[name] is not None else 0.0
++
++        whole_days = get("yr") * _QUANTITY_STR_DAYS["yr"] + get("d")
++        frac_days = (
++            get("hr") * _QUANTITY_STR_DAYS["hr"]
++            + get("min") * _QUANTITY_STR_DAYS["min"]
++            + get("s") * _QUANTITY_STR_DAYS["s"]
++        )
++        sign = -1.0 if groups["sign"] == "-" else 1.0
++        return sign * whole_days, sign * frac_days
++
++    def set_jds(self, val1, val2):
++        """Parse the quantity strings in val1 and set jd1, jd2."""
++        self._check_scale(self._scale)  # Validate scale.
++        strings = val1.ravel()
++        parts = []
++        for val in strings:
++            if isinstance(val, bytes):
++                val = val.decode("ascii")
++            parts.append(self._parse_string(str(val)))
++        parts = np.array(parts, dtype=float).reshape(val1.shape + (2,))
++        self.jd1, self.jd2 = day_frac(parts[..., 0], parts[..., 1])
++
++    @staticmethod
++    def _format_multi(total_days, precision):
++        """Format a non-negative number of days as multiple components."""
++        total_secs = total_days * 86400.0
++        components = []
++        for name, secs_per_unit in (
++            ("yr", 365.25 * 86400.0),
++            ("d", 86400.0),
++            ("hr", 3600.0),
++            ("min", 60.0),
++        ):
++            n = int(np.floor(total_secs / secs_per_unit))
++            total_secs -= n * secs_per_unit
++            if n > 0:
++                components.append(f"{n}{name}")
++        sec_str = f"{total_secs:.{precision}f}s"
++        if total_secs > 0 or not components:
++            components.append(sec_str)
++        return " ".join(components)
++
++    @property
++    def value(self):
++        subfmts = self._select_subfmts(self.out_subfmt)
++        _, _, unit_days = subfmts[0]
++        name = subfmts[0][0]
++
++        jd1, jd2 = day_frac(self.jd1, self.jd2)
++        total = jd1 + jd2
++        outs = []
++        for days in np.nditer(total, flags=["zerosize_ok"]):
++            days = float(days)
++            if unit_days is None:
++                out = self._format_multi(abs(days), self.precision)
++                if days < 0:
++                    out = "-" + out
++            else:
++                out = f"{days / unit_days:.{self.precision}f}{name}"
++            outs.append(out)
++
++        return np.array(outs).reshape(self.jd1.shape)
++
++
+ def _validate_jd_for_storage(jd):
+     if isinstance(jd, (float, int)):
+         return np.array(jd, dtype=float)

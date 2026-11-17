@@ -1,0 +1,76 @@
+# Decathalon datalist loader
+
+## Goals
+- Provide a public loader for Medical Segmentation Decathlon style datalist JSON files, returning per-case items with resolved paths.
+
+## Scope
+- In scope: one public loader function, its module in monai/data, its monai.data export, a docs entry, and a unit test module.
+- Out of scope: training code, transforms, dataset classes, utility changes, dependencies, and datalist writers.
+
+## Workflows
+Run in order; raise ValueError at the first failed check.
+1. Check that data_list_file_path names an existing file, then open it and parse it as JSON.
+2. Check that the top-level object contains data_list_key, then take its value as the list of entries.
+3. If data_list_key equals "test", wrap each entry as an item whose only field is "image", regardless of is_segmentation and before validation.
+4. If base_dir is None, use the directory portion of data_list_file_path, without making it absolute.
+5. For each item, in order:
+   a. The item must be a mapping.
+   b. Resolve field "image".
+   c. Resolve field "label" only when is_segmentation is true; otherwise leave it exactly as stored.
+   d. Leave other fields unchanged. Missing "image" or "label" is not an error.
+6. Resolve a path value:
+   - A string: join it with base_dir and normalize the result (collapse "." and redundant separators). Absolute strings stay absolute.
+   - A list: every element must be a string, resolved independently; never join elements. Keep length and order.
+   - Any other type is an error.
+7. Return processed items in original order.
+
+## Data model
+- Non-"test" entries are objects. "image" is a string or list of strings. "label" is a string or list of strings in segmentation mode; in classification mode it may be any JSON value, such as an integer class id. Extra fields are kept verbatim.
+- "test" entries are plain path strings.
+
+## API contracts
+- Public function load_decathalon_datalist, spelled "Decathalon" to match the reference, importable as monai.data.load_decathalon_datalist.
+- Parameters in order: data_list_file_path (string, required); is_segmentation (boolean, default true); data_list_key (string, default "training"); base_dir (optional string, default none, meaning the datalist file's directory).
+- Type hints are optional. If used, they must cover all four parameters and the return, typing base_dir as an optional string. Do not mix annotated and unannotated parameters.
+- Errors: ValueError for every validation failure. Never raise FileNotFoundError for a missing datalist.
+
+## Module architecture
+- Loader in a dedicated module, monai/data/decathalon_dataloader.py, as in the reference.
+- Export through an explicit import in monai/data/__init__.py; the wildcard import from utils does not guarantee it.
+- Docs: in docs/source/data.rst, after the existing Utilities automodule entry, add subsection "Decathalon DataLoader" underlined with tildes so it nests under Utilities, with one autofunction entry for monai.data.load_decathalon_datalist.
+- Do not import from other monai packages. Use only os and json. Do not change requirements, setup files, or existing functions in monai/data/utils.py. Keep file access and JSON parsing inside the loader.
+- Test module tests/test_load_decathalon_datalist.py, class TestLoadDecathalonDatalist. Use "decathalon" consistently in names, docs, and test identifiers. The loader is the only new public name; helpers use a leading underscore.
+
+## Validation
+- Missing datalist file: ValueError naming the file.
+- Missing data_list_key: ValueError naming the key and file.
+- Non-mapping item: ValueError.
+- "image" values, and "label" values in segmentation mode, must be a string or list of strings, with element types checked inside lists. Classification labels are not type-checked.
+- Do not coerce values to strings. Raise only ValueError, using f-string messages that name the offending file, key, or value. Never swallow exceptions.
+
+## Documentation
+- Google-style docstring like those in monai/data/utils.py. Its Args block lists each entry as "name (type): description", even with type hints. Describe the is_segmentation label behavior and the defaults for data_list_key and base_dir.
+- Describe the return shape in prose; a short example block is allowed.
+
+## Compatibility
+- Additive only. Existing monai.data names, signatures, and behaviors are unchanged. Must run on Python 3.9.
+
+## Maintainability
+- The loader module, the __init__.py export line, and the test module must be black-formatted at line length 120, as runtests.sh checks with black and flake8. If black is absent, verify by measuring line lengths.
+- Split any bracketed list or call over 120 columns one element per line with a trailing comma, including test literals and docstrings.
+
+## Behavioral acceptance criteria
+- Segmentation with base_dir: image and label resolve to normalized paths in list order; extra fields are kept.
+- base_dir omitted: relative values resolve against the datalist's directory; absolute values stay absolute.
+- Classification: an integer label stays the same integer.
+
+## Test requirements
+- Import the public name from monai.data. Class TestLoadDecathalonDatalist has four tests. Every call passes the key and base_dir explicitly, and the key must exist in that test's datalist.
+  - test_seg_values: segmentation, training key, base_dir supplied; image and label resolved using scalar string paths, as the reference does.
+  - test_cls_values: classification; integer labels stay integers; images resolved.
+  - test_seg_no_basedir: base_dir none, training key; absolute image and label paths preserved. Build absolute inputs by joining the temporary directory with each file name, without hardcoded separators or leading slashes, since CI runs on Windows, Linux, and macOS.
+  - test_seg_no_labels: only a "test" key with plain string entries, passed explicitly; segmentation at its default; base_dir supplied; first item's image resolved.
+- Build expectations with the loader's path-joining approach so they compare equal on every platform.
+- Each test creates its temporary directory and removes it in all outcomes.
+- Do not assert the old bare-string return for "test", or a ValueError for label-less items.
+- Include the MONAI license header, use unittest, follow PEP 8 blank-line rules, and end with the standard main guard.

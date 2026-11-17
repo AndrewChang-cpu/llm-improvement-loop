@@ -1,0 +1,253 @@
+diff --git a/monai/losses/__init__.py b/monai/losses/__init__.py
+index c9ab109..a11ccf3 100644
+--- a/monai/losses/__init__.py
++++ b/monai/losses/__init__.py
+@@ -9,6 +9,14 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-from .dice import Dice, DiceLoss, GeneralizedDiceLoss, MaskedDiceLoss, dice, generalized_dice
++from .dice import (
++    Dice,
++    DiceLoss,
++    GeneralizedDiceLoss,
++    GeneralizedWassersteinDiceLoss,
++    MaskedDiceLoss,
++    dice,
++    generalized_dice,
++)
+ from .focal_loss import FocalLoss
+ from .tversky import TverskyLoss
+diff --git a/monai/losses/dice.py b/monai/losses/dice.py
+index 86823f2..b2cfa29 100644
+--- a/monai/losses/dice.py
++++ b/monai/losses/dice.py
+@@ -12,7 +12,9 @@
+ import warnings
+ from typing import Callable, Optional, Union
+ 
++import numpy as np
+ import torch
++import torch.nn.functional as F
+ from torch.nn.modules.loss import _Loss
+ 
+ from monai.networks import one_hot
+@@ -297,5 +299,146 @@ class GeneralizedDiceLoss(_Loss):
+         return f
+ 
+ 
++class GeneralizedWassersteinDiceLoss(_Loss):
++    """
++    Compute the generalized Wasserstein Dice loss defined in:
++
++        Fidon, L. et al. (2017) Generalised Wasserstein Dice Score for Imbalanced Multi-class
++        Segmentation using Holistic Convolutional Networks. MICCAI BrainLes 2017.
++
++    The true positive contribution of each voxel is discounted by the Wasserstein distance between the
++    predicted class probabilities and the ground-truth label, computed from the class-distance matrix.
++    The class weighting follows the generalized Dice loss (Sudre et al., Generalised Dice overlap as a
++    deep learning loss function for highly unbalanced segmentations. DLMIA 2017), i.e. inverse volume.
++    """
++
++    def __init__(
++        self,
++        dist_matrix: Union[torch.Tensor, np.ndarray],
++        reduction: Union[LossReduction, str] = LossReduction.MEAN,
++    ) -> None:
++        """
++        Args:
++            dist_matrix: square 2D class-distance matrix of shape (C, C), as a torch tensor or numpy array,
++                with nonnegative entries. It is divided by its maximum entry if that maximum is not 1.
++            reduction: {``"none"``, ``"mean"``, ``"sum"``}
++                Reduction mode stored on the loss. Defaults to ``"mean"``. It is not applied in ``forward``,
++                which always returns the batch mean.
++
++        Raises:
++            ValueError: Dist Matrix is invalid.
++            ValueError: reduction={reduction} is invalid. Valid options are: none, mean or sum.
++
++        """
++        super().__init__(reduction=LossReduction(reduction).value)
++
++        if dist_matrix.shape[0] != dist_matrix.shape[1]:
++            raise ValueError("Dist Matrix is invalid.")
++        if isinstance(dist_matrix, np.ndarray):
++            dist_matrix = torch.from_numpy(dist_matrix)
++        max_value = dist_matrix.max().item()
++        if max_value != 1:
++            dist_matrix = dist_matrix / max_value
++        self.m = dist_matrix
++        self.num_classes = dist_matrix.shape[0]
++
++    def wasserstein_distance_map(self, flat_proba: torch.Tensor, flat_target: torch.Tensor) -> torch.Tensor:
++        """
++        Compute the per-voxel Wasserstein distance for every sample.
++
++        For sample s and voxel v with label y, W_s(v) = sum_k M[y, k] * p_k,s(v).
++
++        Args:
++            flat_proba: softmax probabilities, shape (batch, classes, N).
++            flat_target: integer class-index labels, shape (batch, N).
++
++        Returns:
++            distance map of shape (batch, N).
++        """
++        m = self.m.to(flat_proba.device)
++        # each voxel's distance row, selected by its label: shape (batch, N, classes)
++        rows = m[flat_target]
++        return (rows.transpose(1, 2) * flat_proba).sum(1)
++
++    def compute_weights_generalized_true_positives(self, flat_target: torch.Tensor) -> torch.Tensor:
++        """
++        Compute the generalized Dice class weights alpha(b, c) = 1 / (V(b, c) + 1), where V(b, c) is the
++        number of voxels of class c in sample b. Absent classes receive weight 1.
++
++        Args:
++            flat_target: integer class-index labels, shape (batch, N).
++
++        Returns:
++            per-sample, per-class weights of shape (batch, classes).
++        """
++        counts = F.one_hot(flat_target.long(), self.num_classes).sum(1)
++        return 1.0 / (counts.float() + 1.0)
++
++    def compute_generalized_true_positive(
++        self, alpha: torch.Tensor, flat_target: torch.Tensor, wasserstein_distance_map: torch.Tensor
++    ) -> torch.Tensor:
++        """
++        Compute the generalized true positives TP_b = sum_s sum_v alpha(b, y_b(v)) * (1 - W_s(v)).
++        The sum runs over every sample's distance map s, while the weight uses sample b's own labels.
++
++        Args:
++            alpha: class weights from ``compute_weights_generalized_true_positives``, shape (batch, classes).
++            flat_target: integer class-index labels, shape (batch, N).
++            wasserstein_distance_map: distance map of shape (batch, N).
++
++        Returns:
++            one true positive value per sample, shape (batch,).
++        """
++        weights = alpha.gather(1, flat_target.long())
++        # sum over every sample s of (1 - W_s(v)), per voxel: shape (N,)
++        distance_sum = (1.0 - wasserstein_distance_map).sum(0)
++        return (weights * distance_sum).sum(1)
++
++    def compute_denominator(
++        self, alpha: torch.Tensor, flat_target: torch.Tensor, wasserstein_distance_map: torch.Tensor
++    ) -> torch.Tensor:
++        """
++        Compute the generalized denominator D_b = sum_s sum_v alpha(b, y_b(v)) * (2 - W_s(v)).
++        The sum runs over every sample's distance map s, while the weight uses sample b's own labels.
++
++        Args:
++            alpha: class weights from ``compute_weights_generalized_true_positives``, shape (batch, classes).
++            flat_target: integer class-index labels, shape (batch, N).
++            wasserstein_distance_map: distance map of shape (batch, N).
++
++        Returns:
++            one denominator value per sample, shape (batch,).
++        """
++        weights = alpha.gather(1, flat_target.long())
++        # sum over every sample s of (2 - W_s(v)), per voxel: shape (N,)
++        distance_sum = (2.0 - wasserstein_distance_map).sum(0)
++        return (weights * distance_sum).sum(1)
++
++    def forward(self, input: torch.Tensor, target: torch.Tensor, smooth: float = 1e-5) -> torch.Tensor:
++        """
++        Args:
++            input: raw logits, shape (batch, classes, spatial_dims...).
++            target: integer class-index labels, shape (batch, spatial_dims...) or (batch, 1, spatial_dims...).
++            smooth: a small constant to avoid nan.
++
++        Returns:
++            scalar tensor: the mean over the batch of ``1 - (2 * TP_b + smooth) / (D_b + smooth)``.
++        """
++        batch = input.shape[0]
++        if target.dim() == input.dim() and target.shape[1] == 1:
++            target = target.squeeze(1)
++        flat_target = target.reshape(batch, -1)
++        flat_proba = torch.softmax(input, 1).reshape(batch, input.shape[1], -1)
++
++        wasserstein_map = self.wasserstein_distance_map(flat_proba, flat_target)
++        alpha = self.compute_weights_generalized_true_positives(flat_target)
++        tp = self.compute_generalized_true_positive(alpha, flat_target, wasserstein_map)
++        denominator = self.compute_denominator(alpha, flat_target, wasserstein_map)
++
++        score = (2.0 * tp + smooth) / (denominator + smooth)
++        return torch.mean(1.0 - score)
++
++
+ dice = Dice = DiceLoss
+ generalized_dice = GeneralizedDiceLoss
++generalized_wasserstein_dice = GeneralizedWassersteinDiceLoss
+diff --git a/tests/test_generalized_wasserstein_dice_loss.py b/tests/test_generalized_wasserstein_dice_loss.py
+new file mode 100644
+index 0000000..d353aa9
+--- /dev/null
++++ b/tests/test_generalized_wasserstein_dice_loss.py
+@@ -0,0 +1,66 @@
++# Copyright 2020 MONAI Consortium
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#     http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import unittest
++
++import torch
++from parameterized import parameterized
++
++from monai.losses import GeneralizedWassersteinDiceLoss
++
++DIST_MATRIX = torch.tensor([[0.0, 1.0], [1.0, 0.0]])
++
++
++def one_hot_logits(label_map, num_classes):
++    """Build logits of shape (batch, classes, spatial...) equal to 1000 times the one-hot of a batched label map."""
++    encoded = torch.nn.functional.one_hot(label_map, num_classes)
++    # move the class axis (last) to channel position 1
++    dims = [0, encoded.dim() - 1] + list(range(1, encoded.dim() - 1))
++    return encoded.permute(*dims).float() * 1000.0
++
++
++def binary_target():
++    target = torch.zeros(1, 4, 4, dtype=torch.long)
++    target[:, 1:3, 1:3] = 1
++    return target
++
++
++class TestGeneralizedWassersteinDiceLoss(unittest.TestCase):
++    @parameterized.expand(
++        [
++            [False, False],
++            [False, True],
++            [True, False],
++            [True, True],
++        ]
++    )
++    def test_binary_case(self, flipped, add_channel_dim):
++        target = binary_target()
++        pred_label = 1 - target if flipped else target
++        input = one_hot_logits(pred_label, 2)
++        gt = target.unsqueeze(1) if add_channel_dim else target
++        loss = GeneralizedWassersteinDiceLoss(dist_matrix=DIST_MATRIX)(input, gt)
++        expected = 1.0 if flipped else 0.0
++        self.assertEqual(loss.dim(), 0)
++        self.assertAlmostEqual(loss.item(), expected, places=3)
++
++    @parameterized.expand([[False], [True]])
++    def test_empty_class_case(self, flipped):
++        target = torch.zeros(1, 4, 4, dtype=torch.long)
++        pred_label = 1 - target if flipped else target
++        input = one_hot_logits(pred_label, 2)
++        loss = GeneralizedWassersteinDiceLoss(dist_matrix=DIST_MATRIX)(input, target)
++        expected = 1.0 if flipped else 0.0
++        self.assertAlmostEqual(loss.item(), expected, places=3)
++
++
++if __name__ == "__main__":
++    unittest.main()

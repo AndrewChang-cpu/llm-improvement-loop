@@ -1,0 +1,1302 @@
+{
+  "current_specification": "## Goals\n- Let callers see progress while bytes are read from a file, so a long consumer such as a JSON or CSV parser can show how far through its input it is.\n- Provide two public entry points at module level in rich.progress and two methods on Progress:\n  - open: takes a path (str, path-like object, or bytes) and returns a reader that counts bytes consumed. Text mode is the default; binary mode is selected with 'rb'.\n  - wrap_file: takes an already-open binary file-like object and returns a reader that counts bytes consumed without closing the caller's file.\n- The module-level functions create and manage their own Progress display for one-call use. The Progress methods attach a reader to an existing Progress and task.\n- The public names are open and wrap_file only. Do not expose a public read function or method for this feature.\n\n## Scope\n- In scope:\n  - rich/progress.py: a private reader class, a private context wrapper, two module-level functions, and two Progress methods.\n  - tests/test_progress.py: new tests for the feature.\n  - docs/source/progress.rst: new subsections on reading from a file and from a file-like object.\n  - CHANGELOG.md: one entry under Unreleased, Added.\n- Out of scope: changes to track(), Progress rendering, the Task fields, column classes, or rich/__init__.py exports. No public names beyond the four entry points.\n- Edits must be additive. Do not delete or alter existing code.\n\n## Assumptions\n- Target the Python versions the project already declares (3.6.2 and newer). Use only syntax available on those versions.\n- typing_extensions is already a declared dependency for Python below 3.9. Use it only in the same version-gated way the other rich modules use it, for Literal on interpreters older than 3.8.\n- A caller passing a file-like object must supply total, unless the task passed in already has a total. The feature does not infer a total for file-like objects.\n- Bytes are the unit for total and completed.\n\n## Terminology\n- Path input: a str, a path-like object, or bytes naming a file to open.\n- File-like input: an already-open binary file object supplied by the caller.\n- Reader: the object returned to the caller. It wraps a binary handle and advances a task as bytes are consumed. The reader class is private; callers only receive instances.\n- Reader-owned handle: a handle the feature opened from a path. Closing the reader closes it.\n- Caller-owned handle: a file-like input. Closing the reader must not close it.\n- Text mode: the mode string is exactly 'r' or 'rt'. Binary mode: any other accepted spelling, namely 'rb' and 'br'.\n- Task total: the total field of a progress task, in bytes.\n- Context wrapper: a private helper returned by the module-level functions. It starts and stops the Progress and enters and exits the reader.\n- Text wrapper: the standard library text wrapper placed around a reader.\n\n## Workflows\nModule-level open (file, mode, buffering, encoding, errors, newline, total, description, and display options):\n1. Build columns the way track() builds a bar display: a description text column only when description is non-empty, a bar column carrying the style options, a byte-count download column, and a time-remaining column.\n2. Create a Progress from those columns and the display options (auto refresh, console, transient, time source, disable). The refresh rate falls back to 10 when the given value is falsy.\n3. Ask that Progress for a reader through its open method, passing file, mode, buffering, encoding, errors, newline, total, and description. The display is not started at this point.\n4. Return a context wrapper. On enter, start the Progress, enter the reader, and yield it. On exit, stop the Progress first, then exit the reader.\n\nModule-level wrap_file (file, total, description, display options):\n- Build the Progress the same way, obtain the reader from the Progress wrap_file method, and return a context wrapper that yields a binary reader.\n\nProgress.open (file, mode defaulting to 'r', buffering, encoding, errors, newline, total, task_id, description):\n1. Normalize mode by sorting its letters. Accept only the normalized values 'r', 'rt', and 'br'. Any other value raises ValueError that names the mode. Validate before any file is opened or any task is created.\n2. Buffering: in binary mode, a buffering value of 1 emits a RuntimeWarning saying the default buffer size is used, and buffering is reset to the default. In text mode, buffering 0 is an error. In text mode, buffering 1 requests line buffering on the text wrapper, and the byte handle uses the default buffering.\n3. Total: if none is given, obtain the size in bytes with a file-system stat call on the path, before any task is created. Do not catch, wrap, or re-word errors from this call. A missing path raises the same OSError subclass that the builtin open raises. This error is not a ValueError.\n4. Task: if task_id is None, add a task with description and total. Otherwise update that task's total to the resolved total. Progress.open does not start the Progress.\n5. Open the path in binary mode with the resolved buffering. Wrap the handle in a reader that owns it.\n6. Return value: when the mode string is exactly 'r' or 'rt', wrap the reader in a text wrapper with encoding, errors, newline, and line buffering, and return the wrapper. For every other accepted spelling, including 'rb', 'br', and 'tr', return the binary reader.\n\nProgress.wrap_file (file, total optional, task_id optional, description):\n1. Resolve total. An explicit total wins. Otherwise, if task_id is given, read that task's stored total while holding the Progress lock, and use the stored value unchanged (it may be a float; do not convert it to an integer). If the resolved value is still missing, raise ValueError before any task is created or updated.\n2. If task_id is None, add a task with description and the resolved total. Otherwise update that task's total to the resolved total.\n3. Return a binary reader that wraps file as a caller-owned handle.\n\nReader behavior (all readers):\n- Byte accounting: each read operation advances the task by the number of bytes actually returned. This covers read, readline, readinto, readlines (the sum of the line lengths), and iteration (the length of each yielded line).\n- readinto: call the handle's own readinto on the caller's buffer and advance the task by the count that call returns. Do not read into a temporary buffer and copy, because a buffer the handle rejects must fail before any bytes are consumed.\n- seek(offset, whence): delegate to the handle. After it succeeds, set the task's completed value to the returned absolute position through the Progress public update operation. Return that position.\n- tell: return the handle's own position. Do not keep a separate counter.\n- readable, seekable, fileno, isatty: delegate to the handle. writable: false. write: refuse with the standard unsupported-operation error, naming 'write'.\n- close: close the handle only if the reader owns it. Always mark the reader closed. The closed property reports that marker, not the handle's state.\n- Entering the reader enters the handle and returns the reader. Exiting the reader closes it.\n- Iteration returns the reader itself, and each step yields the next line of the handle.\n- The wrapped handle is exposed as a public attribute named handle so callers can inspect it.\n\nLifecycle:\n- open and wrap_file calls never start the live display. The display starts only when the module-level context is entered. If an error happens before entering, nothing is started and nothing needs cleanup.\n\n## Data model\n- Reader state: the wrapped handle, the owning Progress, the task identifier, a flag saying whether the reader closes the handle, and a closed marker. No other per-reader state. The byte position comes from the handle.\n- Task state: use the existing total and completed fields. The feature adds no fields to Task or Progress and stores no data outside memory.\n- A task total may be a float, because track() accepts float totals. The feature reads and writes totals without narrowing them.\n- The text wrapper, when used, is the standard library text wrapper around the reader. It is not a separate type introduced by this feature.\n\n## API contracts\n- Public names: the module-level open and wrap_file in rich.progress, and the open and wrap_file methods on Progress. Nothing else is public. The reader class and the context wrapper are private, with underscore-prefixed names.\n- Module-level open, positional parameters in this order: file (str, path-like, or bytes); mode, default 'r'; buffering, default -1; encoding, optional; errors, optional; newline, optional. Keyword-only parameters after these: total (optional integer count of bytes); description, default 'Reading...'; auto_refresh, default true; console, optional; transient, default false; get_time, optional; refresh_per_second, default 10; style, default 'bar.back'; complete_style, default 'bar.complete'; finished_style, default 'bar.finished'; pulse_style, default 'bar.pulse'; disable, default false.\n  - Returns a context manager. It yields a text reader for 'r' and 'rt', and a binary reader for the binary modes.\n- Module-level wrap_file: file (binary file-like object); total (required integer count of bytes, may be given by keyword). Keyword-only parameters after total: description, auto_refresh, console, transient, get_time, refresh_per_second, style, complete_style, finished_style, pulse_style, disable, with the same defaults as open. Returns a context manager that yields a binary reader.\n- Progress.open: file, mode default 'r', buffering default -1, encoding, errors, newline. Keyword-only after these: total (optional integer count of bytes), task_id (optional), description default 'Reading...'. Returns a binary reader for binary modes, or a text wrapper for 'r' and 'rt'. It does not return a context manager; the caller uses the result in a with statement.\n- Progress.wrap_file: file (binary file-like object); total (optional integer count of bytes); keyword-only task_id (optional) and description default 'Reading...'. Returns a binary reader.\n- Return annotations: every public return is annotated with the standard interface types. Use the text interface for text results, the binary file interface for binary results, and a context manager of either for the module-level functions. The reader class and the context wrapper must never be named in any public annotation or overload.\n- The reader class inherits from both the standard raw I/O base class and the binary file interface type, so that type checkers and the text wrapper accept it.\n- Public total parameters are integer counts of bytes. A total read from an existing task is passed through as stored and may be a float; it is never converted to an integer.\n- Type-level overloads: binary modes map to the binary file interface and text modes map to the text interface, for both open entry points.\n\n## Module architecture\n- All code changes are in rich/progress.py. Place the private reader class and context wrapper with the other progress helpers. Place the module-level functions beside track(). Place the Progress methods in the Progress class next to track().\n- Progress.open and Progress.wrap_file own the file, total, and task logic. The module-level functions only build a Progress with the display options and delegate. They must not duplicate file handling.\n- Progress.wrap_file reads the task's stored total only while holding the Progress lock, as the other task reads in the class do.\n- The reader uses only the public Progress methods for advancing and updating. It must not read or write Progress internals such as the task table or its lock.\n- The context wrapper alone owns the ordering of start and stop.\n\n## Implementation constraints\n- Implement every read-side method explicitly on the reader: read, readline, readinto, readlines, iteration, seek, and tell. Do not add a catch-all attribute forwarder that can bypass byte accounting or let writes through. Other attributes come from the base classes.\n- Do not hide type mismatches with ignore comments. Fix the declared type. Use an ignore comment only where the reference uses one for the same construct.\n- Do not start the Progress inside open or wrap_file.\n- Do not catch exceptions from the size lookup or from opening the handle; let them propagate.\n- track() and existing Progress behavior must not change.\n\n## Dependencies\n- Standard library only: io, os, warnings, typing, and contextlib if needed. Existing rich imports in progress.py are reused. Do not add new rich module imports.\n- No new third-party packages and no project metadata changes.\n- Literal, if imported, uses the same version-gated import pattern as the other rich modules.\n\n## Naming\n- Public: open and wrap_file, both module-level and as Progress methods. The name read is not a public name for this feature.\n- Private: the reader class, the context wrapper, and any type alias or type variable introduced for this feature. Each has a leading underscore. No public alias is exported.\n- Parameter names: file, mode, buffering, encoding, errors, newline, total, task_id, description, and the display options spelled exactly as in track() and Progress.__init__.\n- Mode values are the strings 'r', 'rt', and 'rb'.\n\n## Validation\n- Mode: must normalize to 'r', 'rt', or 'br'. Validated before any file is opened or any task is created.\n- Buffering: validated as described under Workflows and Error handling.\n- Total: path input defaults to the file size, and errors from that lookup propagate unchanged (see Error handling). File-like input requires an explicit total or a task whose stored total is set.\n- task_id: when supplied, it refers to an existing task. Use the Progress's existing task lookup behavior.\n\n## Error handling\n- Invalid mode: ValueError whose message includes the offending value.\n- Text mode with buffering 0: ValueError.\n- Binary mode with buffering 1: emit RuntimeWarning stating that line buffering is not supported in binary mode and the default buffer size is used. Continue with default buffering.\n- File-like input with no total and no task total: ValueError whose message says that total must be specified. Raised before any task is created or updated.\n- Path input whose size cannot be obtained (for example a missing file): the OSError from the size lookup propagates unchanged, so a missing file raises FileNotFoundError as the builtin open does. Do not wrap it in ValueError and do not re-word it. The ValueError rule above does not apply to path input.\n- write on a reader: raise the standard unsupported-operation error naming 'write'.\n- Exceptions raised by the underlying handle propagate unchanged. Do not swallow them.\n- An error before the module-level context is entered leaves no display running. An error inside the context stops the display and exits the reader, then propagates.\n\n## Documentation\n- docs/source/progress.rst: add two subsections, \"Reading from a file\" and \"Reading from a file-like object\", as subsections of the existing \"Advanced usage\" section, placed after \"Customizing\" and before \"Multiple Progress\". Underline them with the tilde character used for the other subsections of Advanced usage. Do not use the hyphen underline, which marks top-level sections.\n- The file-path subsection covers Progress.open with a path, the default text mode compared with 'rb', and that the default total is the file size. The file-like subsection covers Progress.wrap_file: binary only, total required unless a task with a total is given, and the reader does not close the wrapped file.\n- Every documentation example imports each name it uses (for example, import json before calling json.load).\n- Use only the names open and wrap_file in the documentation.\n- Docstrings for the four public entry points and the reader use the Google style with Args, Returns, and Raises sections, matching track(). Describe total as a count of bytes, and state the default description.\n- CHANGELOG.md: add one entry under the Unreleased section's Added heading. Use the bullet form of the neighboring entries, including a pull request link in the same URL form, with pull request number 1759.\n\n## Maintainability\n- Format with black at its default line length of 88. Order imports as isort does with the black profile. Within the standard library block, plain imports come before from-imports.\n- Keep file-handling logic in one place (Progress.open and Progress.wrap_file).\n- Keep two blank lines before any module-level statement that follows a class.\n\n## Reliability\n- The display starts on context entry and always stops on context exit, including when the body raises.\n- Exiting a reader closes a reader-owned handle and leaves a caller-owned handle open.\n\n## Compatibility\n- Purely additive. Existing names, track(), Progress, Task, and column classes keep their behavior.\n- Use syntax no newer than the project's declared minimum Python version.\n\n## Behavioral acceptance criteria\n- Module-level open on a path with default mode returns text: read() returns a str equal to the file contents, and after the with block the reader reports closed.\n- Explicit mode 'r' behaves the same way.\n- Mode 'rb' returns bytes.\n- Progress.open on a path with no total sets the task total to the file size in bytes.\n- Module-level open and Progress.open on a missing path with no total raise FileNotFoundError (an OSError), not ValueError, and create no task.\n- Module-level wrap_file on a caller-owned binary file returns bytes. After the context exits, the reader reports closed, the caller's file is still open, and the caller's own with block closes it.\n- Progress.wrap_file with an existing task that has a total, and no total argument, reads correctly, the task's completed value equals the bytes read, and a float stored total is not truncated.\n- Progress.wrap_file with an existing task that has no total, and no total argument, raises ValueError and creates or updates no task.\n- Each read path (read, readline, readinto, readlines, iteration) advances completed by exactly the number of bytes returned.\n- seek to a position p sets completed to p. tell returns the handle's position.\n- write raises the unsupported-operation error.\n- File-like input with no total and a task without a total raises ValueError, and no display is started.\n- Invalid mode raises ValueError. Text mode with buffering 0 raises ValueError.\n- Binary mode with buffering 1 emits RuntimeWarning, and reading still succeeds.\n\n## Test requirements\n- Add tests to tests/test_progress.py in the file's existing style: each test annotated to return None, temporary files removed in a finally block, and a Console writing to an in-memory stream with forced terminal output as existing tests do.\n- Insert the new tests before the existing script-entry block at the end of tests/test_progress.py, not after it.\n- Cover at least: module-level open with default mode, module-level open with explicit 'r', module-level wrap_file with a caller-owned file, Progress.wrap_file reusing an existing task's total, a missing path with no total raising FileNotFoundError, and Progress.wrap_file with a task lacking a total raising ValueError.\n- Cover the behavioral acceptance criteria where practical.\n- New test code follows the repo's line-length limit.",
+  "categories": {
+    "Purpose": [
+      "Goals",
+      "Scope",
+      "Assumptions",
+      "Terminology"
+    ],
+    "Behavior": [
+      "Workflows"
+    ],
+    "Data": [
+      "Data model"
+    ],
+    "Interfaces": [
+      "API contracts"
+    ],
+    "Architecture": [
+      "Module architecture",
+      "Implementation constraints",
+      "Dependencies"
+    ],
+    "Conventions": [
+      "Naming",
+      "Validation",
+      "Error handling",
+      "Logging",
+      "Documentation"
+    ],
+    "Quality": [
+      "Performance",
+      "Security",
+      "Reliability",
+      "Usability",
+      "Maintainability"
+    ],
+    "Compatibility": [
+      "Compatibility"
+    ],
+    "Operations": [
+      "Operations"
+    ],
+    "Acceptance": [
+      "Behavioral acceptance criteria",
+      "Test requirements"
+    ]
+  },
+  "requirements": {
+    "patch_and_checks": "Patch applies to the original snapshot (no tests are run).",
+    "file_location": "Code is placed in the required existing module or component.",
+    "api_contract": "API names, visibility, parameters, types, and return contracts match requirements.",
+    "dependency_direction": "Imports and dependency directions respect existing boundaries.",
+    "extension_registration": "Required registration and interface implementation are present.",
+    "approved_dependencies": "No unapproved dependencies are introduced.",
+    "architectural_fit": "Responsibilities belong in the intended layer or component.",
+    "extension_point_adherence": "Existing extension mechanisms are used rather than a parallel path.",
+    "abstraction_integrity": "Domain, transport, persistence, and framework boundaries are preserved.",
+    "convention_fit": "Follow the repository conventions visible in the original and reference code for validation, errors, naming, logging, and tests.",
+    "requirement_intent": "The feature satisfies its behavioral intent and constraints."
+  },
+  "runs": [
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies=true, commands=[], api_inspection=[]; no executed checks exist, and tests were not run.",
+            "diff -rq base vs generated: only CHANGELOG.md, docs/source/progress.rst, rich/progress.py and tests/test_progress.py differ.",
+            "patch.diff contains 0 removed lines (grep '^-[^-]' returns none), so no existing base code is altered.",
+            "Test expectations were traced by reading only, e.g. byte counts in test_read_paths_advance_completed_by_bytes_returned (tests/test_progress.py:668) and test_seek_sets_completed_and_tell_reports_position (:696)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "Generated rich/progress.py:103 _ProgressReader, :228 _ProgressContext, :261 _file_progress, :376 module open, :452 module wrap_file, :1221-1342 Progress.open, :1344-1379 Progress.wrap_file.",
+            "Reference puts the same API in rich/progress.py (reference :171 _Reader, :263 _ReadContext, :284 wrap_file, :350/:375/:399 open, :1130 Progress.wrap_file, :1173-1204 Progress.open).",
+            "Tests are in tests/test_progress.py:574-737; docs in docs/source/progress.rst; the CHANGELOG entry is in the Unreleased Added section."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "Public names match the reference: rich.progress.open and wrap_file (generated :376, :452 vs reference :399, :284); Progress.open and Progress.wrap_file (generated :1221-1268, :1344 vs reference :1173-1204, :1130).",
+            "Keyword-only parameters match (total, description, and task_id on the methods). The module open forwards every option it accepts (auto_refresh, console, transient, get_time, refresh_per_second, style, complete_style, finished_style, pulse_style, disable) through _file_progress (:261-300) into Progress, BarColumn, DownloadColumn and TimeRemainingColumn. Every accepted option is used.",
+            "Mode handling: generated :1303-1306 validates sorted(mode) but dispatches on the raw mode, so 'tr' passes validation and returns bytes. Reference :1237-1238 and :1270 do the same, so this is shared reference behavior, not a regression. The documented r/rt/rb/br contract is honored (:1334-1342)."
+          ],
+          "deficiency": "None against the reference. Shared edge case: mode 'tr' passes validation but yields a binary reader (generated :1303-1306; reference :1237-1270)."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "rich/progress.py:1-4 adds only stdlib imports (io, os, sys, warnings). The typing imports extend the existing list.",
+            "No new relative imports or cross-package edges are introduced."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "The base rich/progress.py has no __all__ and no star-import consumers (grep empty), so no export list needs updating.",
+            "_ProgressReader subclasses io.RawIOBase and BinaryIO (generated :103), the same interface base as the reference (reference :171)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "typing-extensions is already declared in base pyproject.toml:30 for python<3.9. Generated progress.py:36-39 imports it only in the pre-3.8 branch.",
+            "No new third-party packages. Tests use stdlib tempfile and os."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Module open and wrap_file are thin factories that delegate to Progress.open and Progress.wrap_file (generated :439-449, :503-504) rather than duplicating stream logic. Stream logic lives in _ProgressReader (:103-227).",
+            "Column construction is factored into _file_progress (:261-300). The reference duplicates it in both module functions (reference.diff:376-391 and :504-518)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "The reader uses existing Progress primitives: add_task (:1327-1328, :1376), update (:1330, :1378), advance via _advance (:128-130), and start/stop via _ProgressContext (:241, :256).",
+            "No parallel progress mechanism is introduced."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "_ProgressReader calls only public Progress methods (advance in _advance at :128-130, update in seek at :218-224).",
+            "The private _lock and _tasks are read only inside Progress.wrap_file (:1368-1371), consistent with the existing with self._lock pattern in start_task.",
+            "owns_handle (:125, :158-165) keeps caller-owned handles open in wrap_file, matching the reference's close_handle=False behavior (reference.diff:589)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Docstrings use the Args/Returns/Raises layout of the base file (generated :1281-1302).",
+            "Private helper naming (_ProgressReader, _ProgressContext, _file_progress) follows the existing _TrackThread style.",
+            "Tests use -> None signatures and alias open as progress_open to avoid shadowing the builtin (tests/test_progress.py import block).",
+            "The CHANGELOG entry matches the existing '- text https://github.com/Textualize/rich/pull/N' format.",
+            "Minor, non-blocking: warnings.warn(stacklevel=2) at generated :1316-1321 points at rich's internal module open when called through rich.progress.open. The reference sets no stacklevel either (reference.diff:663-666)."
+          ],
+          "deficiency": "None blocking. Minor: the RuntimeWarning location for module-level open calls points at rich internals (see evidence)."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Bytes advance the task on read, readline, readlines, readinto and iteration (generated :189-215 and the iterator methods within :103-227).",
+            "total defaults to the os.stat size (:1324-1325). wrap_file leaves the caller's file open (:1379, close at :158-165).",
+            "Text mode returns a TextIOWrapper (:1334-1341). A task's existing total is reused (:1368-1378). seek sets completed (:218).",
+            "Not counted as requirements: the reference-only examples/cp_progress.py and the CONTRIBUTORS.md entry.",
+            "Shared, non-blocking edge case: the task is added (:1327-1328) before io.open (:1332). If io.open fails after os.stat succeeds (e.g. a directory), the task is leaked. The reference orders these the same way (reference.diff:679-685)."
+          ],
+          "deficiency": "None blocking. Shared edge case: a leaked task if io.open fails after os.stat succeeds (generated :1327-1332; the reference has the same ordering)."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__rich-1759/revision-02/run-00/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_progress.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json: \"patch_applies\": true",
+            "results/.../run-01/checks.json: \"patch_applies\": true; \"commands\": []"
+          ],
+          "deficiency": "None under the stated criterion (the patch applies). The import-time NameError that makes the patched module unloadable is recorded under requirement_intent and convention_fit."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/rich/progress.py:351-502 module-level open/wrap_file, placed after track() as in reference/rich/progress.py:168-539",
+            "generated/rich/progress.py:1205-1332 Progress.open overloads/implementation and Progress.wrap_file, inside class Progress (class at generated/rich/progress.py:1023)",
+            "generated/tests/test_progress.py:721-957 tests appended to the existing test module"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": false,
+          "evidence": [
+            "Public names and signatures match the reference: module open (generated/rich/progress.py:425-449 vs reference/rich/progress.py:456-476), module wrap_file (generated/rich/progress.py:504-516 vs reference/rich/progress.py:341-356), Progress.open (generated/rich/progress.py:1252-1266 vs reference/rich/progress.py:573-585), Progress.wrap_file (generated/rich/progress.py:1332-1340 vs reference/rich/progress.py:549-556).",
+            "generated/rich/progress.py:322 `) -> Progress:` is evaluated at def time (def at :310; class Progress not bound until :1023; no `from __future__` import in the file), so importing rich.progress raises NameError on Python 3.6-3.13. The declared range is pyproject.toml:29 `python = \"^3.6.2\"` with classifiers :18-22 (3.6-3.10). The public names are therefore unreachable on those interpreters."
+          ],
+          "deficiency": "Signatures, defaults and return types match the reference, but the public surface cannot be imported on the declared Python range because of the unquoted `-> Progress:` annotation at generated/rich/progress.py:322. The reference has no such annotation (its only quoted forward reference is reference/rich/progress.py:1069 and the `\"Progress\"` string annotations)."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/rich/progress.py:1-4 new imports are stdlib only (io, os, sys, warnings)",
+            "generated/rich/progress.py:41 typing_extensions import is guarded by sys.version_info and does not add a new layer dependency"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "base/pyproject.toml:30 `typing-extensions = { version = \">=3.7.4, <5.0\", python = \"<3.9\" }` already declared",
+            "generated/rich/progress.py:41 fallback `from typing_extensions import Literal` only for <3.8, covered by the existing declaration; all other new imports are stdlib"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "generated/rich/progress.py:310-348 _make_reader_progress builds a Progress display with byte-count columns",
+            "generated/rich/progress.py:351-502 module open/wrap_file delegate to Progress.open/wrap_file (generated/rich/progress.py:1252, 1332)",
+            "Reader logic lives in _ProgressReader (generated/rich/progress.py:104-206), placed beside track() as in the reference"
+          ],
+          "deficiency": "None. The shared column-building helper is a small improvement over the reference, which duplicates that block in two places."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "generated/rich/progress.py:147-149 _ProgressReader._advance uses the existing Progress.advance",
+            "generated/rich/progress.py:185 seek uses the existing Progress.update",
+            "generated/rich/progress.py:1252-1330 Progress.open uses existing self.add_task / self.update, the same as base update/add_task (base/rich/progress.py:999, 826)",
+            "generated/rich/progress.py:310-348 reuses existing TextColumn/BarColumn/DownloadColumn/TimeRemainingColumn rather than a parallel rendering path"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "generated/rich/progress.py:104-206 _ProgressReader talks to Progress only through the public advance/update methods",
+            "generated/rich/progress.py:1332-1365 Progress.wrap_file reads self._tasks[task_id].total under `with self._lock`, the same pattern as base/rich/progress.py:850-851 and 904-905"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": false,
+          "evidence": [
+            "generated/rich/progress.py:322 `) -> Progress:` is unquoted, def at :310, class at :1023",
+            "Existing and candidate-consistent forward references are quoted: generated/rich/progress.py:67 `progress: \"Progress\", task_id: \"TaskID\"`, :117 `progress: \"Progress\"`, :217 `\"Progress\"`",
+            "reference/rich/progress.py:1069 `-> \"Progress\"` shows the repo's quoting convention"
+          ],
+          "deficiency": "The unquoted forward reference at generated/rich/progress.py:322 breaks the file's own quoting convention for forward references and causes the import-time NameError. The rest of the conventions (ValueError messages, docstring Args/Returns style, test naming, CHANGELOG entry under Unreleased/Added at CHANGELOG.md:13) are followed."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated/rich/progress.py:104-206 _ProgressReader implements the file-object interface by subclassing io.RawIOBase and BinaryIO, as the reference _Reader does (reference/rich/progress.py:228)",
+            "generated/rich/progress.py:1205-1332 Progress.open/wrap_file are plain methods; no registry or __all__ registration is required by the reference either"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": false,
+          "evidence": [
+            "generated/rich/progress.py:322 `) -> Progress:` evaluated at def time (def :310, class Progress :1023); no `from __future__` import; declared range pyproject.toml:18-22 and :29",
+            "Consequence by reading: `import rich.progress` raises NameError on Python 3.6-3.13, which regresses the existing track()/Progress API (original base/rich/progress.py has no such failure) and makes the new open/wrap_file/Progress.open/Progress.wrap_file and tests/test_progress.py (generated/tests/test_progress.py:721-957) unusable there",
+            "Reader behavior otherwise matches the reference: text wrapper (patch.diff:642-651), wrap_file total resolution (patch.diff:677-690), seek/readline/readinto tracking (generated/rich/progress.py:147-206)",
+            "Shared with reference, not counted: mode 'tr' is treated as binary (generated Progress.open `is_text = mode in (\"r\", \"rt\")`; reference/rich/progress.py:689)"
+          ],
+          "deficiency": "The feature cannot be loaded on the declared Python range because of the unquoted return annotation at generated/rich/progress.py:322, so the intended behavior is not delivered. The fix is to quote it as `-> \"Progress\":`, the same way the file quotes other forward references. This is a regression relative to the original snapshot, since the original module imports cleanly. On Python 3.14+ (deferred annotations) the module would load, so the failure is conditional on the interpreter version."
+        }
+      ],
+      "passed": false,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__rich-1759/revision-02/run-01/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_progress.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies=true, commands=[], api_inspection=[] (no tests executed for this experiment)",
+            "patch.diff is purely additive: CHANGELOG.md +1, docs/source/progress.rst +24, rich/progress.py +483 / -0, tests/test_progress.py +170 / -0",
+            "Generated tree differs from base only in CHANGELOG.md, docs/source/progress.rst, rich/progress.py, tests/test_progress.py; the progress.py added-line count matches patch.diff (483 added, 0 removed)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/rich/progress.py:168 _make_display_progress helper; :258 module-level open; :337 module-level wrap_file; :856 _ProgressReader; :975 _ReaderContext; :1188-1307 Progress.open overloads and impl; :1309-1346 Progress.wrap_file",
+            "Reference places the same API in rich/progress.py (reference.diff: module open/wrap_file ~L406-539, _Reader/_ReadContext ~L228-403, Progress.open/wrap_file ~L498-657)",
+            "Docs and changelog updated in docs/source/progress.rst and CHANGELOG.md under Unreleased > Added"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "Module open signature generated/rich/progress.py:258-285 matches reference.diff:456-476 (file, mode='r', buffering, encoding, errors, newline, keyword-only total/description/auto_refresh/console/transient/get_time/refresh_per_second/style/complete_style/finished_style/pulse_style/disable)",
+            "Module wrap_file generated/rich/progress.py:337-352 matches reference.diff:341-356 (file, total, keyword-only options)",
+            "Progress.open generated/rich/progress.py:1235-1247 matches reference.diff:623-635 (mode, buffering, encoding, errors, newline, keyword-only total/task_id/description)",
+            "Progress.wrap_file generated/rich/progress.py:1309-1316 matches reference.diff:549-556 (file, total=None, keyword-only task_id/description)",
+            "Error contracts: invalid mode ValueError generated/rich/progress.py:1270-1271 (reference.diff:657-658); unbuffered text ValueError :1274-1275 (reference.diff:669-670); binary buffering=1 RuntimeWarning :1279-1284 (reference.diff:662-666); missing total ValueError :1339-1340 (reference.diff:650-651, same message)",
+            "Return types: text returns io.TextIOWrapper :1299-1306, binary returns _ProgressReader :1307; module functions return _ReaderContext :331-332 region / _ReaderContext(progress, result)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/rich/progress.py:1-4 adds only stdlib imports (io, os, sys, warnings); typing additions at lines 13-21",
+            "generated/rich/progress.py:33-37 typing_extensions Literal import only in the pre-3.8 branch; typing-extensions is declared in tasks/.../base/pyproject.toml:30 for python<3.9",
+            "No new imports from other rich modules; progress.py continues to import only from existing rich submodules"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "No registry or plugin interface is required for this feature; module-level open/wrap_file are exposed by being defined in rich/progress.py (generated/rich/progress.py:258, :337)",
+            "Reference diff also makes no rich/__init__.py or registry change (reference.diff file list: CHANGELOG, CONTRIBUTORS, docs, examples, rich/progress.py, tests)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No new third-party packages added; the patch adds only stdlib imports plus the typing_extensions Literal fallback already declared in tasks/Textualize__rich-1759/base/pyproject.toml:30"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Module-level open/wrap_file build a Progress via shared helper _make_display_progress (generated/rich/progress.py:168-206) and delegate to Progress.open / Progress.wrap_file (:311-321, :375-383), matching the reference's layering (reference.diff:L406-539 delegates to progress.open/progress.wrap_file)",
+            "File-reading logic lives in the Progress class (Progress.open :1235-1307, Progress.wrap_file :1309-1346) and the reader in _ProgressReader (:856-972); progress lifecycle is in _ReaderContext (:975-1003)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Uses existing Progress APIs rather than a parallel path: add_task (generated/rich/progress.py:1293, :1343), update (:1295, :1345), advance via _advance (:879-881)",
+            "Column composition reuses existing ProgressColumn classes (TextColumn, BarColumn, TimeRemainingColumn) at :168-206, same set as base track (tasks/.../base/rich/progress.py:120-136)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "_ProgressReader keeps progress bookkeeping internal, exposing only io-style methods (generated/rich/progress.py:856-972)",
+            "_ReaderContext unwraps TextIOWrapper via its public .buffer attribute to enter/exit the binary layer (:987-989), with no leakage of Progress internals to callers",
+            "wrap_file reader does not close the caller's handle: owns_handle=False (:1346) and close() respects _owns_handle (:953-960)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Google-style Args/Returns/Raises docstrings match base track docstring conventions (tasks/.../base/rich/progress.py:84+)",
+            "Private helpers use leading underscores (_PathInput :165, _make_display_progress :168, _ProgressReader :856, _ReaderContext :975), matching base naming",
+            "Tests follow base test_progress.py conventions: Console built with io.StringIO/_environ (generated tests/test_progress.py:~575-770 via _make_console), pytest.raises usage, '-> None' annotations; base imports io and pytest at tests/test_progress.py:3-7",
+            "Shared, non-differential note: mode 'tr' is accepted by validation (:1270) but treated as binary (:1272); the reference has the same behavior (reference.diff:656-689)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Default text mode and binary modes: generated/rich/progress.py:1270-1272 and :1299-1307; 'rb' returns bytes via _ProgressReader (:1307)",
+            "Total defaults to os.stat(file).st_size: :1290; explicit total or task total honored: :1291-1296 and :1336-1338",
+            "Progress start/stop around the reader: _ReaderContext.__enter__/__exit__ (:991-1003), matching reference _ReadContext (reference.diff:L320-338)",
+            "Seek sets completed to absolute position: :927-930; write raises io.UnsupportedOperation: :944-945; readline/readlines/readinto advance by bytes returned: :898-916",
+            "Reference-style test expectations are satisfied by reading: generated attribute 'handle' (:873) is what the reference test checks (f.handle.closed), and closed reports _closed (:884-886)",
+            "Candidate tests tests/test_progress.py:575-770 cover module open text/binary, wrap_file caller-file ownership, total defaults, missing-path FileNotFoundError before any task is added, invalid mode, buffering rules, and write rejection"
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__rich-1759/revision-02/run-02/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_progress.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json: patch_applies=true, commands=[] (no executed commands; the experiment states tests were not run, so no execution results are claimed).",
+            "Base vs generated rich/progress.py: 0 removed lines (diff count of '<' lines = 0); generated git status shows M for CHANGELOG.md, docs/source/progress.rst, rich/progress.py, tests/test_progress.py only.",
+            "patch.diff hunks in rich/progress.py (@@ -1,3 +1,7 @@, @@ -8,21 +12,31 @@, @@ -40,6 +54,9 @@, @@ -81,6 +98,192 @@, @@ -149,6 +352,215 @@, @@ -794,6 +1206,165 @@) contain only '+' lines; CHANGELOG (patch.diff:9), docs (patch.diff:24-62) and test hunks (patch.diff:723-900) are additions only."
+          ],
+          "deficiency": "None"
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "Reader classes, module-level open/wrap_file and Progress methods are in rich/progress.py: _FileReader generated:101, _ReadContext generated:214, _read_progress generated:247, module open generated:430, module wrap_file generated:509, Progress.open generated:1257, Progress.wrap_file generated:1328.",
+            "Reference also places these in rich/progress.py (reference.diff:165 'rich/progress.py'), next to track() and Progress.",
+            "Docs in docs/source/progress.rst (patch.diff:24), CHANGELOG entry under Unreleased/Added (patch.diff:9), tests appended to tests/test_progress.py (patch.diff:723-900)."
+          ],
+          "deficiency": "None"
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "Module open signature (file, mode='r', buffering, encoding, errors, newline, keyword-only total, description, auto_refresh, console, transient, get_time, refresh_per_second, style/complete_style/finished_style/pulse_style, disable) at generated:430 matches reference.diff:456-476 parameter-for-parameter.",
+            "Module wrap_file(file, total, *, description, ..., disable) at generated:509 matches reference.diff:341-356.",
+            "Progress.open(file, mode='r', buffering=-1, encoding, errors, newline, *, total, task_id, description) at generated:1257 matches reference.diff:623-635; Progress.wrap_file(file, total=None, *, task_id, description) at generated:1328 matches reference.diff:549-556.",
+            "Mode handling: generated:1292-1294 normalizes with sorted() and raises ValueError before stat/add_task, same as reference.diff:655-658.",
+            "Minor, not counted as a failure: the overload at patch.diff:553-555 declares Literal['rb','br','tr'] as binary and generated:1295 uses the raw mode ('tr' is not in ('r','rt'), so it returns binary). Reference.diff:689 has the same runtime behavior for 'tr'."
+          ],
+          "deficiency": "None"
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "New imports are stdlib only: generated:1-4 (import io, os, sys, warnings) plus typing names; no new cross-module import added to rich/progress.py.",
+            "Existing sibling imports (.console, .progress_bar, .style, .live) are unchanged (base progress.py header)."
+          ],
+          "deficiency": "None"
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "rich/progress.py defines no __all__ (grep of base returned no match), so no export registry needs updating; the reference adds no registration either (reference.diff contains only function/method additions in rich/progress.py).",
+            "Interface implementation: _FileReader(io.RawIOBase, BinaryIO) at generated:101 implements read/readline/readinto/seek/tell/close; _ReadContext at generated:214 implements __enter__/__exit__ for the with-block protocol."
+          ],
+          "deficiency": "None"
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "The conditional 'from typing_extensions import Literal' (generated:35-38) relies on typing-extensions, which is already declared in base pyproject.toml:30 for python<3.9.",
+            "No other third-party dependency is introduced; reference.diff uses the same conditional import."
+          ],
+          "deficiency": "None"
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Progress.open and Progress.wrap_file are class methods (generated:1257, 1328) that use the existing task machinery (add_task/update, self._lock), matching the reference placement (reference.diff:549, 623).",
+            "Module-level open/wrap_file build a Progress through _read_progress (generated:247) and return a context wrapper, the same pattern track() uses for its own Progress."
+          ],
+          "deficiency": "None"
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "_read_progress reuses existing column classes TextColumn (base progress.py:261), BarColumn (:291), TimeRemainingColumn (:345), DownloadColumn (:435) instead of a new rendering path.",
+            "Progress progress reporting goes through public Progress.add_task, update, advance, start and stop, matching reference.diff:289-300 and reference.diff:584-585."
+          ],
+          "deficiency": "None"
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "File I/O is done with io.open (generated:1316) and os.stat (generated:1309); the module-level def open (generated:356-430) shadows the builtin, but grep of generated/rich/progress.py finds no bare builtin open( call, so the shadowing does not change behavior.",
+            "_FileReader reports only through the public Progress.advance and Progress.update (generated:185-205, 205), and Progress.wrap_file reads the task total under self._lock (generated:1328 body), the same internal-access pattern the class already uses."
+          ],
+          "deficiency": "None"
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": false,
+          "evidence": [
+            "The repo runs mypy in CI: .github/workflows/pythonpackage.yml:34 ('Typecheck with mypy') and Makefile:8 ('mypy -p rich --no-incremental').",
+            "The reference suppresses the same typing problems that the candidate's reader code has: reference progress.py:231 '# type: ignore[no-untyped-def, override]' on readinto, :232 '# type: ignore[attr-defined]' on self.handle.readinto, and :236 '# type: ignore[override]' on readline. The reference writes write(self, s: Any) (reference.diff:316) to avoid the narrowing.",
+            "Candidate generated/rich/progress.py has no '# type: ignore' anywhere. It calls self.handle.readinto(buffer) at :174 on a BinaryIO handle, and the local typeshed BinaryIO (typing.pyi:551-553) declares only __enter__ with no readinto. Its overrides narrow stub parameter types: readline(size: int) at :163 vs IOBase readline(__size: int | None) (io.pyi:45); readinto(buffer: Union[bytearray, memoryview]) at :173 vs RawIOBase readinto(__buffer: WriteableBuffer) (io.pyi:53); write(data: bytes) at :201 vs RawIOBase write(__b: ReadableBuffer) (io.pyi:54).",
+            "Not executed: mypy was not run here, and the pinned mypy ^0.942 (pyproject.toml:43) may use different stubs than the local typeshed, so these are likely mypy errors rather than confirmed ones. The reference markers are the evidence that CI flagged these exact spots."
+          ],
+          "deficiency": "Under the repository's CI mypy typecheck (mypy -p rich), the candidate's reader overrides and the self.handle.readinto call at generated/rich/progress.py:163, :173-174 and :201 are likely to fail. The reference needed suppressions at the same spots (reference progress.py:231, 232, 236). The candidate did not add them or use the reference's Any type for write. Not executed here, so this is likely rather than confirmed."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Traced the four checks.json test IDs against the candidate code by reading: test_open (module open default 'r' returns TextIOWrapper over _FileReader; closed after exit via _FileReader.close, generated:~229), test_open_text_mode (same path with explicit 'r'), test_wrap_file (_FileReader(close_handle=False) at generated:1328 body; handle attribute at generated:~110; caller file stays open), test_wrap_file_task_total (Progress.wrap_file takes total from self._tasks[task_id].total at generated:1328 body). All four expectations are met by reading.",
+            "The candidate's own tests use different names (e.g., test_module_open_default_mode_reads_text, patch.diff:741) and remove none of the existing tests (patch.diff hunks are additive), so this is not a deletion. The checks.json IDs refer to the reference's test names, which the candidate file does not define.",
+            "Behavior matches reference.diff for buffering handling (patch.diff:618-632 vs reference.diff:655-667), progress totals (file size default via os.stat, generated:1309), and ValueError before opening (generated:1293-1294).",
+            "Not a requirement and not counted: the reference also adds examples/cp_progress.py (reference.diff:120); the candidate does not."
+          ],
+          "deficiency": "None"
+        }
+      ],
+      "passed": false,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__rich-1759/revision-02/run-03/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_progress.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json: patch_applies=true, commands=[], api_inspection=[] (no executable status recorded; no tests run per instructions)",
+            "patch.diff contains 0 removed lines; generated vs base differs only in CHANGELOG.md, docs/source/progress.rst, rich/progress.py, tests/test_progress.py; 0 removed lines in each",
+            "Added-line count per generated diff (rich/progress.py 629 + tests 199 + CHANGELOG 1 + docs 44 = 873) equals patch.diff non-blank '+' lines (735) plus blank '+' lines (138)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/rich/progress.py:104 _ProgressFileReader, :274 _ProgressReaderContext, :371 _make_file_progress, :486 module-level open, :565 module-level wrap_file, :1314 Progress.open, :1389 Progress.wrap_file (same module as reference.diff:165-170)",
+            "generated/tests/test_progress.py:555-805 new tests appended to existing test module",
+            "generated/CHANGELOG.md:13 entry under existing '### Added' heading; generated/docs/source/progress.rst:204 and :224 new sections"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "Module open signature generated/rich/progress.py:486-500 matches reference.diff:456-468 (file, mode, buffering, encoding, errors, newline, *, total, description, auto_refresh, console, transient, get_time, refresh_per_second, style, complete_style, finished_style, pulse_style, disable)",
+            "Module wrap_file generated/rich/progress.py:565-577 matches reference.diff:341-353",
+            "Progress.open generated/rich/progress.py:1314-1324 matches reference.diff:623-635 (task_id/description keyword-only); Progress.wrap_file generated/rich/progress.py:1389-1396 matches reference.diff:549-556",
+            "Mode normalization/allowed set generated/rich/progress.py:1349-1351 equals reference.diff:656-658; return types match (text wrapper for r/rt, binary otherwise)",
+            "Reference docs/example mention rich.progress.read and progress.read (reference.diff:39-45, :160) but the reference code defines neither; not treated as a required contract"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/rich/progress.py:1-4 adds stdlib imports only (io, os, sys, warnings)",
+            "generated/rich/progress.py:48-51 guarded Literal import from typing or typing_extensions, same as reference.diff:206-209",
+            "No new cross-module rich imports added; progress.py continues to depend only on existing siblings"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "No registry or plugin mechanism exists in the original or reference for this feature; the public surface is module functions and Progress methods",
+            "Exposed at generated/rich/progress.py:486, :565, :1314, :1389, matching reference.diff:406, :341, :591-623"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "Only stdlib additions in generated/rich/progress.py:1-4 and typing names at :9-30 region",
+            "typing-extensions already declared for python<3.9 in pyproject.toml:30 and used only behind a version guard (generated/rich/progress.py:48-51)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Reader logic stays in the reader class: generated/rich/progress.py:104-273 (read/readline/readinto/readlines/seek/write delegated to the handle with progress advance)",
+            "Progress-level methods reuse the existing add_task/update API and the Progress lock: generated/rich/progress.py:1372-1375 and :1414-1416",
+            "Shared builder _make_file_progress (:371-405) replaces the duplicated Progress construction in the reference (reference.diff:377-400 and :504-527)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Uses existing column classes TextColumn, BarColumn, DownloadColumn, TimeRemainingColumn inside _make_file_progress (generated/rich/progress.py:371-405), the same set as reference.diff:377-391",
+            "Lifecycle uses the existing Progress start/stop (generated/rich/progress.py:286-287 and :298) as the reference does (reference.diff:327-338)",
+            "No parallel tracking path; progress is updated via advance/update on the existing Progress"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Caller-owned handle is never closed: generated/rich/progress.py:253-258 closes only when owns_handle; wrap_file passes owns_handle=False at :1424",
+            "Test asserts the caller file stays open after the reader closes: generated/tests/test_progress.py:612-625",
+            "Writes are refused with io.UnsupportedOperation: generated/rich/progress.py:237-239"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Google-style Args/Returns/Raises docstrings consistent with the repo (generated/rich/progress.py:1325-1348)",
+            "Private helpers use the _ prefix; tests follow the file's def test_...() -> None style and use pytest.raises / pytest.warns (generated/tests/test_progress.py:724-747)",
+            "CHANGELOG entry sits under the existing Unreleased '### Added' heading (generated/CHANGELOG.md:13)",
+            "Non-blocking: progress.rst documents rich.progress.open, wrap_file and Progress.wrap_file (:204-244) but not Progress.open, which the reference documents (reference.diff:79-89)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Mode validated before any task is created: generated/rich/progress.py:1349-1351 precede add_task at :1372-1373 (test: tests/test_progress.py:724-735)",
+            "Text/binary buffering semantics match the reference: generated/rich/progress.py:1352-1367 vs reference.diff:660-672; binary buffering=1 warns and falls back (tests/test_progress.py:738-747)",
+            "Total defaults to os.stat(file).st_size: generated/rich/progress.py:1369-1370 vs reference.diff:674-676; wrap_file total resolution from an existing task under lock: :1414-1418 vs reference.diff:572-578",
+            "Progress display starts on enter and stops on exit: generated/rich/progress.py:286-298; caller file not closed: :253-258 and :1424"
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__rich-1759/revision-02/run-04/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_progress.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json: patch_applies=true, commands=[], api_inspection=[] (no executable results recorded; tests were not run)",
+            "diff -rq base generated: only rich/progress.py, tests/test_progress.py, CHANGELOG.md, docs/source/progress.rst differ (plus generated .git)",
+            "generated `git diff --cached` matches judge-context/patch.diff exactly when index lines are ignored",
+            "patch.diff contains zero removed ('-') lines; test count 28 -> 43 with no base test names missing",
+            "rich/progress.py has no duplicate definitions except the 4 `def open` entries = 3 @overload stubs + implementation (lines 363, 388, 413, 437)"
+          ],
+          "deficiency": "None. The 15 new tests in tests/test_progress.py (lines 555-790) were verified by reading only; their assertions are consistent with the implementation, but nothing was executed."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "rich/progress.py:101 _Reader, :221 _ReaderContext, :363 module open, :516 module wrap_file, :1217 Progress.open, :1341 Progress.wrap_file, same module as reference rich/progress.py (reference _Reader at 171, _ReadContext at 263, Progress.wrap_file at 1130, Progress.open at 1173)",
+            "docs/source/progress.rst:202-232 new 'Reading from a file' sections under 'Customizing'; RST underline lengths match titles",
+            "CHANGELOG.md:13 added inside the existing '## [Unreleased] / ### Added' block"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "Module open (rich/progress.py:363-437 overloads, :388 impl params) has the same parameter names and order as reference (reference overloads at 350/375/399): file, mode, buffering, encoding, errors, newline, *, total, description, auto_refresh, console, transient, get_time, refresh_per_second, style, complete_style, finished_style, pulse_style, disable",
+            "Progress.open (rich/progress.py:1217-1264 overloads, impl after) matches reference Progress.open (reference 1173-1204): keyword-only total, task_id, description",
+            "Progress.wrap_file (rich/progress.py:1341) signature (file, total, *, task_id, description) matches reference (reference :1130)",
+            "Return contracts: module open returns _ReaderContext (:513); Progress.open returns TextIOWrapper or _Reader (:1331-1338); Progress.wrap_file returns _Reader (:1378), same as reference",
+            "rich/progress.py:181 _Reader.readinto annotates only bytearray where reference accepts bytearray|memoryview|mmap; this narrows an annotation and does not break the contract"
+          ],
+          "deficiency": "None blocking. The readinto annotation is narrower than the reference's, which is a typing nit only."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "rich/progress.py:1-4 adds stdlib imports io, os, sys, warnings only",
+            "rich/progress.py:~33-36 Literal import guarded by sys.version_info, same pattern as reference",
+            "No new imports from other rich modules; progress.py still imports only filesize, console, highlighter, etc. as before"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "No registry or plugin mechanism in rich/progress.py; reference also registers nothing beyond module-level definitions (reference :171 _Reader, :263 _ReadContext)",
+            "rich/progress.py:101 _Reader(io.RawIOBase, BinaryIO) implements the same BinaryIO surface as reference _Reader (read/readinto/readline/readlines/seek/tell/write/fileno/isatty/readable/seekable/writable) at :101-220"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "Only stdlib modules added (io, os, sys, warnings, typing names)",
+            "typing_extensions Literal fallback at rich/progress.py (sys.version_info < 3.8 branch) is already declared in pyproject.toml:30 for python<3.9, and the reference uses the same import"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "_Reader delegates progress accounting through the public Progress API: self._progress.advance (rich/progress.py:130) and self._progress.update(completed=...) (:190), not private state",
+            "_make_read_progress (rich/progress.py:322) builds the bar Progress in one helper, where the reference inlines the same column setup twice (reference :296-300 and :~440)",
+            "Progress.wrap_file reads self._tasks under self._lock (rich/progress.py:1367-1368), the same in-class pattern as reference (reference wrap_file total lookup)"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Progress.open creates/updates tasks via existing self.add_task / self.update (rich/progress.py:1325-1327) and Progress.wrap_file via :1375-1377, the same mechanisms the reference uses",
+            "Module-level open/wrap_file start and stop the existing Progress via _ReaderContext (:237, :250-251), not a parallel display path",
+            "Every option forwarded to Progress/BarColumn (_make_read_progress :322-361) is used: auto_refresh, console, transient, get_time, refresh_per_second, disable, style, complete_style, finished_style, pulse_style"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "_Reader never touches Progress internals; it calls only advance/update/start/stop (rich/progress.py:130, :190, :237, :250)",
+            "Handle ownership is explicit: owns_handle=True at :1331-1333 path and owns_handle=False at :1378 so wrap_file does not close the caller's file (close() at :137-141)",
+            "Text wrapping is delegated to io.TextIOWrapper (:1331-1338), consistent with reference's use of io.TextIOWrapper"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Private helpers use the leading-underscore style of existing private names (_Reader, _ReaderContext, _make_read_progress, _PathInput; base progress.py has _TrackThread)",
+            "Google-style docstrings with 'name (type, optional): ... Defaults to X.' match repo docstring style (rich/progress.py:401-432 and :475-496)",
+            "Invalid-mode errors raise ValueError (rich/progress.py:1301-1303), consistent with reference ValueError at reference :1239",
+            "Tests use the same try/finally os.remove cleanup and Console(_environ={}) construction as the reference tests, and pytest.raises/pytest.warns, consistent with the file"
+          ],
+          "deficiency": "Nits, not failures: CHANGELOG.md:13 begins its entry with 'Added' under the existing '### Added' heading, unlike the neighbouring entry at CHANGELOG.md:12. tests/test_progress.py:33 adds a second 'from rich.progress import ...' line instead of extending the existing import block."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Module open returns a context manager that starts/stops the display around the reader (rich/progress.py:513, :237-251) and Progress.open returns a reader without starting the display (:1331-1338), matching reference behaviour",
+            "Default mode 'r' yields text (is_text at :1304, :1331); 'rb' yields bytes; total defaults to os.stat(file).st_size (:1322); existing task's total is reused when total is omitted (:1367-1368)",
+            "seek updates completed (:187-190), tell returns handle position (:193-195), write raises io.UnsupportedOperation (:206-208), invalid mode raises ValueError (:1301-1303), missing total raises ValueError (:1369-1372)",
+            "Minor oddity shared with reference: mode 'tr' passes normalisation as text but returns binary (is_text at :1304 uses the raw mode, consistent with reference's raw-mode test); not a regression"
+          ],
+          "deficiency": "None blocking."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__rich-1759/revision-02/run-05/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_progress.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json (run-06): patch_applies=true, commands=[], candidate_test_changes=[tests/test_progress.py].",
+            "diff -rq base vs generated: only CHANGELOG.md, docs/source/progress.rst, rich/progress.py and tests/test_progress.py differ, matching the files in patch.diff.",
+            "grep of patch.diff for removed lines (ignoring --- headers) returns nothing: the patch is additions-only against the original snapshot."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/rich/progress.py:97 _Reader, :211 _ReaderContext, :311 _make_reader_progress, :353-427 module open overloads and implementation, :507 module wrap_file, :1208-1255 Progress.open overloads and implementation, :1332 Progress.wrap_file.",
+            "Placement matches the reference: module helpers sit between track() and ProgressColumn (reference.diff:228-541), and the Progress methods sit just before start_task (reference.diff:549-699).",
+            "Docs go in docs/source/progress.rst:202-234 under Advanced usage; CHANGELOG entry is under [Unreleased] Added."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": false,
+          "evidence": [
+            "Names, parameters, defaults, keyword-only markers, overloads and return types match the reference: module open (generated/rich/progress.py:353-427; reference.diff:406-539), module wrap_file (generated :507; reference.diff:341-356), Progress.open (generated :1208-1255; reference.diff:591-635), Progress.wrap_file (generated :1332-1337; reference.diff:549-556).",
+            "generated/rich/progress.py:1295-1302: for any text-mode buffering value other than 0, byte_buffering is forced to -1 (line 1302), and only 0 is checked (line 1299). The value is therefore dropped in text mode, and io.open at :1320 receives -1.",
+            "reference.diff:668-672 only remaps buffering==1 to -1 and rejects 0 in text mode, and reference.diff:685 passes the caller's buffering through to io.open(file, 'rb', buffering=buffering). The reference honors the buffer size in text mode; the candidate does not."
+          ],
+          "deficiency": "buffering is accepted and documented as 'as for the builtin open' (generated/rich/progress.py Progress.open and module open docstrings), but in text mode any integer other than 0 or 1 is silently discarded (generated/rich/progress.py:1302). The reference forwards it to io.open (reference.diff:685). Severity is low: only read buffering changes, not the data returned. Binary mode is correct."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "The added top-level imports in rich/progress.py are stdlib only: io, os, sys, warnings (patch.diff hunk '@@ -1,3 +1,7 @@').",
+            "No new imports from other rich modules; the reader depends on Progress only through public methods advance and update (generated/rich/progress.py:122, :186)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "rich/progress.py has no __all__ (grep is empty), so the new module-level open and wrap_file are exported the same way as track(). The reference adds no registration either (reference.diff has no __all__ or registry change).",
+            "_Reader implements the binary-file surface it needs (generated/rich/progress.py:97-209: read, readline, readlines, readinto, seek, tell, readable, writable, seekable, fileno, isatty, write raising UnsupportedOperation). _ReaderContext implements __enter__/__exit__ (:211-245)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "New third-party import: only typing_extensions, guarded by sys.version_info < (3, 8) for Literal, the same pattern as rich/align.py:6-9.",
+            "pyproject.toml:30 already declares typing-extensions for python<3.9, so no new dependency is introduced."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "The byte-counting reader (_Reader, generated/rich/progress.py:97) and display construction live in progress.py next to track(), as in the reference (reference.diff:228-240).",
+            "The module-level open and wrap_file only build a Progress and delegate to Progress.open and Progress.wrap_file (generated :481-504 and :545-559), matching the reference (reference.diff:519-539 and :392-403).",
+            "Shared column setup is factored into _make_reader_progress (generated :311-350) instead of duplicated in two functions as the reference does (reference.diff:377-391 and :504-518)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Uses existing public Progress API: add_task and update in Progress.open and wrap_file (generated :1368-1370), advance inside _Reader (:122), update in seek (:186), start/stop via _ReaderContext (:223-238).",
+            "Uses existing column classes TextColumn, BarColumn, DownloadColumn and TimeRemainingColumn (generated :311-350). No parallel rendering path is introduced."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "_Reader touches the Progress only through advance and update (generated :122, :186). It does not reach into internal state.",
+            "Progress.wrap_file reads self._tasks[task_id].total under self._lock (generated :1359-1360), the same private access the reference uses (reference.diff:576-577), inside the owning class.",
+            "File ownership is explicit: _Reader.close closes the handle only if owns_handle (generated :136-139), so caller-owned files from wrap_file are not closed."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Docstrings follow the Args/Returns/Raises layout used elsewhere in rich/progress.py. ValueError messages are plain f-strings, as in the surrounding code.",
+            "tests/test_progress.py:574 onward follows the existing file style: '-> None' test signatures, a _make_test_console helper matching the existing Console(...) construction, and os.remove cleanup in finally blocks, like the reference tests (reference.diff:726-801)."
+          ],
+          "deficiency": "Non-blocking style point: generated/rich/progress.py:180 uses getattr(self.handle, 'readinto')(buffer) with a constant name instead of attribute access. It is functionally equivalent. The reference uses self.handle.readinto(b) with '# type: ignore[attr-defined]' (reference.diff:288-290). The repo runs mypy (Makefile:8, tox.ini:32)."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Default text mode returns str and 'rb' returns bytes: generated/rich/progress.py:1295-1302 for mode normalization and the TextIOWrapper branch around :1320-1330; the binary reader is returned otherwise.",
+            "total defaults to os.stat size (:1313) before any task is created, so a missing path raises FileNotFoundError with no task left behind (tests/test_progress.py:627-635).",
+            "Progress advances by bytes returned through read, readline, readlines and readinto (generated :122, :178-182, and the read/readline/readlines methods); seek sets completed to the new position (:184-186).",
+            "wrap_file requires total or a task with a total, otherwise ValueError (generated :1359-1366). The caller's file stays open (:136-139).",
+            "The context starts and stops the display (:223-238), matching reference.diff:320-338."
+          ],
+          "deficiency": "Non-blocking: the text-mode buffer-size divergence noted under api_contract does not change returned data, so the behavioral intent is met."
+        }
+      ],
+      "passed": false,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__rich-1759/revision-02/run-06/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_progress.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies=true; commands=[] (no executed checks, so no test status exists)",
+            "patch.diff: 0 removed lines (grep of '^-' excluding headers); only CHANGELOG.md, docs/source/progress.rst, rich/progress.py and tests/test_progress.py are touched"
+          ],
+          "deficiency": "None against the stated 'patch applies' requirement. No commands ran. The import-time NameError is a separate failure recorded under requirement_intent."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "rich/progress.py holds Progress and track in base (base/rich/progress.py:84, :616); the patch adds its readers, helpers and wrappers to that module (patch.diff:118, :290, :331, :483) and the Progress methods (patch.diff:545-708)",
+            "reference.diff also places open/wrap_file/_Reader in rich/progress.py (reference.diff:228, :341, :407) and Progress.open/wrap_file in the Progress class (reference.diff:549, :592)"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "Module open signature patch.diff:405-425 has the same keyword set as reference.diff:456-476 (total, description, auto_refresh, console, transient, get_time, refresh_per_second, style, complete_style, finished_style, pulse_style, disable)",
+            "Module wrap_file patch.diff:483-498 matches reference.diff:341-356 (positional file/total, keyword-only options, ContextManager[BinaryIO] return)",
+            "Progress.open impl patch.diff:593-605 matches reference.diff:592-~620 (file, mode, buffering, encoding, errors, newline, *, total, task_id, description); Progress.wrap_file patch.diff:670-677 matches reference.diff:549-555 (file, total=None, *, task_id, description) returning BinaryIO",
+            "No API inspection facts exist (checks.json api_inspection=[]), so this rests on reading"
+          ],
+          "deficiency": "Names, parameters and return contracts match the reference. The public names cannot be imported on Python 3.9 because of the NameError (generated/rich/progress.py:346); that reachability failure is recorded under requirement_intent."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "New imports in patch.diff:72-75 and :103-106 are stdlib (io, os, sys, warnings) plus typing names; no new import of another rich module and no reverse dependency",
+            "Existing relative imports (from . import filesize, get_console; .console; .style; .text) are unchanged (base/rich/progress.py:26-35)"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "No plugin, registry or entry-point mechanism is involved in this feature; reference.diff adds none either",
+            "Module-level open/wrap_file and Progress.open/wrap_file are plain definitions (patch.diff:331, :483, :593, :670)"
+          ],
+          "deficiency": "None. Not applicable to this feature."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "typing_extensions is imported only in the else branch for Python <3.8 (patch.diff:103-106), the same pattern the reference uses (reference.diff Literal import)",
+            "pyproject.toml:30 already declares typing-extensions for python<3.9, and base modules such as rich/align.py:8 already import it this way",
+            "No new third-party packages are added"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Private reader class _ProgressReader at patch.diff:118 (generated/rich/progress.py:101) sits next to track, which is the existing file-reading surface",
+            "Display construction is factored into _create_progress (patch.diff:290-327), which removes the duplicated Progress construction that the reference repeats in its two wrappers (reference.diff:~380-450)",
+            "Progress.open and Progress.wrap_file live in the Progress class (patch.diff:545-708) and reuse its public API"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Reader advances through the public Progress.advance and Progress.update (patch.diff:146, :211)",
+            "Task creation and total updates go through Progress.add_task and Progress.update (patch.diff:653-656, :704-707)",
+            "Context start/stop go through Progress.start/stop (patch.diff:264, :278), with no parallel progress path"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Reader interacts with the progress only via advance/update (patch.diff:146, :211); the only private access is Progress.wrap_file reading self._tasks under self._lock (patch.diff:694-697), the same lock discipline as base/rich/progress.py:708",
+            "Handle ownership is explicit via owns_handle, so the wrapped caller file is not closed by wrap_file (patch.diff:247-248, :708)"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": false,
+          "evidence": [
+            "Base quotes every forward reference in the module: base/rich/progress.py:47 (\"Progress\"), :166 (\"Task\"), :736 (-> \"Progress\"), 15 occurrences in total",
+            "Candidate leaves one unquoted forward reference: patch.diff:302 `) -> Progress:` (generated/rich/progress.py:346), evaluated at def time before class Progress at generated/rich/progress.py:1046",
+            "Neither base nor generated/rich/progress.py contains `from __future__ import annotations`, so the annotation is evaluated eagerly"
+          ],
+          "deficiency": "The patch breaks the module's own forward-reference quoting convention. That one line is the cause of the import-time NameError described under requirement_intent. Fix: write -> \"Progress\", or add the future import. Other conventions (Google-style docstrings, test naming, validation messages, ValueError/RuntimeWarning use) are consistent with the repo."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": false,
+          "evidence": [
+            "generated/rich/progress.py:346 `) -> Progress:` is evaluated when `_create_progress` is defined (line 334), but `class Progress` is defined at generated/rich/progress.py:1046. On the manifest's Python 3.9 (prepared.json python_version \"3.9\"; pyproject.toml:29 python ^3.6.2) this raises NameError on `import rich.progress` (reasoned from Python semantics; not executed)",
+            "Consequences: rich.progress.open, rich.progress.wrap_file, Progress.open and Progress.wrap_file are all unreachable. The existing tests/test_progress.py module (28 test functions in base/tests/test_progress.py) and the 16 new ones (44 total in generated tests/test_progress.py) would fail at collection because they import rich.progress. This is a regression against the original snapshot",
+            "Behaviour otherwise matches the reference: mode normalisation and validation (patch.diff:628-631), buffering and binary line-buffering warning (patch.diff:633-648), os.stat total with task reuse (patch.diff:650-656), wrap_file total resolution and ValueError (patch.diff:694-702), handle ownership and close semantics (patch.diff:242-248), and start/stop with error-safe enter (patch.diff:263-280)"
+          ],
+          "deficiency": "The feature is not usable as delivered: importing rich.progress raises NameError on the target Python version, so the intended behaviour is never reached and existing progress tests regress. The fix is one line (quote the annotation, or add from __future__ import annotations). Minor and shared with the reference, so not counted: mode 'tr' is sorted to 'rt' but is_text is false, so it returns a binary reader. Not a deletion: the reference-only test names (test_open, test_open_text_mode, test_wrap_file, test_wrap_file_task_total) are absent, and tests were not required."
+        }
+      ],
+      "passed": false,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__rich-1759/revision-02/run-07/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_progress.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json (run-08): \"patch_applies\": true; no executed commands recorded, and the task states no tests were run.",
+            "patch.diff: only '+' content lines for rich/progress.py, tests/test_progress.py, docs/source/progress.rst and CHANGELOG.md; grep for removed lines ('^-' excluding '---' headers) returns nothing, so no original behavior or test is removed.",
+            "patch.diff rich/progress.py hunks '@@ -794,6 +1201,171 @@' and '@@ -149,6 +306,256 @@' insert new code only; existing track(), Progress methods and column classes are untouched."
+          ],
+          "deficiency": "None. Behavior was judged by reading only; no tests or mypy were executed."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/rich/progress.py:104 _ProgressReader, :210 _ProgressFileContext, :309 _file_progress, :424 module open implementation, :503 module wrap_file, :1252 Progress.open implementation, :1327 Progress.wrap_file. All sit in rich/progress.py, the same module the reference uses (reference/rich/progress.py:171 _Reader, :284 wrap_file, :350 open, :1130 Progress.wrap_file, :1173 Progress.open).",
+            "Tests are added to tests/test_progress.py (patch.diff @@ -549,6 +554,195 @@), docs to docs/source/progress.rst, and the changelog entry to the Unreleased Added section of CHANGELOG.md."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "Module open signature (generated/rich/progress.py:350-423 overloads, :424-446 implementation) matches reference/rich/progress.py:350-373 in name, positional order (file, mode, buffering, encoding, errors, newline) and keyword-only total, description, console, transient, get_time, refresh_per_second, style, complete_style, finished_style, pulse_style, disable.",
+            "Progress.open (generated :1205-1265) and Progress.wrap_file (:1327-1334) match reference/rich/progress.py:1173-1200 and :1130-1140 in parameters and return types (TextIO for text, BinaryIO otherwise).",
+            "Return contract: TextIOWrapper for 'r'/'rt' (generated/rich/progress.py:1317-1323), _ProgressReader otherwise (:1325). Errors: ValueError on invalid mode (:1288) and when no total is available (:1357-1360)."
+          ],
+          "deficiency": "No blocking deficiency. Non-blocking shared quirk: the overloads at generated/rich/progress.py:377 and :1224 declare mode 'tr' as BinaryIO, and runtime returns bytes for 'tr' because is_text = mode in ('r','rt') (:1290), whereas builtin open treats 'tr' as text. The reference has the same runtime behavior (same sorted-mode check, mode == 'r' or 'rt' test) but does not advertise 'tr' in its overloads, so this is not a regression against the reference."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "patch.diff rich/progress.py @@ -1,3 +1,7 @@ adds only stdlib imports (io, os, sys, warnings) and typing names; no new imports from other rich modules.",
+            "The Literal fallback (sys.version_info check) imports typing_extensions, which the base pyproject.toml already declares as a dependency for python < 3.9."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated/rich/progress.py:104 class _ProgressReader(io.RawIOBase, BinaryIO) mirrors reference/rich/progress.py:171 class _Reader(RawIOBase, BinaryIO), so the binary-IO interface is implemented in the same way.",
+            "The interface methods are present: read/readline/readinto/readlines (:~121-160), __iter__/__next__, seek/tell (:~177-181), write raising UnsupportedOperation, close (:188), closed property (:131), __enter__/__exit__ (:197-205).",
+            "The reference adds no registry or export entry, so none is required."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "The only new imports are stdlib modules (io, os, sys, warnings) and typing names (patch.diff rich/progress.py hunk @@ -1,3 +1,7 @@ and @@ -7,22 +11,33 @@).",
+            "typing_extensions is used only in the python < 3.9 fallback; base pyproject.toml lists `typing-extensions = { version = \">=3.7.4, <5.0\", python = \"<3.9\" }`, so it is already approved.",
+            "The new tests use only stdlib tempfile/os and typing.Any."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "generated/rich/progress.py:309-348 _file_progress builds the Progress and column stack once for both module-level helpers; the reference instead inlines the same column setup in two places (reference/rich/progress.py:284-300 and :350-372).",
+            "Progress-level file APIs live as methods on Progress (:1205-1367), alongside the existing track/start_task methods, and the reader classes sit next to track() in the module, as in the reference."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "_ProgressReader reports progress only through public Progress methods: _advance calls self._progress.advance (generated/rich/progress.py:127), seek calls self._progress.update (:177).",
+            "Progress.open and Progress.wrap_file use existing add_task and update (generated/rich/progress.py:1308-1315 and :1364-1366).",
+            "Columns are the existing TextColumn, BarColumn, DownloadColumn and TimeRemainingColumn (:309-340). _ProgressFileContext drives the existing Progress.start/stop (:222-236). No parallel progress path is introduced."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "_ProgressReader touches the Progress instance only through public advance/update (generated/rich/progress.py:127, :177).",
+            "Progress.wrap_file reads self._tasks[task_id].total only under `with self._lock` (:1353-1356), the same internal-access pattern the base class uses in its own methods.",
+            "Ownership of the wrapped handle is an explicit flag (owns_handle, :1316 and :1367), so caller-owned files are never closed by the reader."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": false,
+          "evidence": [
+            "generated/rich/progress.py:154 `def readline(self, size: int = -1) -> bytes:` has no `# type: ignore[override]`. reference/rich/progress.py:236 has the same signature with `# type: ignore[override]`, which indicates the reference hit a mypy override error on it.",
+            "CI runs mypy: base Makefile:8 `mypy -p rich --no-incremental` and .github/workflows/pythonpackage.yml 'Typecheck with mypy'; base pyproject.toml sets `[tool.mypy] strict = true`.",
+            "Docstring type notation: generated/rich/progress.py:451 and :1270 use `file (str | bytes | os.PathLike)`. The reference uses `Union[str, PathLike[str], BinaryIO]` style (reference/rich/progress.py:303, :423, :1220)."
+          ],
+          "deficiency": "Likely CI typecheck failure (inferred, not executed): the candidate's readline narrows the size parameter to int while the base IOBase.readline signature accepts int | None (typeshed), and the reference suppresses exactly this override error at line 236. Running `make typecheck` would confirm it. Secondary: the docstring type notation departs from the repo's Union[...] convention. Test style follows the existing patterns (tempfile + os.remove, Console helper), so no issue there."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "All four public entry points exist: module open (generated/rich/progress.py:350-500), module wrap_file (:503-556), Progress.open (:1205-1325), Progress.wrap_file (:1327-1367).",
+            "Total defaults to os.stat(file).st_size (:1308) and wrap_file reuses the task total when no total is given (:1353-1366), with ValueError when neither exists (:1357-1360).",
+            "wrap_file leaves the caller's file open: _ProgressReader(file, owns_handle=False) (:1367) and close only marks the reader closed (:188-196), matching the reference's close_handle=False behavior.",
+            "The progress display starts and stops around the file context (:222-236). Tests in tests/test_progress.py cover text/binary reads, readline/readinto/readlines, iteration, seek/tell, write, invalid mode, unbuffered text, line-buffering warning, and missing total/path."
+          ],
+          "deficiency": "No blocking gap. Non-blocking: docs/source/progress.rst and the CHANGELOG entry describe only module-level open and Progress.wrap_file, not the Progress.open method that the reference documents. Mode 'tr' returns bytes (see api_contract)."
+        }
+      ],
+      "passed": false,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__rich-1759/revision-02/run-08/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_progress.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies=true; commands=[] and api_inspection=[]. No tests were executed, so this verdict is by reading only.",
+            "patch.diff contains no removed lines (grep for '^-' returns nothing besides headers), so existing Progress/track behavior is not altered; PASS_TO_PASS risk is limited to the added imports and definitions.",
+            "Reference FAIL_TO_PASS traced by reading: test_open -> module open (rich/progress.py:425-500) returns _ReaderContext wrapping a TextIOWrapper whose closed property delegates to _Reader.closed (rich/progress.py:132-133, set in close at 203-206), so f.closed holds. test_wrap_file -> module wrap_file (rich/progress.py:503-558) builds _Reader with close_handle=False (rich/progress.py:1372), so f.handle.closed is False and the caller's file stays open. test_wrap_file_task_total -> Progress.wrap_file reads the task total (rich/progress.py:1359-1363) and returns a _Reader. test_open_text_mode -> positional mode 'r' is accepted (rich/progress.py:425 signature)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "Core logic is in rich/progress.py alongside track(): _Reader and _ReaderContext at rich/progress.py:104-251, module open/wrap_file at 310-558, Progress.open/wrap_file at 1207-1372.",
+            "Docs section 'Reading from a file' is in docs/source/progress.rst:202-229, the same file as the reference docs.",
+            "CHANGELOG entry is under the existing '## [Unreleased]' '### Added' heading (CHANGELOG.md:13). Tests are in tests/test_progress.py (helpers at 555-564, new tests from 566)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "Public names match the reference: module-level open and wrap_file, and Progress.open and Progress.wrap_file (reference.diff rich/progress.py hunks for the same four names).",
+            "Module open (rich/progress.py:351-500) has the reference's keyword-only set: total, description, auto_refresh, console, transient, get_time, refresh_per_second, style, complete_style, finished_style, pulse_style, disable. Overloads return TextIO for 'r'/'rt' and BinaryIO for 'rb'.",
+            "Module wrap_file (rich/progress.py:503-558) takes total positionally and the same keyword-only display args as the reference.",
+            "Progress.open (rich/progress.py:1207-1270 overloads, 1254-1290 impl) takes file, mode, buffering, encoding, errors, newline, keyword-only total/task_id/description. Progress.wrap_file (rich/progress.py:1335-1372) takes file, total=None, keyword-only task_id/description, matching reference signatures.",
+            "Every accepted display argument is forwarded and rendered: _file_progress (rich/progress.py:310-348) passes style/complete_style/finished_style/pulse_style to BarColumn and description to TextColumn, and passes refresh_per_second/disable/etc. to Progress."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "New top-level imports are stdlib only: io, os, sys, warnings (rich/progress.py:1-4) plus additional typing names (rich/progress.py:6-36).",
+            "No new imports from other rich modules; existing relative imports (from . import filesize, get_console; .console; .live; etc.) are unchanged."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "rich/progress.py has no __all__ (grep returns nothing in base), and the reference adds no export or registry entry either, so no registration is required.",
+            "Tests import the new API via 'from rich import progress as rich_progress' (tests/test_progress.py), consistent with direct module access."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "Only added third-party import is typing_extensions.Literal in the pre-3.8 branch: rich/progress.py:37-41 (if sys.version_info >= (3, 8) ... else from typing_extensions import Literal).",
+            "typing_extensions is already declared in pyproject.toml:30 as typing-extensions with python = \"<3.9\", which covers this fallback.",
+            "All other new imports (io, os, sys, warnings, typing names) are stdlib."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Reader classes sit next to the existing _TrackThread/track code (rich/progress.py:104-251), and module-level open/wrap_file mirror track's pattern of wrapping a Progress (rich/progress.py:310-558).",
+            "Progress.open and Progress.wrap_file are Progress methods next to add_task/update (rich/progress.py:1207-1372), so task logic stays in the owning class.",
+            "Progress.wrap_file reads self._tasks[task_id].total under self._lock (rich/progress.py:1359-1363), matching how the existing update/advance methods access task state."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Progress.open and Progress.wrap_file reuse the existing add_task and update methods to create or resize tasks (rich/progress.py:1289-1330 for open, 1368-1372 for wrap_file) rather than adding a parallel task path.",
+            "_Reader drives progress only through the public Progress.advance and Progress.update APIs (rich/progress.py:125-129 for _advance, 177-181 for seek).",
+            "Display lifecycle uses Progress.start/stop via _ReaderContext (rich/progress.py:222-248), the same mechanism the reference uses."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "_Reader talks to Progress only through public methods (advance/update), with no access to Task internals (rich/progress.py:125-129, 177-181).",
+            "Only Progress itself reads self._tasks (rich/progress.py:1359-1363), inside its own class.",
+            "Module-level open/wrap_file construct Progress via the _file_progress helper (rich/progress.py:310-348) and return a _ReaderContext that uses only start/stop; they do not reach into Progress internals.",
+            "The file-system boundary sits in Progress.open (os.stat, io.open at rich/progress.py:1312, 1319), mirroring the reference's placement."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Google-style docstrings with Args/Returns/Raises, consistent with track() and the Progress class docstrings (rich/progress.py:397-427 and 1289-1330 range).",
+            "Warnings use RuntimeWarning with stacklevel=2 (rich/progress.py Progress.open binary-mode line-buffering branch).",
+            "Tests use tempfile plus try/finally os.remove cleanup and small helpers (_make_temp_file, _make_console at tests/test_progress.py:555-564), matching the reference test style.",
+            "CHANGELOG entry follows the existing Unreleased '### Added' bullet format (CHANGELOG.md:13)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Text mode is the default and 'rb' returns bytes: module open and Progress.open (rich/progress.py:425-500, 1289-1330).",
+            "total defaults to os.stat(file).st_size when omitted (rich/progress.py:1311-1312).",
+            "wrap_file does not close the caller's file: close_handle=False (rich/progress.py:1372) and _Reader.close only closes the handle when close_handle is set (rich/progress.py:203-206).",
+            "seek resyncs task.completed to the new position (rich/progress.py:177-181); write raises io.UnsupportedOperation (rich/progress.py:194-195).",
+            "Invalid modes raise ValueError before any task is created (rich/progress.py:1289-1291), and text mode buffering=0 is rejected (rich/progress.py:1295-1297).",
+            "Progress.open does not start the display; the module-level functions do, via _ReaderContext (rich/progress.py:222-227), matching the reference."
+          ],
+          "deficiency": "No blocking deficiency. Minor edge: mode 'tr' passes the normalized check at rich/progress.py:1289-1290 (sorted 'rt') but is_text uses the raw mode at rich/progress.py:1293, so it returns a binary reader. The reference has the same gap (reference.diff: 'if mode == \"r\" or mode == \"rt\"'), so this is not a regression against the reference."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__rich-1759/revision-02/run-09/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "tests/test_progress.py"
+        ],
+        "api_inspection": []
+      }
+    }
+  ]
+}

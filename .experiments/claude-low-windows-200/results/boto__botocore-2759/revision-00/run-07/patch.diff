@@ -1,0 +1,210 @@
+diff --git a/botocore/args.py b/botocore/args.py
+index 0da5bb7..10bf152 100644
+--- a/botocore/args.py
++++ b/botocore/args.py
+@@ -225,6 +225,16 @@ class ClientArgsCreator:
+                 s3_config = {}
+             s3_config['use_dualstack_endpoint'] = True
+ 
++        endpoint_resolver_builtins = (
++            self.compute_endpoint_resolver_builtin_defaults(
++                service_name=service_name,
++                region_name=region_name,
++                endpoint_url=endpoint_url,
++                client_config=client_config,
++                s3_config=s3_config,
++            )
++        )
++
+         return {
+             'service_name': service_name,
+             'parameter_validation': parameter_validation,
+@@ -234,8 +244,63 @@ class ClientArgsCreator:
+             'config_kwargs': config_kwargs,
+             's3_config': s3_config,
+             'socket_options': self._compute_socket_options(scoped_config),
++            'endpoint_resolver_builtins': endpoint_resolver_builtins,
+         }
+ 
++    def compute_endpoint_resolver_builtin_defaults(
++        self,
++        service_name,
++        region_name,
++        endpoint_url,
++        client_config,
++        s3_config,
++    ):
++        """Compute the builtin parameter values for endpoint rulesets.
++
++        The returned dict is keyed by the builtin parameter names used in
++        endpoint rulesets (e.g. ``AWS::Region``). Values reflect what the
++        user asked for (client config, then config store) rather than the
++        endpoint that was ultimately resolved.
++        """
++        builtins = {
++            'AWS::Region': region_name,
++            'AWS::UseFIPS': self._resolve_variant_flag(
++                client_config, 'use_fips_endpoint'
++            ),
++            'AWS::UseDualStack': self._resolve_variant_flag(
++                client_config, 'use_dualstack_endpoint'
++            ),
++            'SDK::Endpoint': endpoint_url,
++        }
++        if service_name in ['s3', 's3-control']:
++            s3_config = s3_config or {}
++            if 'use_dualstack_endpoint' in s3_config:
++                # The s3 specific setting takes precedence over the
++                # generic use_dualstack_endpoint variant setting.
++                builtins['AWS::UseDualStack'] = botocore.utils.ensure_boolean(
++                    s3_config['use_dualstack_endpoint']
++                )
++            builtins['AWS::S3::Accelerate'] = botocore.utils.ensure_boolean(
++                s3_config.get('use_accelerate_endpoint', False)
++            )
++            builtins['AWS::S3::ForcePathStyle'] = (
++                s3_config.get('addressing_style') == 'path'
++            )
++        return builtins
++
++    def _resolve_variant_flag(self, client_config, config_var):
++        # Client config takes precedence over the config store, which
++        # covers environment variables and the shared config file.
++        if client_config is not None:
++            value = getattr(client_config, config_var)
++            if value is not None:
++                return bool(value)
++        if self._config_store is not None:
++            value = self._config_store.get_config_variable(config_var)
++            if value is not None:
++                return botocore.utils.ensure_boolean(value)
++        return False
++
+     def compute_s3_config(self, client_config):
+         s3_configuration = self._config_store.get_config_variable('s3')
+ 
+diff --git a/tests/unit/test_args.py b/tests/unit/test_args.py
+index b2a2320..18e8d2c 100644
+--- a/tests/unit/test_args.py
++++ b/tests/unit/test_args.py
+@@ -459,3 +459,120 @@ class TestCreateClientArgs(unittest.TestCase):
+             client_config=Config(retries={'mode': 'standard'})
+         )['client_config']
+         self.assertEqual(config.retries['mode'], 'standard')
++
++
++class TestEndpointResolverBuiltins(unittest.TestCase):
++    def setUp(self):
++        self.event_emitter = mock.Mock(HierarchicalEmitter)
++        self.config_store = ConfigValueStore()
++        self.args_create = args.ClientArgsCreator(
++            self.event_emitter, None, None, None, None, self.config_store
++        )
++        self.service_name = 'ec2'
++        self.region = 'us-west-2'
++        self.service_model = mock.Mock(ServiceModel)
++        self.service_model.endpoint_prefix = self.service_name
++        self.service_model.metadata = {
++            'serviceFullName': 'MyService',
++            'protocol': 'query',
++        }
++        self.bridge = mock.Mock(ClientEndpointBridge)
++        self.bridge.resolve.return_value = {
++            'region_name': self.region,
++            'signature_version': 'v4',
++            'endpoint_url': 'https://ec2/',
++            'signing_region': self.region,
++            'signing_name': 'ec2',
++            'metadata': {},
++        }
++
++    def compute_builtins(self, **override_kwargs):
++        kwargs = {
++            'service_name': self.service_name,
++            'region_name': self.region,
++            'endpoint_url': None,
++            'client_config': None,
++            's3_config': None,
++        }
++        kwargs.update(override_kwargs)
++        return self.args_create.compute_endpoint_resolver_builtin_defaults(
++            **kwargs
++        )
++
++    def test_region_and_endpoint_defaults(self):
++        builtins = self.compute_builtins()
++        self.assertEqual(builtins['AWS::Region'], 'us-west-2')
++        self.assertEqual(builtins['SDK::Endpoint'], None)
++        self.assertFalse(builtins['AWS::UseFIPS'])
++        self.assertFalse(builtins['AWS::UseDualStack'])
++
++    def test_endpoint_url_is_passed_through(self):
++        builtins = self.compute_builtins(endpoint_url='https://custom/')
++        self.assertEqual(builtins['SDK::Endpoint'], 'https://custom/')
++
++    def test_fips_from_client_config(self):
++        builtins = self.compute_builtins(
++            client_config=Config(use_fips_endpoint=True)
++        )
++        self.assertTrue(builtins['AWS::UseFIPS'])
++
++    def test_dualstack_from_client_config(self):
++        builtins = self.compute_builtins(
++            client_config=Config(use_dualstack_endpoint=True)
++        )
++        self.assertTrue(builtins['AWS::UseDualStack'])
++
++    def test_client_config_beats_config_store(self):
++        self.config_store.set_config_variable('use_fips_endpoint', True)
++        builtins = self.compute_builtins(
++            client_config=Config(use_fips_endpoint=False)
++        )
++        self.assertFalse(builtins['AWS::UseFIPS'])
++
++    def test_config_store_used_when_client_config_unset(self):
++        self.config_store.set_config_variable('use_dualstack_endpoint', True)
++        builtins = self.compute_builtins(client_config=Config())
++        self.assertTrue(builtins['AWS::UseDualStack'])
++
++    def test_s3_dualstack_setting_takes_precedence(self):
++        builtins = self.compute_builtins(
++            service_name='s3',
++            client_config=Config(use_dualstack_endpoint=True),
++            s3_config={'use_dualstack_endpoint': False},
++        )
++        self.assertFalse(builtins['AWS::UseDualStack'])
++
++    def test_s3_accelerate_and_path_style(self):
++        builtins = self.compute_builtins(
++            service_name='s3',
++            s3_config={
++                'use_accelerate_endpoint': True,
++                'addressing_style': 'path',
++            },
++        )
++        self.assertTrue(builtins['AWS::S3::Accelerate'])
++        self.assertTrue(builtins['AWS::S3::ForcePathStyle'])
++
++    def test_s3_defaults(self):
++        builtins = self.compute_builtins(service_name='s3')
++        self.assertFalse(builtins['AWS::S3::Accelerate'])
++        self.assertFalse(builtins['AWS::S3::ForcePathStyle'])
++
++    def test_s3_keys_absent_for_other_services(self):
++        builtins = self.compute_builtins(service_name='ec2')
++        self.assertNotIn('AWS::S3::Accelerate', builtins)
++        self.assertNotIn('AWS::S3::ForcePathStyle', builtins)
++
++    def test_compute_client_args_includes_builtins(self):
++        args = self.args_create.compute_client_args(
++            self.service_model,
++            client_config=None,
++            endpoint_bridge=self.bridge,
++            region_name=self.region,
++            endpoint_url=None,
++            is_secure=True,
++            scoped_config=None,
++        )
++        builtins = args['endpoint_resolver_builtins']
++        self.assertEqual(builtins['AWS::Region'], self.region)
++        self.assertFalse(builtins['AWS::UseFIPS'])

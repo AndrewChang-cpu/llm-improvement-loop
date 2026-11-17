@@ -1,0 +1,297 @@
+diff --git a/botocore/args.py b/botocore/args.py
+index 0da5bb7..cdeba20 100644
+--- a/botocore/args.py
++++ b/botocore/args.py
+@@ -26,6 +26,7 @@ import botocore.serialize
+ import botocore.utils
+ from botocore.config import Config
+ from botocore.endpoint import EndpointCreator
++from botocore.regions import EndpointResolverBuiltins as EPRBuiltins
+ from botocore.signers import RequestSigner
+ 
+ logger = logging.getLogger(__name__)
+@@ -344,7 +345,9 @@ class ClientArgsCreator:
+     def _should_set_global_sts_endpoint(
+         self, region_name, endpoint_url, endpoint_config
+     ):
+-        endpoint_variant_tags = endpoint_config['metadata'].get('tags')
++        endpoint_variant_tags = None
++        if endpoint_config is not None:
++            endpoint_variant_tags = endpoint_config['metadata'].get('tags')
+         if endpoint_url or endpoint_variant_tags:
+             return False
+         return (
+@@ -464,3 +467,62 @@ class ClientArgsCreator:
+             return val
+         else:
+             return val.lower() == 'true'
++
++    def compute_endpoint_resolver_builtin_defaults(
++        self,
++        region_name,
++        service_name,
++        s3_config,
++        endpoint_bridge,
++        client_endpoint_url,
++        legacy_endpoint_url,
++    ):
++        """Compute the endpoint ruleset builtin values for a client.
++
++        Returns a mapping keyed by EndpointResolverBuiltins members. Every
++        builtin is computed regardless of service name. SDK::Endpoint is
++        None when no value applies.
++        """
++        fips = endpoint_bridge._resolve_endpoint_variant_config_var(
++            'use_fips_endpoint'
++        )
++        dualstack = endpoint_bridge._resolve_use_dualstack_endpoint(
++            service_name
++        )
++        sts_global = self._should_set_global_sts_endpoint(
++            region_name, None, None
++        )
++        s3_global = self._should_force_s3_global(region_name, s3_config)
++
++        # The SDK endpoint precedence: a client endpoint URL wins, then the
++        # legacy endpoint URL when custom endpoint data is in use.
++        if client_endpoint_url:
++            sdk_endpoint = client_endpoint_url
++        elif not endpoint_bridge.endpoint_resolver.uses_builtin_data:
++            sdk_endpoint = legacy_endpoint_url
++        else:
++            sdk_endpoint = None
++
++        return {
++            EPRBuiltins.AWS_REGION: region_name,
++            EPRBuiltins.AWS_USE_FIPS: fips or False,
++            EPRBuiltins.AWS_USE_DUALSTACK: dualstack or False,
++            EPRBuiltins.AWS_STS_USE_GLOBAL_ENDPOINT: sts_global,
++            EPRBuiltins.AWS_S3_USE_GLOBAL_ENDPOINT: s3_global,
++            EPRBuiltins.AWS_S3_ACCELERATE: s3_config.get(
++                'use_accelerate_endpoint', False
++            ),
++            EPRBuiltins.AWS_S3_FORCE_PATH_STYLE: (
++                s3_config.get('addressing_style') == 'path'
++            ),
++            EPRBuiltins.AWS_S3_USE_ARN_REGION: s3_config.get(
++                'use_arn_region', True
++            ),
++            EPRBuiltins.AWS_S3CONTROL_USE_ARN_REGION: s3_config.get(
++                'use_arn_region', False
++            ),
++            EPRBuiltins.AWS_S3_DISABLE_MRAP: s3_config.get(
++                's3_disable_multiregion_access_points', False
++            ),
++            EPRBuiltins.SDK_ENDPOINT: sdk_endpoint,
++        }
+diff --git a/botocore/regions.py b/botocore/regions.py
+index e550b27..c24b2e2 100644
+--- a/botocore/regions.py
++++ b/botocore/regions.py
+@@ -18,6 +18,7 @@ in a specific AWS partition.
+ """
+ import logging
+ import re
++from enum import Enum
+ 
+ from botocore.exceptions import (
+     EndpointVariantError,
+@@ -401,3 +402,34 @@ class EndpointResolver(BaseEndpointResolver):
+         return template.format(
+             service=service_name, region=endpoint_name, dnsSuffix=dnsSuffix
+         )
++
++
++class EndpointResolverBuiltins(str, Enum):
++    """Names of the builtin inputs that endpoint rulesets consume."""
++
++    # string: the region name passed to client creation.
++    AWS_REGION = 'AWS::Region'
++    # boolean: whether FIPS endpoints are requested.
++    AWS_USE_FIPS = 'AWS::UseFIPS'
++    # boolean: whether DualStack endpoints are requested.
++    AWS_USE_DUALSTACK = 'AWS::UseDualStack'
++    # boolean: whether STS should use its global endpoint.
++    AWS_STS_USE_GLOBAL_ENDPOINT = 'AWS::STS::UseGlobalEndpoint'
++    # boolean: whether S3 should use its global endpoint.
++    AWS_S3_USE_GLOBAL_ENDPOINT = 'AWS::S3::UseGlobalEndpoint'
++    # boolean: whether S3 transfer acceleration is requested.
++    AWS_S3_ACCELERATE = 'AWS::S3::Accelerate'
++    # boolean: whether S3 path-style addressing is forced.
++    AWS_S3_FORCE_PATH_STYLE = 'AWS::S3::ForcePathStyle'
++    # boolean by default, raw config value otherwise: whether S3 uses the
++    # region from an ARN.
++    AWS_S3_USE_ARN_REGION = 'AWS::S3::UseArnRegion'
++    # boolean by default, raw config value otherwise: whether S3Control uses
++    # the region from an ARN.
++    AWS_S3CONTROL_USE_ARN_REGION = 'AWS::S3Control::UseArnRegion'
++    # boolean: whether S3 multi-region access points are disabled.
++    AWS_S3_DISABLE_MRAP = 'AWS::S3::DisableMultiRegionAccessPoints'
++    # string, or absent: the SDK-supplied endpoint URL. A client endpoint
++    # URL takes precedence, then the legacy endpoint URL when custom
++    # endpoint data is in use.
++    SDK_ENDPOINT = 'SDK::Endpoint'
+diff --git a/tests/unit/test_args.py b/tests/unit/test_args.py
+index b2a2320..32371dc 100644
+--- a/tests/unit/test_args.py
++++ b/tests/unit/test_args.py
+@@ -459,3 +459,159 @@ class TestCreateClientArgs(unittest.TestCase):
+             client_config=Config(retries={'mode': 'standard'})
+         )['client_config']
+         self.assertEqual(config.retries['mode'], 'standard')
++
++
++class TestEndpointResolverBuiltins(unittest.TestCase):
++    def setUp(self):
++        self.event_emitter = mock.Mock(HierarchicalEmitter)
++        self.config_store = ConfigValueStore()
++        self.args_create = args.ClientArgsCreator(
++            self.event_emitter, None, None, None, None, self.config_store
++        )
++        self.endpoint_resolver = mock.Mock()
++        self.endpoint_resolver.uses_builtin_data = True
++        self.bridge = ClientEndpointBridge(
++            self.endpoint_resolver,
++            client_config=Config(),
++            config_store=self.config_store,
++        )
++        self.legacy_url = 'https://my.legacy.endpoint.com'
++
++    def compute(self, **overrides):
++        call_kwargs = {
++            'region_name': 'ca-central-1',
++            'service_name': 'fooservice',
++            's3_config': {},
++            'endpoint_bridge': self.bridge,
++            'client_endpoint_url': None,
++            'legacy_endpoint_url': self.legacy_url,
++        }
++        call_kwargs.update(overrides)
++        return self.args_create.compute_endpoint_resolver_builtin_defaults(
++            **call_kwargs
++        )
++
++    def test_bundled_data_default_builtins_for_fooservice(self):
++        builtins = self.compute()
++        self.assertEqual(builtins['AWS::Region'], 'ca-central-1')
++        self.assertFalse(builtins['AWS::UseFIPS'])
++        self.assertFalse(builtins['AWS::UseDualStack'])
++        self.assertTrue(builtins['AWS::STS::UseGlobalEndpoint'])
++        self.assertFalse(builtins['AWS::S3::UseGlobalEndpoint'])
++        self.assertFalse(builtins['AWS::S3::Accelerate'])
++        self.assertFalse(builtins['AWS::S3::ForcePathStyle'])
++        self.assertTrue(builtins['AWS::S3::UseArnRegion'])
++        self.assertFalse(builtins['AWS::S3Control::UseArnRegion'])
++        self.assertFalse(
++            builtins['AWS::S3::DisableMultiRegionAccessPoints']
++        )
++        self.assertIsNone(builtins['SDK::Endpoint'])
++
++    def test_config_store_use_fips_true_enables_fips(self):
++        self.config_store.set_config_variable('use_fips_endpoint', True)
++        self.assertTrue(self.compute()['AWS::UseFIPS'])
++
++    def test_config_store_use_fips_false_disables_fips(self):
++        self.config_store.set_config_variable('use_fips_endpoint', False)
++        self.assertFalse(self.compute()['AWS::UseFIPS'])
++
++    def test_s3control_with_s3_client_dualstack_true_enables_dualstack(
++        self,
++    ):
++        self.bridge.client_config = Config(s3={'use_dualstack_endpoint': True})
++        builtins = self.compute(service_name='s3-control')
++        self.assertTrue(builtins['AWS::UseDualStack'])
++
++    def test_s3control_with_s3_client_dualstack_false_disables_dualstack(
++        self,
++    ):
++        self.bridge.client_config = Config(
++            s3={'use_dualstack_endpoint': False}
++        )
++        builtins = self.compute(service_name='s3-control')
++        self.assertFalse(builtins['AWS::UseDualStack'])
++
++    def test_other_service_with_s3_client_dualstack_true_ignores_it(self):
++        self.bridge.client_config = Config(s3={'use_dualstack_endpoint': True})
++        builtins = self.compute(service_name='other-service')
++        self.assertFalse(builtins['AWS::UseDualStack'])
++
++    def test_us_west_2_default_sts_config_uses_global_sts(self):
++        builtins = self.compute(region_name='us-west-2')
++        self.assertTrue(builtins['AWS::STS::UseGlobalEndpoint'])
++
++    def test_eu_south_1_does_not_use_global_sts(self):
++        builtins = self.compute(region_name='eu-south-1')
++        self.assertFalse(builtins['AWS::STS::UseGlobalEndpoint'])
++
++    def test_us_west_2_regional_sts_config_disables_global_sts(self):
++        self.config_store.set_config_variable(
++            'sts_regional_endpoints', 'regional'
++        )
++        builtins = self.compute(region_name='us-west-2')
++        self.assertFalse(builtins['AWS::STS::UseGlobalEndpoint'])
++
++    def test_s3_predicate_true_sets_s3_global_with_single_call(self):
++        s3_config = {}
++        with mock.patch.object(
++            self.args_create,
++            '_should_force_s3_global',
++            return_value=True,
++        ) as predicate:
++            builtins = self.compute(s3_config=s3_config)
++        self.assertTrue(builtins['AWS::S3::UseGlobalEndpoint'])
++        predicate.assert_called_once_with('ca-central-1', s3_config)
++
++    def test_use_accelerate_endpoint_true_passes_through(self):
++        builtins = self.compute(s3_config={'use_accelerate_endpoint': True})
++        self.assertTrue(builtins['AWS::S3::Accelerate'])
++
++    def test_use_accelerate_endpoint_false_passes_through(self):
++        builtins = self.compute(s3_config={'use_accelerate_endpoint': False})
++        self.assertFalse(builtins['AWS::S3::Accelerate'])
++
++    def test_multiregion_access_points_disabled_true_passes_through(self):
++        builtins = self.compute(
++            s3_config={'s3_disable_multiregion_access_points': True}
++        )
++        self.assertTrue(builtins['AWS::S3::DisableMultiRegionAccessPoints'])
++
++    def test_multiregion_access_points_disabled_false_passes_through(self):
++        builtins = self.compute(
++            s3_config={'s3_disable_multiregion_access_points': False}
++        )
++        self.assertFalse(
++            builtins['AWS::S3::DisableMultiRegionAccessPoints']
++        )
++
++    def test_addressing_style_path_forces_path_style(self):
++        builtins = self.compute(s3_config={'addressing_style': 'path'})
++        self.assertTrue(builtins['AWS::S3::ForcePathStyle'])
++
++    def test_addressing_style_auto_does_not_force_path_style(self):
++        builtins = self.compute(s3_config={'addressing_style': 'auto'})
++        self.assertFalse(builtins['AWS::S3::ForcePathStyle'])
++
++    def test_addressing_style_virtual_does_not_force_path_style(self):
++        builtins = self.compute(s3_config={'addressing_style': 'virtual'})
++        self.assertFalse(builtins['AWS::S3::ForcePathStyle'])
++
++    def test_use_arn_region_false_sets_both_arn_region_builtins_false(self):
++        builtins = self.compute(s3_config={'use_arn_region': False})
++        self.assertFalse(builtins['AWS::S3::UseArnRegion'])
++        self.assertFalse(builtins['AWS::S3Control::UseArnRegion'])
++
++    def test_use_arn_region_true_sets_both_arn_region_builtins_true(self):
++        builtins = self.compute(s3_config={'use_arn_region': True})
++        self.assertTrue(builtins['AWS::S3::UseArnRegion'])
++        self.assertTrue(builtins['AWS::S3Control::UseArnRegion'])
++
++    def test_client_url_wins_over_custom_data_and_legacy_url(self):
++        self.endpoint_resolver.uses_builtin_data = False
++        builtins = self.compute(client_endpoint_url='https://client.url')
++        self.assertEqual(builtins['SDK::Endpoint'], 'https://client.url')
++
++    def test_custom_data_without_client_url_uses_legacy_url(self):
++        self.endpoint_resolver.uses_builtin_data = False
++        builtins = self.compute()
++        self.assertEqual(builtins['SDK::Endpoint'], self.legacy_url)

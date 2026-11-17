@@ -1,0 +1,259 @@
+diff --git a/cosmos/profiles/__init__.py b/cosmos/profiles/__init__.py
+index 392b4f7..30eab5e 100644
+--- a/cosmos/profiles/__init__.py
++++ b/cosmos/profiles/__init__.py
+@@ -10,6 +10,7 @@ from .bigquery.oauth import GoogleCloudOauthProfileMapping
+ from .bigquery.service_account_file import GoogleCloudServiceAccountFileProfileMapping
+ from .bigquery.service_account_keyfile_dict import GoogleCloudServiceAccountDictProfileMapping
+ from .clickhouse.user_pass import ClickhouseUserPasswordProfileMapping
++from .databricks.oauth import DatabricksOauthProfileMapping
+ from .databricks.token import DatabricksTokenProfileMapping
+ from .exasol.user_pass import ExasolUserPasswordProfileMapping
+ from .postgres.user_pass import PostgresUserPasswordProfileMapping
+@@ -32,6 +33,7 @@ profile_mappings: list[Type[BaseProfileMapping]] = [
+     GoogleCloudServiceAccountDictProfileMapping,
+     GoogleCloudOauthProfileMapping,
+     DatabricksTokenProfileMapping,
++    DatabricksOauthProfileMapping,
+     PostgresUserPasswordProfileMapping,
+     RedshiftUserPasswordProfileMapping,
+     SnowflakeUserPasswordProfileMapping,
+@@ -72,6 +74,7 @@ __all__ = [
+     "GoogleCloudServiceAccountFileProfileMapping",
+     "GoogleCloudServiceAccountDictProfileMapping",
+     "GoogleCloudOauthProfileMapping",
++    "DatabricksOauthProfileMapping",
+     "DatabricksTokenProfileMapping",
+     "DbtProfileConfigVars",
+     "PostgresUserPasswordProfileMapping",
+diff --git a/cosmos/profiles/databricks/__init__.py b/cosmos/profiles/databricks/__init__.py
+index 2e3a9d1..f5d700d 100644
+--- a/cosmos/profiles/databricks/__init__.py
++++ b/cosmos/profiles/databricks/__init__.py
+@@ -1,5 +1,6 @@
+ """Databricks Airflow connection -> dbt profile mappings"""
+ 
++from .oauth import DatabricksOauthProfileMapping
+ from .token import DatabricksTokenProfileMapping
+ 
+-__all__ = ["DatabricksTokenProfileMapping"]
++__all__ = ["DatabricksOauthProfileMapping", "DatabricksTokenProfileMapping"]
+diff --git a/cosmos/profiles/databricks/oauth.py b/cosmos/profiles/databricks/oauth.py
+new file mode 100644
+index 0000000..f29f112
+--- /dev/null
++++ b/cosmos/profiles/databricks/oauth.py
+@@ -0,0 +1,56 @@
++"""Maps Airflow Databricks connections with an OAuth client id and client secret to dbt profiles."""
++
++from __future__ import annotations
++
++from typing import Any
++
++from ..base import BaseProfileMapping
++
++
++class DatabricksOauthProfileMapping(BaseProfileMapping):
++    """
++    Maps Airflow Databricks connections with an OAuth client id and client secret to dbt profiles.
++    The client id and client secret are stored in environment variables, not written to the profile.
++
++    https://docs.getdbt.com/reference/warehouse-setups/databricks-setup
++    https://airflow.apache.org/docs/apache-airflow-providers-databricks/stable/connections/databricks.html
++    """
++
++    airflow_connection_type: str = "databricks"
++    dbt_profile_type: str = "databricks"
++
++    required_fields = [
++        "host",
++        "schema",
++        "client_secret",
++        "client_id",
++        "http_path",
++    ]
++
++    secret_fields = [
++        "client_id",
++        "client_secret",
++    ]
++
++    airflow_param_mapping = {
++        "host": "host",
++        "schema": "schema",
++        "http_path": "extra.http_path",
++        "client_id": ["login", "extra.client_id"],
++        "client_secret": ["password", "extra.client_secret"],
++    }
++
++    @property
++    def profile(self) -> dict[str, Any | None]:
++        """
++        Generates profile. The client id and client secret are stored in environment variables,
++        and the auth type is always oauth.
++        """
++        return {
++            **self.mapped_params,
++            **self.profile_args,
++            "auth_type": "oauth",
++            # secrets should always get set as env vars
++            "client_secret": self.get_env_var_format("client_secret"),
++            "client_id": self.get_env_var_format("client_id"),
++        }
+diff --git a/tests/profiles/databricks/test_dbr_oauth.py b/tests/profiles/databricks/test_dbr_oauth.py
+new file mode 100644
+index 0000000..ff3310e
+--- /dev/null
++++ b/tests/profiles/databricks/test_dbr_oauth.py
+@@ -0,0 +1,151 @@
++"""Tests for the Databricks OAuth profile mapping."""
++
++from unittest.mock import patch
++
++import pytest
++from airflow.models.connection import Connection
++
++from cosmos.profiles import get_automatic_profile_mapping
++from cosmos.profiles.databricks import (
++    DatabricksOauthProfileMapping,
++    DatabricksTokenProfileMapping,
++)
++
++
++@pytest.fixture()
++def mock_databricks_oauth_conn():  # type: ignore
++    """
++    Mocks and returns an Airflow Databricks connection that uses OAuth credentials in extra.
++    """
++    conn = Connection(
++        conn_id="my_databricks_oauth_connection",
++        conn_type="databricks",
++        host="https://my_host",
++        extra='{"http_path": "my_http_path", "client_id": "my_client_id", "client_secret": "my_client_secret"}',
++    )
++
++    with patch("airflow.hooks.base.BaseHook.get_connection", return_value=conn):
++        yield conn
++
++
++def test_connection_claiming() -> None:
++    """
++    Tests that the Databricks OAuth profile mapping claims the correct connection type.
++    """
++    # should only claim when:
++    # - conn_type == databricks
++    # and the following exist:
++    # - schema
++    # - host
++    # - http_path
++    # - client_id (login)
++    # - client_secret (password)
++    potential_values = {
++        "conn_type": "databricks",
++        "host": "my_host",
++        "login": "my_client_id",
++        "password": "my_client_secret",
++        "extra": '{"http_path": "my_http_path"}',
++    }
++
++    # if we're missing any of the values, it shouldn't claim
++    for key in potential_values:
++        values = potential_values.copy()
++        del values[key]
++        conn = Connection(**values)  # type: ignore
++
++        print("testing with", values)
++
++        with patch("airflow.hooks.base.BaseHook.get_connection", return_value=conn):
++            profile_mapping = DatabricksOauthProfileMapping(conn, {"schema": "my_schema"})
++            assert not profile_mapping.can_claim_connection()
++
++    # also test when there's no schema
++    conn = Connection(**potential_values)  # type: ignore
++    with patch("airflow.hooks.base.BaseHook.get_connection", return_value=conn):
++        profile_mapping = DatabricksOauthProfileMapping(conn, {})
++        assert not profile_mapping.can_claim_connection()
++
++    # if we have them all, it should claim
++    conn = Connection(**potential_values)  # type: ignore
++    with patch("airflow.hooks.base.BaseHook.get_connection", return_value=conn):
++        profile_mapping = DatabricksOauthProfileMapping(conn, {"schema": "my_schema"})
++        assert profile_mapping.can_claim_connection()
++
++
++def test_token_mapping_selected_when_login_and_password_set() -> None:
++    """
++    Tests that a login-plus-password connection is still selected as the token mapping.
++    """
++    conn = Connection(
++        conn_id="my_databricks_token_login_connection",
++        conn_type="databricks",
++        host="https://my_host",
++        login="my_login",
++        password="my_token",
++        extra='{"http_path": "my_http_path"}',
++    )
++    with patch("airflow.hooks.base.BaseHook.get_connection", return_value=conn):
++        profile_mapping = get_automatic_profile_mapping(conn.conn_id, {"schema": "my_schema"})
++    assert isinstance(profile_mapping, DatabricksTokenProfileMapping)
++
++
++def test_oauth_mapping_selected(
++    mock_databricks_oauth_conn: Connection,
++) -> None:
++    """
++    Tests that a connection with extra OAuth credentials and no password or token is selected as the OAuth mapping.
++    """
++    profile_mapping = get_automatic_profile_mapping(
++        mock_databricks_oauth_conn.conn_id,
++        {"schema": "my_schema"},
++    )
++    assert isinstance(profile_mapping, DatabricksOauthProfileMapping)
++
++
++def test_profile(
++    mock_databricks_oauth_conn: Connection,
++) -> None:
++    """
++    Tests that the profile values and environment variables get set correctly.
++    """
++    profile_mapping = get_automatic_profile_mapping(
++        mock_databricks_oauth_conn.conn_id,
++        profile_args={"schema": "my_schema"},
++    )
++    profile = profile_mapping.profile
++
++    assert profile == {
++        "type": "databricks",
++        "host": "https://my_host",
++        "schema": "my_schema",
++        "http_path": "my_http_path",
++        "auth_type": "oauth",
++        "client_secret": "{{ env_var('COSMOS_CONN_DATABRICKS_CLIENT_SECRET') }}",
++        "client_id": "{{ env_var('COSMOS_CONN_DATABRICKS_CLIENT_ID') }}",
++    }
++    assert profile_mapping.env_vars == {
++        "COSMOS_CONN_DATABRICKS_CLIENT_SECRET": "my_client_secret",
++        "COSMOS_CONN_DATABRICKS_CLIENT_ID": "my_client_id",
++    }
++
++
++def test_profile_args_cannot_override_secrets_or_auth_type(
++    mock_databricks_oauth_conn: Connection,
++) -> None:
++    """
++    Tests that profile_args cannot override auth_type or the secret fields.
++    """
++    profile_mapping = get_automatic_profile_mapping(
++        mock_databricks_oauth_conn.conn_id,
++        profile_args={
++            "schema": "my_schema",
++            "auth_type": "token",
++            "client_id": "override_client_id",
++            "client_secret": "override_client_secret",
++        },
++    )
++    profile = profile_mapping.profile
++    assert profile["auth_type"] == "oauth"
++    assert profile["client_id"] == "{{ env_var('COSMOS_CONN_DATABRICKS_CLIENT_ID') }}"
++    assert profile["client_secret"] == "{{ env_var('COSMOS_CONN_DATABRICKS_CLIENT_SECRET') }}"

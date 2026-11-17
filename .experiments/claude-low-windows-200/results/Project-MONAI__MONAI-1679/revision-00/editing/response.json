@@ -1,0 +1,180 @@
+{
+  "specification": "## Goals\n- Provide grid-sampled patch iteration over an image dataset. Patch geometry comes from a separate patch generator, each extracted patch can receive a per-patch transform, and each patch can be delivered together with its location in the source image (issue 1500).\n- Keep patch generation (`PatchIter`) separate from dataset iteration (`GridPatchDataset`) so another patch generator can be supplied without changing the dataset class.\n- Keep all grid geometry in the existing `iter_patch` utility, which is the single source of patch coordinates.\n\n## Scope\n- In scope: `monai/data/grid_dataset.py` (new `PatchIter`, reworked `GridPatchDataset`, docstring example fix in `PatchDataset`), `monai/data/utils.py` (`iter_patch` output and docstring), `monai/data/__init__.py` (export of `PatchIter`), `docs/source/data.rst` (autodoc entry), and a new `tests/test_grid_dataset.py`.\n- Out of scope: behavior of `PatchDataset`, `iter_patch_slices`, `get_valid_patch_size`, and `apply_transform`. The only utility change to `set_rnd` is listed under Reliability.\n\n## Assumptions\n- Each image item is an array-like whose first dimension is the channel dimension. The channel dimension is always yielded whole, and patch sizes exclude it.\n- The image dataset supports `len()`. Iterable-only image datasets are not supported.\n- The patch transform is a MONAI transform that accepts a single patch array.\n- A patch generator accepts one image item at a time. When a custom generator is supplied, `GridPatchDataset` does not inspect the item type, so items may be any objects the generator accepts.\n\n## Terminology\n- Image item: one element returned by indexing the image dataset.\n- Patch: a sub-region of one image item with the full channel extent and the requested spatial size. It is taken from a padded copy so border patches are valid.\n- Patch generator: a callable that takes one image item and returns an iterable of tuples. The first element of each tuple is the patch. The second element, if present, is the coordinate array for that patch. Any further elements are ignored. `PatchIter` is the built-in patch generator.\n- Coordinates: an integer-valued array with one row per dimension of the image item, including the channel dimension. Each row holds the start and stop of that dimension for the patch, in the original unpadded image frame.\n- Grid sampling: patches are placed at positions that step by the patch size from the start position. Visit order makes the first spatial dimension vary fastest.\n\n## Workflows\nPatch generation (`PatchIter`, once per image item):\n- Build the spatial patch size with a \"whole dimension\" entry prepended for the channel dimension.\n- Delegate to the shared `iter_patch` utility with copy-back disabled, the configured start position, the padding mode, and the padding options unchanged.\n- Yield each tuple from `iter_patch` unchanged.\n\nDataset iteration (`GridPatchDataset`):\n- Index range: start at 0 and end at the length of the image dataset. If a data-loader worker context exists, compute per_worker as the ceiling of length divided by the number of workers. This worker takes indices from worker_id times per_worker up to the smaller of that start plus per_worker and the length. Without a worker context, use the full range.\n- For each index, fetch the image item and iterate the patch generator over it.\n- If `with_coordinates` is false: take the first element of each tuple as the patch, apply the transform to the patch alone if one is set, and yield only the resulting patch.\n- If `with_coordinates` is true: take the patch and the coordinates from each tuple, apply the transform to the patch alone if one is set, and yield the pair (transformed patch, coordinates).\n- The transform never receives the tuple or the coordinates.\n\nPseudocode (informative only, not an implementation):\n    for each index in this worker's range:\n        item = dataset[index]\n        for each output of patch_generator(item):\n            patch = output[0]\n            if transform is set: patch = transform(patch)\n            if with_coordinates: yield (patch, output[1])\n            else: yield patch\n\n## Data model\n- Image item: a channel-first array.\n- Patch: a spatial sub-array with the whole channel dimension. It is a view into a padded copy, so modifying it does not write back to the image (copy-back is disabled).\n- Coordinates: an integer-valued array of shape (number of dimensions including channel, 2). Row i is [start_i, stop_i] in the original frame. The channel row is [0, C] for C channels. Stop can exceed the image extent for border patches. Start is negative only when the start position is negative.\n- Dataset element: a patch when `with_coordinates` is false, or a (patch, coordinates) pair when it is true. The coordinates must be a numeric array, not a tuple of slice objects, so the default data-loader collation can batch them.\n\n## API contracts\n`PatchIter` (public, exported from `monai.data`):\n- Construction options: `patch_size` (sequence of ints; 0 or None selects the whole dimension; channel excluded), `start_pos` (sequence; default is the origin in every dimension), `mode` (default wrap; accepts a NumpyPadMode member or its string value), and keyword padding options forwarded to NumPy padding. Construction does no image work.\n- Invocation: takes one image item and returns an iterable of (patch, coordinates) tuples, as produced by `iter_patch`.\n\n`GridPatchDataset` (public, subclass of the torch IterableDataset):\n- Constructor parameters, in order: `dataset` (the image dataset), `patch_iter` (required patch generator, no default), `transform` (optional, default none), `with_coordinates` (boolean, default true).\n- It must not accept `patch_size`, `start_pos`, `mode`, or padding keyword options. Those belong to `PatchIter`.\n- Iteration behavior is defined in Workflows.\n\n`iter_patch` (existing public utility, same name):\n- Input parameters are unchanged: array, patch size, start position, copy-back flag, mode, and padding options.\n- Output changes: each yielded item is a pair of the patch view and its coordinate array, as described in Data model. Previously each item was the patch alone.\n- It is the only place that knows the padding offsets used to compute coordinates.\n\nPackage exports: `monai.data` exports `PatchIter` alongside `GridPatchDataset` and `PatchDataset`. The `__all__` list of the grid dataset module includes `PatchIter`.\n\n## Module architecture\n- `monai/data/grid_dataset.py`: `PatchIter` owns patch generation options and delegates geometry. `GridPatchDataset` owns iteration, worker partitioning, per-patch transforms, and the coordinate toggle. `PatchDataset` keeps its behavior.\n- `monai/data/utils.py`: `iter_patch` owns padding, slicing (through the existing `iter_patch_slices`), and coordinate computation.\n- `monai/data/__init__.py`: re-exports `PatchIter` from the grid dataset module.\n- `docs/source/data.rst`: an autodoc section for `PatchIter` placed directly after the `GridPatchDataset` section within the patch-based dataset group.\n- Layering: patch generation sits below dataset iteration. The dataset consumes a generator and performs no padding or slice arithmetic.\n\n## Implementation constraints\n- `GridPatchDataset` takes the patch generator as an injected callable and must not hard-code `iter_patch`.\n- Do not reimplement padding, slicing, grid stepping, or coordinate offsets in the grid dataset module. Do not build a parallel grid path, and do not depend on `iter_patch` internal padded offsets.\n- Coordinates must be numeric arrays, not tuples of slice objects.\n- Apply the transform through the existing `apply_transform` helper with its map-items behavior disabled, so the transform receives one patch.\n- Each image item is a single image. Do not iterate over channels or treat an item as a sequence of arrays zipped in lockstep. The old multi-array behavior is removed.\n- Do not add new public names to the utility module's public list for coordinate helpers.\n\n## Dependencies\n- `grid_dataset` depends on: torch (IterableDataset and worker info), NumPy (ceiling for the worker split; replaces the `math` import), the base dataset class, `iter_patch` from the utility module, `apply_transform` from the transforms package, and `NumpyPadMode` and `ensure_tuple` from the utilities package.\n- Dependency direction: the utility module must not import the grid dataset module. The grid dataset module depends on the utility module, never the reverse.\n- No new third-party dependencies.\n\n## Naming\n- `PatchIter`: CamelCase, public, exported from `monai.data`, and listed in the grid dataset `__all__`.\n- Parameter names: `patch_size`, `start_pos`, `mode`, padding options, `dataset`, `patch_iter`, `transform`, `with_coordinates`.\n- Test module: `tests/test_grid_dataset.py` with class `TestGridPatchDataset`.\n- Do not add alternative public helper names for coordinate output to the utility module.\n\n## Validation\n- The image dataset must support length; this is checked when iteration starts.\n- Patch size and start position are validated by `iter_patch`: 0 or None selects the whole dimension, and sizes larger than the image are clipped.\n- The mode is validated when `PatchIter` converts it to NumpyPadMode during construction.\n- Do not add silent fallbacks for generator output arity. A generator that yields only one element while coordinates are requested fails by unpacking.\n\n## Error handling\n- An image dataset without length raises NotImplementedError with the message stating that the image dataset must implement `len()`.\n- An invalid mode propagates the conversion error from NumpyPadMode.\n- Exceptions from the transform propagate through `apply_transform`, which wraps them as RuntimeError. Do not swallow them.\n- Do not catch exceptions raised by the patch generator.\n\n## Documentation\n- `GridPatchDataset` class docstring: explain grid sampling through a patch generator plus a per-patch transform. Include a usage example that builds a list of single-channel images, a `PatchIter` with patch size and start position, a per-patch intensity transform, and a dataset that is iterated through a two-worker data loader. State the resulting patch shape and coordinate format. The example must match actual outputs.\n- `GridPatchDataset` constructor docstring: document `dataset`, `patch_iter` (must yield tuples whose first element is the patch and whose second element is the coordinates; reference `PatchIter`), `transform`, and `with_coordinates` (default true).\n- `PatchIter` docstring: summary, arguments (patch size, start position, mode, padding options), and a note that the channel dimension is excluded from patch size, with a worked example for a one-channel 3D image.\n- `iter_patch` docstring: the Yields section describes (patch, coordinates) pairs. Add a note giving the coordinate format as start and stop per dimension, including the channel dimension.\n- `PatchDataset` docstring example: replace the deprecated NumPy float alias with the builtin float.\n- `docs/source/data.rst`: add a `PatchIter` autodoc entry with members, in the same heading style as the surrounding entries, directly after `GridPatchDataset`.\n\n## Reliability\n- Worker partitioning assigns each index to exactly one worker, with no index skipped or repeated.\n- The `set_rnd` seeding helper, when recursing into object attributes, skips attribute names that start with a double underscore.\n- Patches are views of a padded copy created by `iter_patch`. Because copy-back is disabled, in-place changes to a patch do not change the source image.\n\n## Maintainability\n- Lines are at most 120 characters.\n- No duplicate imports and no unused imports. Remove the `math` import once NumPy is used for the ceiling.\n- Grid geometry exists in one place only (the utility module).\n\n## Compatibility\n- Intentional breaking change: the old `GridPatchDataset` constructor form (`patch_size`, `start_pos`, `mode`, padding options) is removed. Callers move to `PatchIter`. Do not add a compatibility shim that accepts the old form.\n- Behavior change: each dataset item is a single image, not a sequence of arrays.\n- Behavior change: coordinates are yielded by default.\n- Behavior change: `iter_patch` callers receive (patch, coordinates) pairs.\n- Additive: the `PatchIter` export. `PatchDataset` is unaffected.\n\n## Operations\n- Environment: Python 3.9 with the repository installed in editable mode and pytest available.\n- Verification: run pytest on `tests/test_grid_dataset.py`. The pull-request checklist items about local quick-test runs are not requirements.\n\n## Behavioral acceptance criteria\n1. With a custom generator that yields (item, index) tuples over string items and `with_coordinates` false, iterating through a data loader with batch size 3 yields the expected contiguous chunks. The union of the chunks has the same total length as the input.\n2. Two single-channel 4x4 images, `PatchIter` with patch size 2x2 and start position (0, 0), and a per-patch RandShiftIntensity with offset 1.0 and probability 1.0 under seed 1234: a data loader with batch size 2 yields patch batches of shape (2, 1, 2, 2).\n3. For each 4x4 image, the four patches in visit order have coordinate arrays of shape (3, 2). The channel row is [0, 1]. The spatial rows are, in order: (0-2, 0-2), (2-4, 0-2), (0-2, 2-4), (2-4, 2-4), where the pairs are listed as (dimension 1 range, dimension 2 range).\n4. With the default `with_coordinates`, iteration yields (patch, coordinates) pairs, and the data loader batches the coordinates without error.\n5. The transform receives a single patch array of shape (channel, height, width), never a tuple. With no transform, patches pass through unchanged.\n6. On non-Windows platforms, two data-loader workers produce the same set of patches as a single process.\n7. An image dataset without length raises NotImplementedError with the specified message.\n8. `PatchIter` is importable from `monai.data`.\n\n## Test requirements\n- Create `tests/test_grid_dataset.py` with class `TestGridPatchDataset` containing `test_shape` and `test_loading_array`. These are the FAIL_TO_PASS tests.\n- `setUp` sets determinism with seed 1234. `tearDown` resets determinism to none.\n- `test_shape`: string items with a custom generator, `with_coordinates` false, batch size 3. Use 0 workers on Windows and 2 workers elsewhere. Compare sorted output and total length.\n- `test_loading_array`: two 1x4x4 float images, `PatchIter` 2x2 with start position (0, 0), and RandShiftIntensity with offset 1.0 and probability 1.0. Check single-process batch shapes and patch values (tolerance 1e-5), and check coordinate arrays. Run the multi-worker check only on non-Windows platforms, with a looser tolerance (1e-3) on values.\n- Do not place grid-dataset tests in `tests/test_patch_dataset.py`.",
+  "edits": [
+    {
+      "category": "Purpose",
+      "subsection": "Goals",
+      "operation": "clarify",
+      "change": "Replace the draft's PR-title sentence with feature goals: grid-sampled patches from a pluggable patch generator, per-patch transforms, coordinate output, and a single source of coordinates in iter_patch.",
+      "hypothesis": "requirement_intent failed in every run because the draft is PR text with no feature intent; the reference's goal is PatchIter-based separation of patch generation from dataset iteration."
+    },
+    {
+      "category": "Purpose",
+      "subsection": "Scope",
+      "operation": "add",
+      "change": "Add in-scope files (grid_dataset.py, utils.py iter_patch, __init__.py export, docs/source/data.rst, new tests/test_grid_dataset.py) and out-of-scope items (PatchDataset behavior, iter_patch_slices, apply_transform).",
+      "hypothesis": "file_location and architectural_fit failed in runs that placed patch generation in the dataset or duplicated geometry; naming the files of the reference change tells the agent where PatchIter, the export, and the docs entry belong."
+    },
+    {
+      "category": "Purpose",
+      "subsection": "Assumptions",
+      "operation": "add",
+      "change": "State that image items are channel-first with the channel dimension yielded whole and excluded from patch size; that the image dataset supports len(); that the transform acts on a single patch; and that a custom generator accepts one item at a time.",
+      "hypothesis": "api_contract failed in runs that treated each dataset item as a sequence of arrays zipped in lockstep (run-05 mis-shaped output from iterating channel slices); the reference treats each item as one image."
+    },
+    {
+      "category": "Purpose",
+      "subsection": "Terminology",
+      "operation": "add",
+      "change": "Define image item, patch, patch generator (tuple output: patch first, optional coordinates second, extra elements ignored), coordinates (start and stop per dimension including channel, original frame), and grid sampling visit order (first spatial dimension fastest).",
+      "hypothesis": "api_contract and requirement_intent failed on the coordinate format: several runs produced start-only coordinates, while the reference yields start and stop pairs per dimension including the channel row."
+    },
+    {
+      "category": "Purpose",
+      "subsection": "Scope",
+      "operation": "remove",
+      "change": "Remove the PR boilerplate from the draft: the sign-off line naming an individual, the 'Ready' status line, the 'Types of changes' checklist, and the 'quick tests passed locally' claim. Breaking-change, test, and documentation items are kept in Compatibility, Test requirements, and Documentation.",
+      "hypothesis": "These are not behavioral requirements. The sign-off is personal author attribution and the quick-test claim cannot be verified from the code; the breaking-change, test, and docs items are preserved in their relevant sections so no correct constraint is lost."
+    },
+    {
+      "category": "Behavior",
+      "subsection": "Workflows",
+      "operation": "add",
+      "change": "Describe patch generation (PatchIter delegates to iter_patch with copy-back disabled) and dataset iteration (worker index split with ceiling division, first-element patch extraction, optional coordinates, transform applied to the patch only).",
+      "hypothesis": "requirement_intent and abstraction_integrity failed: the transform received the tuple in several runs (run-00, run-05, run-08), while the reference applies it to the patch alone and yields (patch, coordinates) pairs by default."
+    },
+    {
+      "category": "Data",
+      "subsection": "Data model",
+      "operation": "add",
+      "change": "Specify the coordinate array as an integer-valued array of shape (dimensions including channel, 2) with start and stop per row in the original frame, and require a numeric array rather than a tuple of slice objects so default collation can batch it.",
+      "hypothesis": "api_contract failed on start-only coordinates in most runs; abstraction_integrity failed in run-04 where DataLoader collation raised TypeError on slice tuples, a runtime failure at the framework boundary."
+    },
+    {
+      "category": "Interfaces",
+      "subsection": "API contracts",
+      "operation": "add",
+      "change": "Add the PatchIter contract: public class exported from monai.data; construction options patch_size (channel excluded; 0/None whole dimension), start_pos (default origin), mode (default wrap, NumpyPadMode or string), and keyword padding options; invocation takes one image item and yields (patch, coordinates) tuples.",
+      "hypothesis": "extension_registration failed in all runs because PatchIter was absent, so the export, __all__ entry, and documented class were missing."
+    },
+    {
+      "category": "Interfaces",
+      "subsection": "API contracts",
+      "operation": "add",
+      "change": "Specify the GridPatchDataset constructor as parameters in order: dataset, patch_iter (required, no default), transform (optional), with_coordinates (default true). State that patch_size, start_pos, mode, and padding options are not accepted by the dataset.",
+      "hypothesis": "api_contract failed in every run: runs kept the old positional signature so patch_iter= was rejected, and defaulted with_coordinates to false instead of the reference's true."
+    },
+    {
+      "category": "Interfaces",
+      "subsection": "API contracts",
+      "operation": "add",
+      "change": "Specify that iter_patch keeps its inputs but yields (patch view, coordinate array) pairs, and that it is the only component that computes coordinates from its padding offsets.",
+      "hypothesis": "extension_point_adherence and abstraction_integrity failed in runs that duplicated iter_patch's padding and slicing arithmetic inside the dataset (runs 01, 03, 05, 06, 08), leaving two copies of the geometry that can drift apart."
+    },
+    {
+      "category": "Architecture",
+      "subsection": "Module architecture",
+      "operation": "add",
+      "change": "Assign responsibilities: PatchIter owns patch generation options and delegates geometry to iter_patch; GridPatchDataset owns iteration, worker partitioning, per-patch transform, and the coordinate toggle; the utility module owns padding, slicing, and coordinates.",
+      "hypothesis": "architectural_fit failed in every run because the candidates kept patch sampling and coordinate math inside the dataset class instead of the reference's patch-generation layer."
+    },
+    {
+      "category": "Architecture",
+      "subsection": "Implementation constraints",
+      "operation": "add",
+      "change": "Require an injected patch generator (no hard-coded iter_patch call in the dataset), no reimplementation of grid stepping, padding, or offsets, numeric coordinate arrays, the existing apply_transform with map-items disabled, and no channel iteration or lockstep multi-array handling.",
+      "hypothesis": "extension_point_adherence failed in all runs (parallel path, no patch_iter extension point); abstraction_integrity failed on the DataLoader TypeError (run-04) and the tuple-shaped transform input; run-05's channel iteration produced silently mis-shaped output."
+    },
+    {
+      "category": "Architecture",
+      "subsection": "Dependencies",
+      "operation": "add",
+      "change": "List the grid module's dependencies (torch, NumPy for the ceiling in place of the math import, base dataset, iter_patch, apply_transform, NumpyPadMode, ensure_tuple); forbid the utility module from importing the grid module; state that no new third-party dependencies are added.",
+      "hypothesis": "dependency_direction and approved_dependencies are preserved as constraints; the explicit ban on a reverse import prevents a cycle when PatchIter relies on the utility module."
+    },
+    {
+      "category": "Conventions",
+      "subsection": "Naming",
+      "operation": "add",
+      "change": "Name the public class PatchIter and list it in the grid module's __all__; fix the parameter names; name the test module tests/test_grid_dataset.py with class TestGridPatchDataset; forbid new public coordinate helpers in the utility module's public list.",
+      "hypothesis": "convention_fit failed on test naming (runs placed tests in tests/test_grid_patch_dataset.py or tests/test_patch_dataset.py) and run-02 added a new public utility name that the reference does not require."
+    },
+    {
+      "category": "Conventions",
+      "subsection": "Validation",
+      "operation": "add",
+      "change": "Require the image-dataset length check at iteration start, delegate size and start-position validation to iter_patch, validate mode during PatchIter construction, and forbid silent fallbacks for generator output arity.",
+      "hypothesis": "requirement_intent and convention_fit: the reference validates length at iteration and mode at construction; silent fallbacks would hide mismatched generator contracts."
+    },
+    {
+      "category": "Conventions",
+      "subsection": "Error handling",
+      "operation": "add",
+      "change": "Specify NotImplementedError with the message stating the image dataset must implement len(); propagate NumpyPadMode conversion errors; let transform exceptions propagate through apply_transform; do not catch generator exceptions.",
+      "hypothesis": "convention_fit: follows the reference's error path, which the judge's convention checks compare against; the candidates had no explicit error contract for datasets without length."
+    },
+    {
+      "category": "Conventions",
+      "subsection": "Documentation",
+      "operation": "add",
+      "change": "Require the GridPatchDataset class docstring to include a usage example whose printed shapes and coordinates match actual output; require constructor, PatchIter, and iter_patch docstrings to describe the contract; replace the deprecated NumPy float alias with builtin float in the PatchDataset example.",
+      "hypothesis": "convention_fit failed in runs 05 and 08 where docstring examples and test expectations disagreed with the implementation's shapes; the reference's docstrings and the float alias change are the evidence."
+    },
+    {
+      "category": "Conventions",
+      "subsection": "Documentation",
+      "operation": "add",
+      "change": "Require a PatchIter autodoc entry in docs/source/data.rst placed directly after the GridPatchDataset section, in the same heading style.",
+      "hypothesis": "extension_registration failed in every run because the documentation entry for the new public class was not added."
+    },
+    {
+      "category": "Conventions",
+      "subsection": "Documentation",
+      "operation": "clarify",
+      "change": "Specify the iter_patch Yields text to describe (patch, coordinates) pairs and add a note giving coordinates as start and stop per dimension including the channel dimension.",
+      "hypothesis": "api_contract and convention_fit: the coordinate format must be documented where it is produced so consumers do not infer start-only coordinates."
+    },
+    {
+      "category": "Quality",
+      "subsection": "Maintainability",
+      "operation": "add",
+      "change": "Require lines of at most 120 characters, no duplicate imports, no unused imports (remove math once NumPy is used), and a single location for grid geometry.",
+      "hypothesis": "convention_fit failed in run-01 (duplicate import that fails flake8 F811) and run-02 (test line over the repository's 120-character limit)."
+    },
+    {
+      "category": "Quality",
+      "subsection": "Reliability",
+      "operation": "add",
+      "change": "Require that worker partitioning assigns each index to exactly one worker; that set_rnd skips attribute names beginning with a double underscore when recursing; and that copy-back is disabled so in-place patch changes do not alter the source image.",
+      "hypothesis": "Not a judge-reported failure. These are reference-diff behaviors (including the set_rnd change) recorded so the spec matches the reference; the set_rnd rule is reference evidence only."
+    },
+    {
+      "category": "Compatibility",
+      "subsection": "Compatibility",
+      "operation": "add",
+      "change": "Declare the breaking change explicitly: the old GridPatchDataset constructor form is removed, the dataset item contract changes from a sequence of arrays to one image, coordinates are yielded by default, iter_patch callers receive pairs, and PatchIter is an additive export. Forbid a compatibility shim.",
+      "hypothesis": "api_contract and requirement_intent: run-06 treated the removal of the old keyword interface as a regression and kept it; the reference is an intentional breaking redesign, so the spec must state it to stop candidates preserving the old signature."
+    },
+    {
+      "category": "Operations",
+      "subsection": "Operations",
+      "operation": "add",
+      "change": "State the environment (Python 3.9, repository installed in editable mode, pytest) and the verification command (pytest on tests/test_grid_dataset.py); state that the checklist items about local quick-test runs are not requirements.",
+      "hypothesis": "patch_and_checks depends on the recorded install and check commands in prepared.json; the draft did not state them."
+    },
+    {
+      "category": "Acceptance",
+      "subsection": "Behavioral acceptance criteria",
+      "operation": "add",
+      "change": "Add eight testable criteria: string-item chunking with coordinates off; batch shapes (2, 1, 2, 2) for the 4x4 two-image case; coordinate arrays of shape (3, 2) with the stated visit order and channel row [0, 1]; default pair output that collates; single-patch transform input; worker equivalence on non-Windows; NotImplementedError for no length; PatchIter importable from monai.data.",
+      "hypothesis": "requirement_intent failed in all runs because the draft had no acceptance statements; these criteria are derived from the reference's test expectations and docstring example."
+    },
+    {
+      "category": "Acceptance",
+      "subsection": "Test requirements",
+      "operation": "add",
+      "change": "Require tests/test_grid_dataset.py with class TestGridPatchDataset, tests test_shape and test_loading_array (the FAIL_TO_PASS tests), setUp/tearDown determinism with seed 1234 and reset, Windows-gated worker counts, and no grid tests placed in test_patch_dataset.py.",
+      "hypothesis": "convention_fit failed in runs 08 and 09 (tests placed in test_patch_dataset.py) and run-00/run-07 (non-conforming test file names); these test names are the recorded FAIL_TO_PASS checks."
+    }
+  ]
+}

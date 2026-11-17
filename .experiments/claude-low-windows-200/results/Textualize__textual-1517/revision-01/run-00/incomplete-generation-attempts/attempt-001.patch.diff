@@ -1,0 +1,145 @@
+diff --git a/src/textual/app.py b/src/textual/app.py
+index b207bbd..5b9fc82 100644
+--- a/src/textual/app.py
++++ b/src/textual/app.py
+@@ -10,14 +10,17 @@ import threading
+ import unicodedata
+ import warnings
+ from asyncio import Task
++from concurrent.futures import Future, wait as wait_futures
+ from contextlib import asynccontextmanager, redirect_stderr, redirect_stdout
+ from datetime import datetime
++from functools import partial
+ from pathlib import Path, PurePath
+ from queue import Queue
+ from time import perf_counter
+ from typing import (
+     TYPE_CHECKING,
+     Any,
++    Awaitable,
+     Callable,
+     Generic,
+     Iterable,
+@@ -130,6 +133,7 @@ class CssPathError(Exception):
+ 
+ 
+ ReturnType = TypeVar("ReturnType")
++CallThreadReturnType = TypeVar("CallThreadReturnType")
+ 
+ 
+ class _NullFile:
+@@ -356,6 +360,10 @@ class App(Generic[ReturnType], DOMNode):
+         self._return_value: ReturnType | None = None
+         self._exit = False
+ 
++        # Thread-entry state, set by run_async and cleared when it finishes.
++        self._loop: asyncio.AbstractEventLoop | None = None
++        self._thread_id: int | None = None
++
+         self.css_monitor = (
+             FileMonitor(self.css_path, self._on_css_change)
+             if ((watch_css or self.debug) and self.css_path)
+@@ -821,6 +829,10 @@ class App(Generic[ReturnType], DOMNode):
+ 
+         auto_pilot_task: Task | None = None
+ 
++        # Record the event loop and app thread so call_from_thread can reach us.
++        self._loop = asyncio.get_running_loop()
++        self._thread_id = threading.get_ident()
++
+         async def app_ready() -> None:
+             """Called by the message loop when the app is ready."""
+             nonlocal auto_pilot_task
+@@ -839,17 +851,22 @@ class App(Generic[ReturnType], DOMNode):
+                 auto_pilot_task = asyncio.create_task(run_auto_pilot(auto_pilot, pilot))
+ 
+         try:
+-            await app._process_messages(
+-                ready_callback=None if auto_pilot is None else app_ready,
+-                headless=headless,
+-                terminal_size=size,
+-            )
+-        finally:
+             try:
+-                if auto_pilot_task is not None:
+-                    await auto_pilot_task
++                await app._process_messages(
++                    ready_callback=None if auto_pilot is None else app_ready,
++                    headless=headless,
++                    terminal_size=size,
++                )
+             finally:
+-                await app._shutdown()
++                try:
++                    if auto_pilot_task is not None:
++                        await auto_pilot_task
++                finally:
++                    await app._shutdown()
++        finally:
++            # Always clear thread-entry state so later calls raise instead of waiting.
++            self._loop = None
++            self._thread_id = None
+ 
+         return app.return_value
+ 
+@@ -889,6 +906,60 @@ class App(Generic[ReturnType], DOMNode):
+             event_loop.run_until_complete(run_app())
+         return self.return_value
+ 
++    def call_from_thread(
++        self,
++        callback: Callable[..., CallThreadReturnType | Awaitable[CallThreadReturnType]],
++        *args: Any,
++        **kwargs: Any,
++    ) -> CallThreadReturnType:
++        """Run a callable in the context of the app from a different thread.
++
++        Textual objects are not thread-safe. This method ensures the callable runs
++        in the correct app context (on the app's event loop), so it may be used
++        from a worker thread wrapping a third-party threaded API.
++
++        The call blocks the calling thread until the callable returns.
++
++        Args:
++            callback (Callable[..., CallThreadReturnType | Awaitable[CallThreadReturnType]]):
++                The callable to run in the app's context. If it returns an awaitable,
++                the awaitable is awaited.
++            *args: Positional arguments to forward to the callable.
++            **kwargs: Keyword arguments to forward to the callable.
++
++        Raises:
++            RuntimeError: If the app is not running (including before it has started
++                and after it has stopped), or if called from the app thread.
++
++        Returns:
++            CallThreadReturnType: The result of the callable.
++        """
++        if self._loop is None:
++            raise RuntimeError("App is not running")
++        if threading.get_ident() == self._thread_id:
++            raise RuntimeError(
++                "The call_from_thread method must run in a different thread from the app"
++            )
++
++        loop = self._loop
++
++        async def run_callback() -> CallThreadReturnType:
++            # The active app context is per task, so set it inside the scheduled task.
++            self._set_active()
++            return await invoke(partial(callback, *args, **kwargs))
++
++        future: Future[CallThreadReturnType] = asyncio.run_coroutine_threadsafe(
++            run_callback(), loop
++        )
++        # Wait for completion, but never block forever if the loop has stopped.
++        while True:
++            done, _ = wait_futures([future], timeout=0.05)
++            if done:
++                return future.result()
++            if not loop.is_running():
++                future.cancel()
++                raise RuntimeError("App is not running")
++
+     async def _on_css_change(self) -> None:
+         """Called when the CSS changes (if watch_css is True)."""
+         css_paths = self.css_path

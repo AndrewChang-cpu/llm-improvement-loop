@@ -1,0 +1,309 @@
+diff --git a/astropy/nddata/nduncertainty.py b/astropy/nddata/nduncertainty.py
+index 05ce66c..3863490 100644
+--- a/astropy/nddata/nduncertainty.py
++++ b/astropy/nddata/nduncertainty.py
+@@ -57,7 +57,8 @@ class NDUncertainty(metaclass=ABCMeta):
+     ------
+     IncompatibleUncertaintiesException
+         If given another `NDUncertainty`-like class as ``array`` if their
+-        ``uncertainty_type`` is different.
++        ``uncertainty_type`` is different. Use `NDUncertainty.represent_as`
++        to convert explicitly between supported uncertainty types.
+     """
+ 
+     def __init__(self, array=None, copy=True, unit=None):
+@@ -395,6 +396,50 @@ class NDUncertainty(metaclass=ABCMeta):
+     def _propagate_divide(self, other_uncert, result_data, correlation):
+         return None
+ 
++    def represent_as(self, other_uncert):
++        """Convert this uncertainty to another `NDUncertainty` subclass.
++
++        The conversion goes through `VarianceUncertainty`: this uncertainty is
++        first converted to variance and the variance is then converted to
++        ``other_uncert``. Conversion is only performed when requested here;
++        constructing an uncertainty or propagating errors never converts
++        between types.
++
++        Parameters
++        ----------
++        other_uncert : subclass of `NDUncertainty`
++            The uncertainty class to convert to. Must be one of
++            `StdDevUncertainty`, `VarianceUncertainty` or `InverseVariance`.
++
++        Returns
++        -------
++        `NDUncertainty`
++            An instance of ``other_uncert``. A new instance is returned for
++            conversions between different classes; the same object is
++            returned when converting `VarianceUncertainty` to itself.
++
++        Raises
++        ------
++        TypeError
++            If this uncertainty's class or ``other_uncert`` does not support
++            conversion to or from another uncertainty type, including when
++            both are the same unsupported class.
++        """
++        to_variance = getattr(self, '_convert_to_variance', None)
++        if to_variance is None:
++            raise TypeError(
++                "{} does not support conversion to another uncertainty "
++                "type.".format(type(self).__name__))
++
++        from_variance = getattr(other_uncert, '_convert_from_variance', None)
++        if from_variance is None:
++            name = getattr(other_uncert, '__name__', repr(other_uncert))
++            raise TypeError(
++                "{} does not support conversion from another uncertainty "
++                "type.".format(name))
++
++        return from_variance(to_variance())
++
+ 
+ class UnknownUncertainty(NDUncertainty):
+     """This class implements any unknown uncertainty type.
+@@ -748,6 +793,23 @@ class StdDevUncertainty(_VariancePropagationMixin, NDUncertainty):
+     def _data_unit_to_uncertainty_unit(self, value):
+         return value
+ 
++    def _convert_to_variance(self):
++        """Convert to `VarianceUncertainty` by squaring the array and unit."""
++        array = None if self.array is None else np.square(self.array)
++        unit = None if self.unit is None else self.unit ** 2
++        return VarianceUncertainty(array, unit=unit, copy=False)
++
++    @classmethod
++    def _convert_from_variance(cls, var_uncert):
++        """Create a `StdDevUncertainty` from a `VarianceUncertainty`.
++
++        Takes the square root of the array and raises the unit to the power
++        1/2.
++        """
++        array = None if var_uncert.array is None else np.sqrt(var_uncert.array)
++        unit = None if var_uncert.unit is None else var_uncert.unit ** 0.5
++        return cls(array, unit=unit, copy=False)
++
+ 
+ class VarianceUncertainty(_VariancePropagationMixin, NDUncertainty):
+     """
+@@ -834,6 +896,15 @@ class VarianceUncertainty(_VariancePropagationMixin, NDUncertainty):
+     def _data_unit_to_uncertainty_unit(self, value):
+         return value ** 2
+ 
++    def _convert_to_variance(self):
++        """Return this uncertainty itself, which is already a variance."""
++        return self
++
++    @classmethod
++    def _convert_from_variance(cls, var_uncert):
++        """Return the variance uncertainty unchanged."""
++        return var_uncert
++
+ 
+ def _inverse(x):
+     """Just a simple inverse for use in the InverseVariance"""
+@@ -933,3 +1004,20 @@ class InverseVariance(_VariancePropagationMixin, NDUncertainty):
+ 
+     def _data_unit_to_uncertainty_unit(self, value):
+         return 1 / value ** 2
++
++    def _convert_to_variance(self):
++        """Convert to `VarianceUncertainty` by taking the reciprocal of the
++        array and the unit.
++        """
++        array = None if self.array is None else 1 / self.array
++        unit = None if self.unit is None else 1 / self.unit
++        return VarianceUncertainty(array, unit=unit, copy=False)
++
++    @classmethod
++    def _convert_from_variance(cls, var_uncert):
++        """Create an `InverseVariance` from a `VarianceUncertainty` by taking
++        the reciprocal of the array and the unit.
++        """
++        array = None if var_uncert.array is None else 1 / var_uncert.array
++        unit = None if var_uncert.unit is None else 1 / var_uncert.unit
++        return cls(array, unit=unit, copy=False)
+diff --git a/astropy/nddata/tests/test_nduncertainty.py b/astropy/nddata/tests/test_nduncertainty.py
+index 1cea6b9..3ff1f08 100644
+--- a/astropy/nddata/tests/test_nduncertainty.py
++++ b/astropy/nddata/tests/test_nduncertainty.py
+@@ -4,7 +4,7 @@ import pickle
+ 
+ import pytest
+ import numpy as np
+-from numpy.testing import assert_array_equal
++from numpy.testing import assert_array_equal, assert_allclose
+ 
+ from astropy.nddata.nduncertainty import (StdDevUncertainty,
+                              VarianceUncertainty,
+@@ -354,3 +354,129 @@ def test_assigning_uncertainty_with_bad_unit_to_parent_fails(NDClass,
+     v = UncertClass([1, 1], unit=u.second)
+     with pytest.raises(u.UnitConversionError):
+         ndd.uncertainty = v
++
++
++supported_uncertainty_types = [StdDevUncertainty,
++                               VarianceUncertainty,
++                               InverseVariance]
++
++
++@pytest.mark.parametrize('UncertClass', supported_uncertainty_types)
++def test_represent_as_self_supported(UncertClass):
++    uncert = UncertClass([1., 4.], unit=u.m)
++    result = uncert.represent_as(UncertClass)
++    assert isinstance(result, UncertClass)
++    assert_allclose(result.array, uncert.array)
++    assert result.unit == u.m
++
++
++def test_represent_as_variance_to_itself_is_same_object():
++    uncert = VarianceUncertainty([1., 4.], unit=u.adu)
++    result = uncert.represent_as(VarianceUncertainty)
++    assert result is uncert
++    assert result.unit == u.adu
++    assert_array_equal(result.array, [1., 4.])
++
++
++@pytest.mark.parametrize('UncertClass', [FakeUncertainty, UnknownUncertainty])
++def test_represent_as_unsupported_self_raises(UncertClass):
++    uncert = UncertClass([1., 4.], unit=u.m)
++    with pytest.raises(TypeError):
++        uncert.represent_as(UncertClass)
++
++
++@pytest.mark.parametrize(('source', 'target'),
++                         [(FakeUncertainty, StdDevUncertainty),
++                          (StdDevUncertainty, FakeUncertainty),
++                          (UnknownUncertainty, VarianceUncertainty),
++                          (VarianceUncertainty, UnknownUncertainty)])
++def test_represent_as_unsupported_cross_raises(source, target):
++    uncert = source([1., 4.], unit=u.m)
++    with pytest.raises(TypeError):
++        uncert.represent_as(target)
++
++
++def test_represent_as_std_to_variance_squares():
++    uncert = StdDevUncertainty([2., 3.], unit=u.m)
++    result = uncert.represent_as(VarianceUncertainty)
++    assert isinstance(result, VarianceUncertainty)
++    assert_allclose(result.array, [4., 9.])
++    assert result.unit == u.m ** 2
++
++
++def test_represent_as_variance_to_std_square_roots():
++    uncert = VarianceUncertainty([4., 9.], unit=u.m)
++    result = uncert.represent_as(StdDevUncertainty)
++    assert isinstance(result, StdDevUncertainty)
++    assert_allclose(result.array, [2., 3.])
++    assert result.unit == u.m ** 0.5
++
++
++def test_represent_as_inverse_variance_to_variance_reciprocal():
++    uncert = InverseVariance([2., 4.], unit=u.m)
++    result = uncert.represent_as(VarianceUncertainty)
++    assert isinstance(result, VarianceUncertainty)
++    assert_allclose(result.array, [0.5, 0.25])
++    assert result.unit == u.m ** -1
++
++
++def test_represent_as_variance_to_inverse_variance_reciprocal():
++    uncert = VarianceUncertainty([2., 4.], unit=u.s)
++    result = uncert.represent_as(InverseVariance)
++    assert isinstance(result, InverseVariance)
++    assert_allclose(result.array, [0.5, 0.25])
++    assert result.unit == u.s ** -1
++
++
++def test_represent_as_inverse_variance_to_std():
++    # ivar -> variance (reciprocal) -> std (square root)
++    uncert = InverseVariance([0.25, 0.04], unit=u.m)
++    result = uncert.represent_as(StdDevUncertainty)
++    assert_allclose(result.array, [2., 5.])
++    assert result.unit == u.m ** -0.5
++
++
++@pytest.mark.parametrize('UncertClass', supported_uncertainty_types)
++def test_represent_as_round_trip_through_variance(UncertClass):
++    uncert = UncertClass([1., 2.], unit=u.m)
++    back = uncert.represent_as(VarianceUncertainty).represent_as(UncertClass)
++    assert isinstance(back, UncertClass)
++    assert_allclose(back.array, [1., 2.])
++    assert back.unit == u.m
++
++
++@pytest.mark.parametrize('UncertClass', supported_uncertainty_types)
++def test_represent_as_none_array_stays_none(UncertClass):
++    uncert = UncertClass(None, unit=u.m)
++    result = uncert.represent_as(VarianceUncertainty)
++    assert result.array is None
++    with pytest.raises(MissingDataAssociationException):
++        result.parent_nddata
++
++
++def test_represent_as_none_unit_stays_none():
++    uncert = StdDevUncertainty([2., 3.])
++    result = uncert.represent_as(InverseVariance)
++    assert_allclose(result.array, [0.25, 1. / 9.])
++    assert result.unit is None
++
++
++def test_represent_as_unit_only_inverse_variance_to_variance():
++    uncert = InverseVariance(None, unit=u.m)
++    result = uncert.represent_as(VarianceUncertainty)
++    assert result.array is None
++    assert result.unit == u.m ** -1
++
++
++def test_represent_as_unit_only_variance_to_inverse_variance():
++    uncert = VarianceUncertainty(None, unit=u.m)
++    result = uncert.represent_as(InverseVariance)
++    assert result.array is None
++    assert result.unit == u.m ** -1
++
++
++def test_represent_as_result_has_no_parent():
++    uncert = StdDevUncertainty([2., 3.], unit=u.m)
++    result = uncert.represent_as(VarianceUncertainty)
++    with pytest.raises(MissingDataAssociationException):
++        result.parent_nddata
+diff --git a/docs/changes/nddata/12057.feature.rst b/docs/changes/nddata/12057.feature.rst
+new file mode 100644
+index 0000000..3a2445a
+--- /dev/null
++++ b/docs/changes/nddata/12057.feature.rst
+@@ -0,0 +1,5 @@
++Added `~astropy.nddata.NDUncertainty.represent_as` to convert between the
++supported uncertainty types (`~astropy.nddata.StdDevUncertainty`,
++`~astropy.nddata.VarianceUncertainty` and `~astropy.nddata.InverseVariance`)
++explicitly, using variance as the intermediate representation. Unsupported
++uncertainty classes raise a ``TypeError``.
+diff --git a/docs/whatsnew/5.1.rst b/docs/whatsnew/5.1.rst
+index 093c341..6a556f1 100644
+--- a/docs/whatsnew/5.1.rst
++++ b/docs/whatsnew/5.1.rst
+@@ -94,6 +94,24 @@ Note that the previous syntax is still supported for backwards compatibility
+ and there is no intent to remove this. See :ref:`io-ascii-read-converters` for
+ details.
+ 
++.. _whatsnew-nddata-uncertainty-conversion:
++
++Conversion between NDData uncertainty types
++===========================================
++
++Uncertainties of the supported types (`~astropy.nddata.StdDevUncertainty`,
++`~astropy.nddata.VarianceUncertainty` and `~astropy.nddata.InverseVariance`)
++can now be converted explicitly with the new
++:meth:`~astropy.nddata.NDUncertainty.represent_as` method. The conversion
++goes through variance, for example::
++
++    >>> from astropy.nddata import StdDevUncertainty, VarianceUncertainty
++    >>> StdDevUncertainty([2.]).represent_as(VarianceUncertainty).array
++    array([4.])
++
++Conversion is never performed implicitly; mixed uncertainty types are still
++rejected in arithmetic and construction.
++
+ .. _whatsnew-structured-columns:
+ 
+ Structured Columns

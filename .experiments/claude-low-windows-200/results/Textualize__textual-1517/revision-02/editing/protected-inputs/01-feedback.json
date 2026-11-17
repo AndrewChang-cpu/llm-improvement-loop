@@ -1,0 +1,1570 @@
+{
+  "current_specification": "# Call from thread method\n\n## Goals\n\n- Provide a public method on the application object that lets code running on a non-app thread (for example, a worker thread wrapping a third-party threaded API) run a callable in the app's context and receive its result. Integrators should not have to manage the app's event loop themselves.\n- Keep behaviour predictable: the call blocks the calling thread until the callable has finished, then returns its result, or propagates the callable's exception unchanged.\n- This is a step toward an integration answer for third-party APIs. Syntactic sugar and further convenience APIs are deferred.\n\n## Scope\n\n- In scope: one new public method on the App class; the thread-entry state the method needs; lifecycle bookkeeping in the app's run entry point; and tests for the behaviours listed below.\n- Out of scope: changes to widgets, the message pump, or drivers; new convenience wrappers; async-native alternatives.\n\n## Assumptions\n\n- The app's run entry point is the only place the app's event loop starts and stops. Thread-entry state must therefore be owned there.\n\n## Terminology\n\n- App thread: the thread that calls the app's run entry point and on which the app's event loop runs.\n- Calling thread: any thread other than the app thread.\n- App context: the framework's active-app context variable. Framework code such as widget access through the app property resolves the app from it, and it is per asyncio task, so it must be established inside the task that runs the callable.\n- Invoke helper: the existing callback helper that calls a callable with at most as many positional arguments as the callable declares, and awaits the result if it is awaitable.\n\n## Workflows\n\nThe method must check the following conditions in this order:\n\n1. If the app is not running (no event loop has been recorded), raise a runtime error with the message \"App is not running\". This applies before the app has started and after it has stopped.\n2. If the calling thread is the app thread, raise a runtime error whose message states that the call must run in a different thread from the app.\n3. Otherwise, schedule work onto the app's event loop in a thread-safe way. The scheduled work must:\n   a. Make the app the active app in the app context for that task, using the App's existing active-app helper, before the callable runs.\n   b. Bind every supplied positional argument and every supplied keyword argument to the callable first, so that the callable is handed to the invoke helper as a callable that needs no positional arguments from the invoke helper. The invoke helper then calls it and awaits the result when it is awaitable. Do not pass the forwarded positional arguments to the invoke helper as separate values, because the helper truncates them to the callable's declared parameter count.\n4. The calling thread waits for the scheduled work to complete with one blocking wait on the scheduled result, then returns the callable's result. Completion is signalled only by that scheduled result.\n5. If the callable raises, any exception (including exception types that are also timeout exceptions on some Python versions) propagates unchanged to the calling thread. The method must not catch, retry, wrap, or convert it.\n6. Callables that touch widgets through the app (for example, querying a widget and writing to it) must succeed when called this way.\n\nLifecycle: the app's run entry point records the event loop and the app thread's identifier when the app starts running. When the run entry point finishes, for any reason including an error, it clears both records so that later calls follow step 1 and raise instead of waiting.\n\n## Data model\n\n- The App holds two thread-entry values: a reference to the app's event loop, and the identifier of the app thread.\n- Both are empty when the App is constructed, so a call made before run is detected as not running.\n- Both are set at the start of the run entry point, from the thread that invokes run.\n- Both are cleared in a cleanup step that always executes when the run entry point ends, so a finished app is never reported as running.\n\n## API contracts\n\n- A public method named call_from_thread on the App class.\n- Input: a required callable that may return a value or an awaitable of a value; followed by any number of positional arguments and any keyword arguments. Every supplied argument is forwarded to the callable unchanged, regardless of how many parameters the callable declares, including variadic callables. If the callable cannot accept the arguments, its own error propagates.\n- Return: the callable's result, after awaiting if needed. Use a dedicated type variable for the callable's result, separate from the App's existing type variable(s) used for its exit or return value. Annotate the callable parameter as a callable returning either that type or an awaitable of it, and annotate the method's return with the same dedicated type variable. Do not use an untyped return.\n- Raises a runtime error when the app is not running or when called from the app thread (see Error handling). Exceptions raised by the callable propagate unchanged.\n\n## Module architecture\n\n- The method belongs on the App class in the app module, grouped with the other App-level methods. It must not be placed in the message pump, widgets, or drivers.\n- The thread-entry values belong to the App and are initialized in the App constructor.\n- Setting and clearing the thread-entry values belongs to the run entry point of the App, not to message processing.\n- Reuse existing mechanisms: the App's existing active-app helper, the invoke helper from the callback module, and the standard threadsafe scheduling of a coroutine onto a given event loop.\n\n## Implementation constraints\n\n- Do not reimplement awaitable handling or argument invocation. Calls to the callable must go through the existing invoke helper.\n- Do not add a parallel callback-invocation path.\n- The active-app setting must occur inside the scheduled work before the callable is invoked. Setting it on the calling thread has no effect on the scheduled work.\n- The not-running check must rely on the cleared state after shutdown, not on a separate flag.\n- Positional arguments must be bound to the callable before the invoke helper is used; they must not be passed to the invoke helper as its own parameters (see Workflows 3b).\n- Do not add a polling loop, timed retries, or periodic state re-checks around the wait (see Reliability).\n\n## Dependencies\n\n- No new third-party dependencies.\n- Use only standard-library modules that the app module already has or can import from the standard library (threading, asyncio, the future type from concurrent.futures, and partial binding from functools), plus the existing invoke helper and active-app variable.\n\n## Error handling\n\n- Not running: raise a runtime error with the exact message \"App is not running\".\n- Same thread: raise a runtime error whose message says the call_from_thread method must run in a different thread from the app. The message must not describe the not-running case.\n- Exceptions raised by the callable are not swallowed, wrapped, retried, or treated specially because of their type. This includes exceptions that are timeout exceptions on some Python versions.\n- Shutdown: calls made after shutdown are rejected by the not-running check at entry and therefore never block. The method must not add a mechanism that watches loop state during the wait to detect shutdown.\n\n## Documentation\n\n- The method must have a docstring that states that Textual objects are not thread-safe, that the call ensures the code runs in the correct context, and that the call blocks until the callable returns.\n- The docstring's Args section must describe the callable and the forwarded arguments.\n- The docstring's Raises section must document both runtime error cases: the app not running (including after it has stopped) and the call from the app thread.\n\n## Reliability\n\n- The method blocks the calling thread only until the scheduled callable completes. It does this with a single blocking wait on the scheduled result, not with timed waits in a loop.\n- Thread-entry state must be cleared on every exit path of the run entry point, including exceptions, so no call after shutdown can wait on a stopped loop.\n\n## Compatibility\n\n- The project declares Python 3.7 and later. The implementation and the tests must behave the same on every supported version.\n- Behaviour must not depend on whether the builtin timeout error and the concurrent.futures timeout error are the same type (they are the same type on newer Python versions).\n- Use only APIs available on the minimum supported version. For example, do not use asyncio.to_thread in the implementation or in tests.\n\n## Behavioral acceptance criteria\n\n- A background thread calling the method with a callable that writes to a text log widget in the app causes the write to occur and the method to return.\n- A callable that returns an awaitable is awaited, and its result is returned to the calling thread.\n- A callable that raises a timeout-class exception (for example, one raised by a third-party timeout) causes that same exception to be raised on the calling thread, and the call returns instead of spinning.\n- A callable that accepts variadic arguments receives all supplied positional arguments, and a callable with named parameters receives the supplied keyword arguments.\n- A call from the app thread raises a runtime error.\n- A call before the app runs raises the \"App is not running\" runtime error.\n- A call made after the app's run has returned raises the \"App is not running\" runtime error and does not block.\n- A background thread that calls the app's exit through the method causes run to return the supplied exit value.\n\n## Test requirements\n\n- Place the tests in a concurrency-focused test module under the tests directory, following the repository's test naming convention.\n- Drive the app with a headless run from the test's main thread. Start the background calling thread from the app's ready hook (or after mount) so that the cross-thread calls happen once the app is running.\n- Test code must not create, start, or drive its own event loop, and must not use APIs unavailable on the minimum supported Python version (see Compatibility).\n- Tests must not read private App attributes (such as loop or thread-identifier state). Verify behaviour through public results: the callable's return value, the value the app's run returns, and raised exceptions.\n- The widget-access test must not assert rendered or layout-dependent widget state (for example, line counts after a write), because widgets may not be laid out when the call happens. Verify that the callable completes without error and that the app exits with a supplied code.\n- Cover: the not-running case, the same-thread case, widget access from within the callable, an awaitable callable, exception propagation (including a timeout-class exception), argument forwarding to a variadic callable, and a call after the app has stopped.\n",
+  "categories": {
+    "Purpose": [
+      "Goals",
+      "Scope",
+      "Assumptions",
+      "Terminology"
+    ],
+    "Behavior": [
+      "Workflows"
+    ],
+    "Data": [
+      "Data model"
+    ],
+    "Interfaces": [
+      "API contracts"
+    ],
+    "Architecture": [
+      "Module architecture",
+      "Implementation constraints",
+      "Dependencies"
+    ],
+    "Conventions": [
+      "Naming",
+      "Validation",
+      "Error handling",
+      "Logging",
+      "Documentation"
+    ],
+    "Quality": [
+      "Performance",
+      "Security",
+      "Reliability",
+      "Usability",
+      "Maintainability"
+    ],
+    "Compatibility": [
+      "Compatibility"
+    ],
+    "Operations": [
+      "Operations"
+    ],
+    "Acceptance": [
+      "Behavioral acceptance criteria",
+      "Test requirements"
+    ]
+  },
+  "requirements": {
+    "patch_and_checks": "The patch applies and the FEA-Bench FAIL_TO_PASS and PASS_TO_PASS test cases pass in the recorded reference environment.",
+    "file_location": "Code is placed in the required existing module or component.",
+    "api_contract": "API names, visibility, parameters, types, and return contracts match requirements.",
+    "dependency_direction": "Imports and dependency directions respect existing boundaries.",
+    "extension_registration": "Required registration and interface implementation are present.",
+    "approved_dependencies": "No unapproved dependencies are introduced.",
+    "architectural_fit": "Responsibilities belong in the intended layer or component.",
+    "extension_point_adherence": "Existing extension mechanisms are used rather than a parallel path.",
+    "abstraction_integrity": "Domain, transport, persistence, and framework boundaries are preserved.",
+    "convention_fit": "Follow the repository conventions visible in the original and reference code for validation, errors, naming, logging, and tests.",
+    "requirement_intent": "The feature satisfies its behavioral intent and constraints."
+  },
+  "runs": [
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json:2 records patch_applies: true",
+            "judge-context/checks.json:15-16 candidate_tests returncode 0 with '8 passed' for tests/test_concurrency.py",
+            "judge-context/checks.json:28-29 reference_tests (FAIL_TO_PASS test_call_from_thread_app_not_running and test_call_from_thread) returncode 0 with '2 passed'",
+            "generated/src/textual/app.py:903-945 implements the same behavior as the reference (reference.diff:44-111)",
+            "PASS_TO_PASS is not recorded in checks.json, so the existing suite is not independently verified; the only changes to existing behavior are the try/finally in run_app (generated/src/textual/app.py:880-892) and two __init__ attributes (app.py:301-302)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:903 places call_from_thread inside class App (class declared at app.py:214), the same module the reference modifies (reference.diff:31-111)",
+            "generated/tests/test_concurrency.py is the same path the reference adds (reference.diff:115-119)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:903-908 signature call_from_thread(self, callback, *args: Any, **kwargs: Any) -> CallThreadReturnType matches reference.diff:44-49 (the reference leaves *args/**kwargs unannotated; the candidate's annotation is compatible)",
+            "generated/src/textual/app.py:931-932 raises RuntimeError('App is not running') matching reference.diff:67-68",
+            "generated/src/textual/app.py:933-935 same-thread RuntimeError differs from reference.diff:71-73 only by missing backticks around call_from_thread; tests match on the substring 'different thread' (generated/tests/test_concurrency.py:45-50)",
+            "generated/src/textual/app.py:135 defines CallThreadReturnType, matching reference.diff:26"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:13 adds stdlib 'from functools import partial' only",
+            "generated/src/textual/app.py:19-20 adds Awaitable to the existing typing import",
+            "generated/src/textual/app.py:44 reuses the existing 'from ._callback import invoke' and app.py:9 the existing threading import; no new upward or cross-layer imports"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "judge-context/patch.diff:1 and :112 show only src/textual/app.py and tests/test_concurrency.py are touched",
+            "No third-party package is added; the only new import is stdlib functools.partial (generated/src/textual/app.py:13)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:880-892 sets and clears _loop and _thread_id around run_async in run(), matching reference.diff:101-111",
+            "generated/src/textual/app.py:903-945 keeps the thread-dispatch logic on App, delegating to self._set_active() (app.py:941, defined at base app.py:458-460) and invoke",
+            "generated/src/textual/app.py:301-302 initializes state in App.__init__, as the reference does (reference.diff:35-36)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:942 awaits the callback through the existing invoke helper, the same as reference.diff:80",
+            "base/src/textual/_callback.py invoke awaits awaitable results, so the documented awaitable behavior is supported by the existing mechanism",
+            "No parallel dispatch path is introduced; the call is routed via asyncio.run_coroutine_threadsafe (generated/src/textual/app.py:944-945), as in reference.diff:83-86"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:941 uses the existing private _set_active hook, the same boundary the reference uses (reference.diff:79)",
+            "No transport, persistence, or framework layer is bypassed; all changes stay inside App's threading boundary"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "judge-context/patch.diff touches no registry or plugin manifest; the reference diff also adds no registration (reference.diff file list: src/textual/app.py and tests/test_concurrency.py)",
+            "The feature is a plain App method, so no interface implementation or registration is required"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Error messages and checks mirror the reference (generated/src/textual/app.py:931-935; reference.diff:67-73); tests use pytest.raises(..., match=...) as the reference does (generated/tests/test_concurrency.py:38-42, 45-50)",
+            "Minor nit: generated/src/textual/app.py:13 places 'from functools import partial' before 'from contextlib' (app.py:14), breaking the alphabetical from-import order at app.py:12-18. Pre-commit only runs black (.pre-commit-config.yaml), so this is not enforced, and the reference also reorders imports",
+            "Minor nit: the _start_worker docstring (generated/tests/test_concurrency.py:21-23) says the helper 'exits the app', but it never does; the outcome records (test_concurrency.py:29, 31, 72) are never asserted",
+            "Minor nit: _start_worker swallows exceptions (test_concurrency.py:28-31), so a failing work() leaves the app running and the test hangs instead of failing. The reference test has the same pattern (reference.diff:146-153)",
+            "black was not run: the recorded venv has no black module. Long lines at app.py:934 and the docstring lines are string/docstring content that black does not wrap"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Raises 'App is not running' before start and after stop: generated/src/textual/app.py:931-932; tests at generated/tests/test_concurrency.py:38-42 and 139-150",
+            "Raises when called from the app thread: generated/src/textual/app.py:933-935; test at test_concurrency.py:45-50",
+            "Returns the callable's result and awaits awaitables: generated/src/textual/app.py:936-945; tests at test_concurrency.py:80-94",
+            "Forwards positional and keyword arguments unchanged via partial: generated/src/textual/app.py:936; test at test_concurrency.py:118-135",
+            "Behavior matches reference.diff:44-111 on every constraint"
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-00/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [
+          {
+            "phase": "candidate_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-q",
+              "--basetemp",
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-00/candidate-test-tmp",
+              "tests/test_concurrency.py"
+            ],
+            "returncode": 0,
+            "output": "........                                                                 [100%]\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n8 passed, 1 warning in 0.71s\n"
+          },
+          {
+            "phase": "reference_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-rA",
+              "tests/test_concurrency.py::test_call_from_thread_app_not_running",
+              "tests/test_concurrency.py::test_call_from_thread"
+            ],
+            "returncode": 0,
+            "output": "============================= test session starts ==============================\nplatform linux -- Python 3.9.25, pytest-8.4.2, pluggy-1.6.0\nrootdir: /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-00/evaluation\nconfigfile: pyproject.toml\ncollected 2 items\n\ntests/test_concurrency.py ..                                             [100%]\n\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n==================================== PASSES ====================================\n=========================== short test summary info ============================\nPASSED tests/test_concurrency.py::test_call_from_thread_app_not_running\nPASSED tests/test_concurrency.py::test_call_from_thread\n========================= 2 passed, 1 warning in 0.36s =========================\n"
+          }
+        ],
+        "candidate_test_changes": [
+          "tests/test_concurrency.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": false,
+          "evidence": [
+            "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-01/judge-context/checks.json:1"
+          ],
+          "deficiency": "Patch application or an executable check failed."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:468 call_from_thread added to App class, same module as reference (reference/src/textual/app.py:614)",
+            "generated/tests/test_concurrency.py matches reference test location and filename",
+            "generated/src/textual/app.py:901-918 lifecycle state set in run_async, the loop owner that run() delegates to"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:468-473 signature call_from_thread(callback, *args: Any, **kwargs: Any) -> CallThreadReturnType, matching reference/src/textual/app.py:614-619 (reference uses untyped *args/**kwargs; typed version is compatible)",
+            "generated/src/textual/app.py:495-500 raises RuntimeError('App is not running') and same-thread RuntimeError, matching reference messages at reference app.py:628-633",
+            "Return value and exception propagation: app.py:517-520 returns result or re-raises the original exception object"
+          ],
+          "deficiency": "None. Private attributes _loop/_thread_id typed int | None (app.py:371-372) vs reference int with default 0; private, not part of the public contract."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:47 reuses existing 'from ._callback import invoke' (already imported in base)",
+            "app.py:9,12,19 new imports are stdlib only (concurrent.futures.Future, functools.partial, typing.Awaitable)"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "Reference diff (tasks/.../reference.diff) adds no registration, plugin, or interface implementation; the candidate adds none and none is required for this feature"
+          ],
+          "deficiency": "None (criterion not applicable beyond the method addition)."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "Only standard-library imports added: generated/src/textual/app.py:9 (concurrent.futures), :12 (functools), :19 (typing.Awaitable); no third-party dependency changes in patch.diff"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:468-520 thread-to-app bridge placed on App, using asyncio.run_coroutine_threadsafe against the app's own loop, same as reference",
+            "generated/src/textual/app.py:901-918 loop/thread lifecycle placed in run_async (which run() delegates to), covering both run() and run_async() entry points; the reference places it only in run()"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:508 reuses existing self._set_active() (defined at app.py:464)",
+            "generated/src/textual/app.py:510 reuses existing invoke() from _callback.py:15 for sync/awaitable handling, same mechanism as reference app.py run_callback",
+            "No parallel dispatch path introduced"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:504-512 run_callback returns (succeeded, outcome) so asyncio's _convert_future_exc cannot rebuild exception classes; the reference's bridge path does rebuild them (reference test with the candidate-style identity assertion fails on reference/src, per the reproduction above)",
+            "Thread/loop state kept in App; no transport or persistence concerns introduced"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Google-style docstrings with Args/Raises/Returns sections, matching existing app.py docstrings (generated/src/textual/app.py:474-494)",
+            "RuntimeError messages follow reference wording; error handling is explicit guard clauses like reference app.py:628-633",
+            "generated/tests/test_concurrency.py uses pytest.mark.parametrize and module-level helper, consistent with existing test style"
+          ],
+          "deficiency": "Minor nit only: generated/tests/test_concurrency.py has no blank line between the docstring and the nested class in test_call_from_thread_after_run_stopped (around line 36-38). Not a convention violation I can prove against the repo's formatter."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Blocks calling thread and returns callable result (app.py:517-520); awaitable results awaited via invoke (app.py:510)",
+            "Args forwarded unchanged via partial (app.py:502); RuntimeError when not running and when called from app thread (app.py:495-500)",
+            "Candidate's own tests: 12/12 pass with patched src; reference's FAIL_TO_PASS tests pass with patched src"
+          ],
+          "deficiency": "None."
+        }
+      ],
+      "passed": false,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-01/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [
+          {
+            "phase": "candidate_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-q",
+              "--basetemp",
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-01/candidate-test-tmp",
+              "tests/test_concurrency.py"
+            ],
+            "returncode": 1,
+            "output": "......F.....                                                             [100%]\n=================================== FAILURES ===================================\n__________ test_call_from_thread_exception_propagates[TimeoutError0] ___________\n\nexception_type = <class 'concurrent.futures._base.TimeoutError'>\n\n    @pytest.mark.parametrize(\n        \"exception_type\",\n        [concurrent.futures.TimeoutError, TimeoutError, ValueError],\n    )\n    def test_call_from_thread_exception_propagates(exception_type: type) -> None:\n        \"\"\"Exceptions raised by the callable propagate unchanged, including timeout-class ones.\"\"\"\n        raised: list[BaseException] = []\n        original = exception_type(\"boom\")\n    \n        def fail() -> None:\n            raise original\n    \n        def worker(app: App[Any]) -> None:\n            try:\n                app.call_from_thread(fail)\n            except BaseException as error:\n                raised.append(error)\n            app.call_from_thread(app.exit, 0)\n    \n        make_worker_app(worker).run(headless=True, size=(80, 24))\n        assert len(raised) == 1\n>       assert raised[0] is original\nE       AssertionError: assert TimeoutError('boom') is TimeoutError('boom')\n\ntests/test_concurrency.py:130: AssertionError\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n=========================== short test summary info ============================\nFAILED tests/test_concurrency.py::test_call_from_thread_exception_propagates[TimeoutError0]\n1 failed, 11 passed, 1 warning in 1.01s\n"
+          },
+          {
+            "phase": "reference_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-rA",
+              "tests/test_concurrency.py::test_call_from_thread_app_not_running",
+              "tests/test_concurrency.py::test_call_from_thread"
+            ],
+            "returncode": 0,
+            "output": "============================= test session starts ==============================\nplatform linux -- Python 3.9.25, pytest-8.4.2, pluggy-1.6.0\nrootdir: /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-01/evaluation\nconfigfile: pyproject.toml\ncollected 2 items\n\ntests/test_concurrency.py ..                                             [100%]\n\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n==================================== PASSES ====================================\n=========================== short test summary info ============================\nPASSED tests/test_concurrency.py::test_call_from_thread_app_not_running\nPASSED tests/test_concurrency.py::test_call_from_thread\n========================= 2 passed, 1 warning in 0.52s =========================\n"
+          }
+        ],
+        "candidate_test_changes": [
+          "tests/test_concurrency.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": false,
+          "evidence": [
+            "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-02/judge-context/checks.json:1"
+          ],
+          "deficiency": "Patch application or an executable check failed."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "results/.../generated/src/textual/app.py:903 defines call_from_thread inside class App, the same module and class as the reference (reference app.py:614).",
+            "results/.../generated/tests/test_call_from_thread.py sits in the top-level tests/ directory with test_*.py naming, matching the reference's tests/test_concurrency.py.",
+            "Candidate-state wiring sits in run_async (generated app.py:846-863), inside the App class in app.py, as the reference's run() wiring does (reference app.py:927-939)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated app.py:903-907: call_from_thread(self, callback: Callable[..., CallThreadReturnType | Awaitable[CallThreadReturnType]], *args: Any, **kwargs: Any) -> CallThreadReturnType, matching reference app.py:614-618.",
+            "Errors: generated app.py:931 raises RuntimeError('App is not running') and app.py:933-935 raises RuntimeError on same-thread calls, matching reference app.py:638 and 641-643.",
+            "Forwarding: generated app.py:937 uses partial(callback, *args, **kwargs); the reference uses the same partial pattern.",
+            "Return: generated app.py:949-953 returns the callback value, or re-raises the captured exception in the caller thread."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated app.py:15 adds 'from functools import partial' and app.py:22 adds 'Awaitable' to the typing import; both stdlib, no new cross-module imports.",
+            "call_from_thread reuses the existing invoke import (base app.py:44) and the existing App._set_active (base app.py:458; used at generated app.py:943)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "No registry, plugin, or hook registration is required for call_from_thread; the reference adds it as a plain App method (reference app.py:614) with no registration.",
+            "Generated change adds only a method plus instance attributes (_loop, _thread_id at generated app.py:361-362) in __init__."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "Only stdlib additions: functools.partial (generated app.py:15), typing.Awaitable (generated app.py:22), threading and asyncio already imported in base.",
+            "No changes to pyproject.toml or any third-party dependency in the generated tree."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Loop and thread state are set in run_async (generated app.py:846-847) and cleared in its finally (generated app.py:862-863). run() delegates to run_async through run_app (generated app.py:886-888), so the state covers both entry points.",
+            "The reference sets the same state in run() (reference app.py:927-939), which does not cover direct run_async callers. Both leave run_test unset (base app.py:776-777 calls _process_messages directly), so neither covers that path.",
+            "The generated try/finally restructuring (app.py:848-863) keeps the original _process_messages/_shutdown ordering."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Uses the existing invoke helper (generated app.py:945 'await invoke(bound_callback)', imported from base app.py:44) for argument-count handling and awaitable handling, as the reference does (reference app.py:647-650).",
+            "Uses existing self._set_active() (generated app.py:943; base app.py:458) rather than a parallel context mechanism."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Thread/loop bridging is confined to App.call_from_thread (generated app.py:903-953) via asyncio.run_coroutine_threadsafe, with no leakage into widgets, drivers, or the DOM layer.",
+            "No transport or persistence code is touched; only app.py and a new test file change (diff of generated vs base src shows only app.py)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Docstring follows the base's Google-style 'Args:' / 'Raises:' / 'Returns:' sections (generated app.py:904-931).",
+            "Error messages follow the same pattern as the reference ('App is not running'; the same-thread message at generated app.py:934). The generated message omits backticks around the method name, which is cosmetic.",
+            "tuple[bool, Any] at generated app.py:939 is valid on Python 3.9 because the module begins with 'from __future__ import annotations' (base app.py:1).",
+            "Tests use plain pytest functions in the top-level tests/ directory, matching the reference style."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Behavioural intent verified in my scratch run against generated src: call_from_thread returns the callback result, forwards positional and keyword args, awaits awaitables, works from a background thread, and raises RuntimeError before start, from the app thread, and after stop without blocking (tests/test_call_from_thread.py:40-143 all pass; reference tests pass too).",
+            "The failing candidate test is a recorded artifact (see patch_and_checks), not a generated-code defect: its exception-identity behaviour holds under generated src (generated app.py:939-952 catches BaseException, returns it, and re-raises the same object in the caller).",
+            "Minor, non-blocking note: run_callback (generated app.py:939-947) catches BaseException, including CancelledError raised during shutdown, and re-raises it in the caller thread. The task therefore completes normally rather than being cancelled. This differs slightly from the reference, which lets the task fail. The extra exception-identity guarantee is beyond the reference's stated contract, not a requirement."
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": false,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-02/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [
+          {
+            "phase": "candidate_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-q",
+              "--basetemp",
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-02/candidate-test-tmp",
+              "tests/test_call_from_thread.py"
+            ],
+            "returncode": 1,
+            "output": "...F....                                                                 [100%]\n=================================== FAILURES ===================================\n____________ test_call_from_thread_propagates_exceptions_unchanged _____________\n\n    def test_call_from_thread_propagates_exceptions_unchanged():\n        error = concurrent.futures.TimeoutError(\"third-party timeout\")\n    \n        def raise_error():\n            raise error\n    \n        def work(app):\n            with pytest.raises(concurrent.futures.TimeoutError) as info:\n                app.call_from_thread(raise_error)\n            assert info.value is error\n            return \"returned\"\n    \n        app = run_threaded(work)\n>       assert app.error is None\nE       AssertionError: assert TimeoutError('third-party timeout') is None\nE        +  where TimeoutError('third-party timeout') = ThreadedApp(title='ThreadedApp', classes={'-dark-mode'}).error\n\ntests/test_call_from_thread.py:86: AssertionError\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n=========================== short test summary info ============================\nFAILED tests/test_call_from_thread.py::test_call_from_thread_propagates_exceptions_unchanged\n1 failed, 7 passed, 1 warning in 0.81s\n"
+          },
+          {
+            "phase": "reference_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-rA",
+              "tests/test_concurrency.py::test_call_from_thread_app_not_running",
+              "tests/test_concurrency.py::test_call_from_thread"
+            ],
+            "returncode": 0,
+            "output": "============================= test session starts ==============================\nplatform linux -- Python 3.9.25, pytest-8.4.2, pluggy-1.6.0\nrootdir: /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-02/evaluation\nconfigfile: pyproject.toml\ncollected 2 items\n\ntests/test_concurrency.py ..                                             [100%]\n\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n==================================== PASSES ====================================\n=========================== short test summary info ============================\nPASSED tests/test_concurrency.py::test_call_from_thread_app_not_running\nPASSED tests/test_concurrency.py::test_call_from_thread\n========================= 2 passed, 1 warning in 0.45s =========================\n"
+          }
+        ],
+        "candidate_test_changes": [
+          "tests/test_call_from_thread.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json: patch_applies=true; candidate_tests returncode 0 ('9 passed'); reference_tests returncode 0 ('2 passed' for test_call_from_thread_app_not_running and test_call_from_thread).",
+            "Independent rerun (scratch copy of generated tree, reference tests/test_concurrency.py, src first on sys.path): both FAIL_TO_PASS tests PASSED.",
+            "Independent full-suite run, original snapshot vs generated copy (--continue-on-collection-errors): original 68 failed / 605 passed / 4 xfailed / 3 errors; generated 68 failed / 614 passed / 4 xfailed / 3 errors. Failing set identical; the 9 extra passes are the candidate's new tests. The pre-existing failures are environmental and also present in the original snapshot, so no PASS_TO_PASS regression."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:467 defines call_from_thread inside class App in the same module as the reference (reference/src/textual/app.py:614).",
+            "generated/tests/test_concurrency.py is the same path as the reference test module (reference tests/test_concurrency.py)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:467-471: call_from_thread(self, callback: Callable[..., CallThreadReturnType | Awaitable[CallThreadReturnType]], *args: Any, **kwargs: Any) -> CallThreadReturnType; matches reference app.py:614-618 except the reference leaves *args/**kwargs unannotated.",
+            "Not-running RuntimeError('App is not running') at generated app.py:496-498 (reference app.py:637-638). Same-thread RuntimeError at generated app.py:499-502 (reference app.py:640-644).",
+            "Return value via future.result() at generated app.py:510-511, with callback args forwarded via partial at line 504.",
+            "Accepted difference: loop/thread state is set in run_async (generated app.py:875-876) rather than run() (reference app.py:929). This makes call_from_thread also work under await app.run_async(), where the reference raises 'App is not running'. That is a superset of the reference contract, not a violation."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:15 adds 'from functools import partial' and line 22 adds 'Awaitable' to the existing typing import; both are stdlib.",
+            "threading is already imported in the original (base/src/textual/app.py:9), so no new module edges are introduced.",
+            "Only src/textual/app.py and the new tests/test_concurrency.py differ from the original tree (diff -rq)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "call_from_thread is a plain public method on App (generated app.py:467), the same as the reference (reference app.py:614). No registry, plugin, or message-handler registration is required, so none is missing."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No new third-party packages are imported. Only stdlib additions: functools.partial (app.py:15) and typing.Awaitable (app.py:22).",
+            "No dependency or packaging files changed (diff -rq against the original shows only app.py and tests/test_concurrency.py)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Thread-to-loop state is initialised in __init__ (generated app.py:361-362) and set and cleared in the run_async lifecycle (app.py:875-876 set, app.py:907-910 cleared in a nested finally after _shutdown).",
+            "The reference places this in run()'s run_app wrapper (reference app.py:929-938). run_async is the coroutine that owns the message loop, so the patch's placement is an equally valid and broader choice, not a responsibility in the wrong layer."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Reuses the existing invoke helper from ._callback (generated app.py:508 'return await invoke(bound_callback)'), matching the reference run_callback.",
+            "Reuses the existing self._set_active() (app.py:507, defined at base app.py:458). No parallel dispatch mechanism is introduced.",
+            "invoke in base/src/textual/_callback.py awaits awaitable results, so the awaitable contract follows from the existing mechanism."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Cross-thread handoff uses asyncio.run_coroutine_threadsafe(run_callback(), loop) at generated app.py:510, the same primitive as the reference (reference app.py:~650). Widget and driver internals are not touched.",
+            "The test helpers only use public App and TextLog APIs (generated tests/test_concurrency.py:91-106 and related)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "The call_from_thread docstring (generated app.py:468-495) follows the file's Google-style Args/Returns/Raises layout used by App.run (base app.py:~856). Error strings are plain, matching the reference wording.",
+            "Non-blocking nits: test_call_after_run_raises_and_does_not_block (generated tests/test_concurrency.py:28) never asserts non-blocking behaviour despite its name; WidgetApp.compose(self) (test:92) lacks the return annotation the other tests use; black is not installed in the venv, so formatting was not verified; a few docstring lines exceed 88 characters, which black does not reflow."
+          ],
+          "deficiency": "No blocking deficiency. Minor: a misleading test name, one unannotated method, and unverified black formatting."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Not running raises: generated app.py:496-498; covered by test_call_before_run_raises (test:22) and test_call_after_run_raises_and_does_not_block (test:28).",
+            "Same-thread raises: generated app.py:499-502; covered by test_call_from_app_thread_raises (test:48).",
+            "Arguments forwarded unchanged: partial at app.py:504; covered by test_arguments_are_forwarded (test:192).",
+            "Awaitable results awaited: invoke at app.py:508; covered by test_awaitable_result_is_awaited (test:129).",
+            "Result and exception propagation: future.result() at app.py:511; covered by test_returns_callable_result (test:84) and test_timeout_exception_propagates_unchanged (test:160).",
+            "Reference FAIL_TO_PASS tests pass against the generated code (independent rerun, 2/2)."
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-03/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [
+          {
+            "phase": "candidate_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-q",
+              "--basetemp",
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-03/candidate-test-tmp",
+              "tests/test_concurrency.py"
+            ],
+            "returncode": 0,
+            "output": ".........                                                                [100%]\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n9 passed, 1 warning in 0.67s\n"
+          },
+          {
+            "phase": "reference_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-rA",
+              "tests/test_concurrency.py::test_call_from_thread_app_not_running",
+              "tests/test_concurrency.py::test_call_from_thread"
+            ],
+            "returncode": 0,
+            "output": "============================= test session starts ==============================\nplatform linux -- Python 3.9.25, pytest-8.4.2, pluggy-1.6.0\nrootdir: /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-03/evaluation\nconfigfile: pyproject.toml\ncollected 2 items\n\ntests/test_concurrency.py ..                                             [100%]\n\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n==================================== PASSES ====================================\n=========================== short test summary info ============================\nPASSED tests/test_concurrency.py::test_call_from_thread_app_not_running\nPASSED tests/test_concurrency.py::test_call_from_thread\n========================= 2 passed, 1 warning in 0.40s =========================\n"
+          }
+        ],
+        "candidate_test_changes": [
+          "tests/test_concurrency.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json:2 records \"patch_applies\": true",
+            "checks.json:16 candidate-test phase: 11 passed",
+            "checks.json:29 reference FAIL_TO_PASS phase: test_call_from_thread_app_not_running and test_call_from_thread PASSED",
+            "Independent run: reference tests/test_concurrency.py against candidate src (scratch copy) gave 2 passed, stable over 3 runs; candidate's own 11 tests passed 3 times",
+            "Existing suite (excluding snapshot/cli/devtools, which need uninstalled aiohttp): base 68 failed/605 passed, candidate 68 failed/607 passed; failure ID sets identical, the +2 passes are the reference tests",
+            "Caveat: generated tests/test_concurrency.py occupies the reference test path with different test names, so FAIL_TO_PASS IDs resolve only if the harness overwrites it with the reference test file"
+          ],
+          "deficiency": "No deficiency."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:446 defines call_from_thread on App, same module as reference/src/textual/app.py:614",
+            "generated/src/textual/app.py:362-363 initialise thread state beside other App attributes (reference app.py:361-362)",
+            "generated/src/textual/app.py:891-902 set and clear thread state inside run_async; run() delegates there (app.py:930-936)",
+            "generated/tests/test_concurrency.py matches the reference test path"
+          ],
+          "deficiency": "No deficiency."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:446-451 signature (callback: Callable[..., CallThreadReturnType | Awaitable[CallThreadReturnType]], *args: Any, **kwargs: Any) -> CallThreadReturnType, same shape as reference app.py:614-619",
+            "generated/src/textual/app.py:474 raises RuntimeError(\"App is not running\"), identical text to reference app.py:638",
+            "generated/src/textual/app.py:475-478 raises RuntimeError when called from the app thread (reference app.py:640-643)",
+            "generated/src/textual/app.py:488 returns future.result(), so the call blocks and returns the callback's value"
+          ],
+          "deficiency": "No deficiency."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:15 adds `from functools import partial` (stdlib)",
+            "generated/src/textual/app.py:22 adds `Awaitable` to the existing typing import (stdlib)",
+            "threading, asyncio and invoke were already imported at base app.py:9, 3 and 44",
+            "No new module-level dependency edges between packages"
+          ],
+          "deficiency": "No deficiency."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "The feature is a public method on App; no registry, plugin or interface registration is involved",
+            "reference.diff adds only the method, state fields and run wiring, with no registration",
+            "generated/src/textual/app.py changes match patch.diff and contain nothing beyond those"
+          ],
+          "deficiency": "No deficiency."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "git status of generated tree shows only M src/textual/app.py and A tests/test_concurrency.py; pyproject.toml is unchanged",
+            "The only new imports are stdlib (functools.partial, typing.Awaitable)"
+          ],
+          "deficiency": "No deficiency."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Thread-entry state is owned by App and set in run_async, the lifecycle method that owns the loop (generated/src/textual/app.py:891-892), in the same component as the reference",
+            "Reference sets state in run() (reference app.py:929-930); the candidate's placement also covers direct run_async callers",
+            "Candidate clears state before _shutdown (app.py:901-902), so call_from_thread during shutdown raises instead of dispatching; the comment at app.py:900 documents this. Minor behavioural difference, not a violation"
+          ],
+          "deficiency": "No deficiency."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:484-485 reuses the existing _set_active and invoke, as reference does (reference app.py:646-649 and 79-81)",
+            "generated/src/textual/app.py:891-894 uses the existing run_async to _process_messages lifecycle; no parallel run path is introduced"
+          ],
+          "deficiency": "No deficiency."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:487-488 dispatches via asyncio.run_coroutine_threadsafe onto the app's loop, the same boundary the reference uses (reference app.py:652-656)",
+            "Callbacks execute inside the app context through invoke (app.py:485), so the calling thread does not touch widget state directly"
+          ],
+          "deficiency": "No deficiency."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:448-473 uses Google-style Args/Raises/Returns docstring sections, matching the reference docstring style",
+            "Error messages mirror reference wording (app.py:474, 476-477)",
+            "generated/tests/test_concurrency.py uses flat pytest functions with pytest.raises(..., match=...) (lines 42-48), consistent with the reference test file",
+            "Private helper _app_with_worker (tests/test_concurrency.py:16) follows the underscore convention"
+          ],
+          "deficiency": "No deficiency."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Not-running guard: generated/src/textual/app.py:473-474",
+            "Same-thread guard: app.py:475-478",
+            "Runs in app context and awaits awaitables: app.py:484-485 via invoke",
+            "Blocks the caller until completion: app.py:487-488 via future.result()",
+            "Argument forwarding via partial: app.py:479-480",
+            "Reference FAIL_TO_PASS tests pass on the candidate source (independent run); candidate's own tests (tests/test_concurrency.py:102-205) cover awaitables, exception propagation and argument forwarding, all passing"
+          ],
+          "deficiency": "No deficiency."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-04/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [
+          {
+            "phase": "candidate_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-q",
+              "--basetemp",
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-04/candidate-test-tmp",
+              "tests/test_concurrency.py"
+            ],
+            "returncode": 0,
+            "output": "...........                                                              [100%]\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n11 passed, 1 warning in 0.76s\n"
+          },
+          {
+            "phase": "reference_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-rA",
+              "tests/test_concurrency.py::test_call_from_thread_app_not_running",
+              "tests/test_concurrency.py::test_call_from_thread"
+            ],
+            "returncode": 0,
+            "output": "============================= test session starts ==============================\nplatform linux -- Python 3.9.25, pytest-8.4.2, pluggy-1.6.0\nrootdir: /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-04/evaluation\nconfigfile: pyproject.toml\ncollected 2 items\n\ntests/test_concurrency.py ..                                             [100%]\n\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n==================================== PASSES ====================================\n=========================== short test summary info ============================\nPASSED tests/test_concurrency.py::test_call_from_thread_app_not_running\nPASSED tests/test_concurrency.py::test_call_from_thread\n========================= 2 passed, 1 warning in 0.39s =========================\n"
+          }
+        ],
+        "candidate_test_changes": [
+          "tests/test_concurrency.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json:2 patch_applies is true",
+            "checks.json:15-16 candidate tests tests/test_concurrency.py: returncode 0, 8 passed",
+            "checks.json:28-29 reference FAIL_TO_PASS tests test_call_from_thread_app_not_running and test_call_from_thread: 2 passed",
+            "Independent run: reference tests/test_concurrency.py copied to /tmp and run against generated src via PYTHONPATH: 2 passed",
+            "Targeted existing-suite slice (10 files, incl. test_auto_pilot, test_message_pump, test_screens, test_binding_inheritance): base and generated both 25 passed / 25 failed with identical failure sets; failures are environmental (async def not supported)"
+          ],
+          "deficiency": "None found. Caveat: the full PASS_TO_PASS set is not recorded in checks.json and was not run; the async tests most exposed to the run_async change could not execute in this environment, so that path is not fully exercised."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:469 call_from_thread defined on App, same module as reference (reference.diff hunk @@ -604 in src/textual/app.py)",
+            "generated/tests/test_concurrency.py is the same path the reference uses for its test"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "app.py:469-474 public name call_from_thread(callback, *args, **kwargs) -> CallThreadReturnType, matching reference signature (reference.diff lines 44-49)",
+            "app.py:497-498 raises RuntimeError(\"App is not running\"), same message as reference.diff line 68",
+            "app.py:499-502 raises RuntimeError when called from app thread",
+            "app.py:504 forwards args via functools.partial, as reference does (reference.diff line 75)",
+            "app.py:509 awaits awaitable results via invoke, and app.py:512 returns future.result(), so exceptions propagate unchanged",
+            "Difference: state is set in run_async (app.py:893-894) rather than in run()'s wrapper; this extends the contract to run_async callers and does not contradict any reference test"
+          ],
+          "deficiency": "None. The extra run_async coverage is an extension, not a violation."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "app.py:15 adds only stdlib 'from functools import partial'",
+            "app.py:22 adds typing 'Awaitable' to the existing typing import block",
+            "Reuses existing 'invoke' import from ._callback (base app.py:44) and existing _set_active (app.py:508); no new cross-module imports"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "No plugin, registry, or interface registration is required for this feature; reference.diff adds only the App method and a test file",
+            "Generated patch adds only the App method (app.py:469) and the test file, matching that scope"
+          ],
+          "deficiency": "None (not applicable)."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "Generated tree git status shows only M src/textual/app.py and A tests/test_concurrency.py; no pyproject.toml or lockfile change",
+            "No new third-party imports in app.py or the test file (pytest and textual only, the same as reference)"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Thread-entry state initialized in App.__init__ (app.py:363-364) alongside other app state",
+            "State set and cleared in run_async (app.py:893-904), the shared lifecycle entry point that run() uses; the finally clears before _shutdown so calls during shutdown raise rather than being scheduled on a loop that may be stopping",
+            "Reference clears its state in run()'s wrapper, after _shutdown (reference.diff lines 109-111); I did not test the shutdown window in either implementation"
+          ],
+          "deficiency": "None. The placement differs from the reference but is a valid alternative in the same component."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Reuses existing invoke() (app.py:509) and _set_active() (app.py:508), as the reference does (reference.diff lines 79-80)",
+            "Uses the existing run/run_async lifecycle; no parallel execution path is introduced"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Threading concerns are confined to App via asyncio.run_coroutine_threadsafe (app.py:511), the same mechanism as the reference (reference.diff line 83)",
+            "No widget, driver, or persistence internals are reached directly; the callable runs through invoke() on the app loop"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "app.py:475-496 docstring uses the repo's Google-style Args/Raises/Returns sections, as in reference.diff lines 50-65",
+            "Error messages follow the repo's plain-sentence style (app.py:498, 501)",
+            "Minor: comment at app.py:902 is about 98 characters; test docstring at test_concurrency.py:119 area is about 91 characters; compose at test_concurrency.py:28 lacks a return annotation. I found no enforced line-length setting in pyproject.toml or pre-commit config"
+          ],
+          "deficiency": "Cosmetic only: one overlong comment (app.py:902) and a missing return annotation on the test's compose (test_concurrency.py:28). Neither affects behavior."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "app.py:497-498 not-running error before start and after stop (state cleared at app.py:903-904)",
+            "app.py:499-502 same-thread error",
+            "app.py:511-512 blocking call returns the callable's result, matching the reference's intended behavior",
+            "test_concurrency.py:119-140 verifies that a timeout-class exception reaches the caller unchanged (is-identity check)",
+            "test_concurrency.py:142-164 verifies positional and keyword argument forwarding",
+            "Reference FAIL_TO_PASS tests pass against this implementation (checks.json:29 and my independent run)"
+          ],
+          "deficiency": "None."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-05/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [
+          {
+            "phase": "candidate_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-q",
+              "--basetemp",
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-05/candidate-test-tmp",
+              "tests/test_concurrency.py"
+            ],
+            "returncode": 0,
+            "output": "........                                                                 [100%]\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n8 passed, 1 warning in 1.05s\n"
+          },
+          {
+            "phase": "reference_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-rA",
+              "tests/test_concurrency.py::test_call_from_thread_app_not_running",
+              "tests/test_concurrency.py::test_call_from_thread"
+            ],
+            "returncode": 0,
+            "output": "============================= test session starts ==============================\nplatform linux -- Python 3.9.25, pytest-8.4.2, pluggy-1.6.0\nrootdir: /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-05/evaluation\nconfigfile: pyproject.toml\ncollected 2 items\n\ntests/test_concurrency.py ..                                             [100%]\n\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n==================================== PASSES ====================================\n=========================== short test summary info ============================\nPASSED tests/test_concurrency.py::test_call_from_thread_app_not_running\nPASSED tests/test_concurrency.py::test_call_from_thread\n========================= 2 passed, 1 warning in 0.46s =========================\n"
+          }
+        ],
+        "candidate_test_changes": [
+          "tests/test_concurrency.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json:2 patch_applies=true",
+            "checks.json:15-16 candidate tests tests/test_concurrency.py returncode 0, '9 passed'",
+            "checks.json:28-29 reference tests test_call_from_thread_app_not_running and test_call_from_thread returncode 0. Note: the recorded phase does not state which src it imported. venv/lib/python3.9/site-packages/textual.pth points to tasks/.../reference/src, so I re-ran both suites in an isolated copy with generated/src forced first on sys.path (python -I). Reference test file: 2 passed. Candidate tests: 9 passed.",
+            "Full existing suite (ignoring tests/cli, tests/devtools, tests/snapshot_tests, which fail collection on missing aiohttp/jinja2 on base and candidate alike): base 605 passed / 68 failed; candidate 614 passed / 68 failed. The 68 failing node IDs are identical in both runs (diff empty). They are pre-existing async tests that need pytest_asyncio, which is not installed. The +9 passes are the candidate's own new tests."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:445 call_from_thread is defined inside class App, alongside exit() at :430, matching reference/src/textual/app.py:614 placement in App.",
+            "generated/tests/test_concurrency.py is a new file at the same path as the reference test file."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:445-450 signature call_from_thread(self, callback, *args: Any, **kwargs: Any) -> CallThreadReturnType, matching the reference's callback/*args/**kwargs contract.",
+            "generated/src/textual/app.py:472-473 raises RuntimeError('App is not running') when the loop is unset, matching reference app.py:637-638.",
+            "generated/src/textual/app.py:474-477 raises RuntimeError for same-thread calls, matching reference app.py:640-643.",
+            "generated/src/textual/app.py:486 returns future.result(); awaitable handling happens via invoke at :483, matching the reference."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:9 threading was already imported and is reused at :474 and :873.",
+            "generated/src/textual/app.py:14 adds 'from functools import partial' (stdlib).",
+            "generated/src/textual/app.py:46 invoke comes from the existing ._callback import; the patch adds no new internal imports."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "The reference adds no registration, hook, or interface; the candidate needs none either. The patch touches only src/textual/app.py and tests/test_concurrency.py (patch.diff)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "patch.diff touches no pyproject.toml, lock file, or requirements file.",
+            "The only new import is stdlib functools.partial (generated/src/textual/app.py:14). Awaitable is from typing (:20)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Candidate sets _thread_loop/_thread_id inside run_async (generated/src/textual/app.py:872-873) and clears them in its finally (:904-907). The reference instead sets them in run()'s run_app wrapper (reference/src/textual/app.py:929-938).",
+            "Candidate placement covers both run() (which calls run_async at :932) and direct run_async callers, a superset of the reference. Neither implementation covers run_test (generated/src/textual/app.py:801-829), so this is not a differential gap.",
+            "The lifecycle state stays on the App object, in the same layer as the reference."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:481 self._set_active() and :483 invoke(bound) reuse the existing helpers, as the reference does.",
+            "No parallel dispatch path is introduced; run_coroutine_threadsafe is the same mechanism the reference uses (reference/src/textual/app.py:654)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:445-486 keeps thread hand-off inside App; widgets are touched only from the app loop via the callback (test at generated/tests/test_concurrency.py: write_to_log runs through call_from_thread).",
+            "No transport, persistence, or driver code is modified."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": false,
+          "evidence": [
+            "generated/src/textual/app.py:13-15 inserts 'from functools import partial' between 'from contextlib import ...' and 'from datetime import datetime'. The original import block is alphabetically sorted (base/src/textual/app.py:9-12: contextlib, datetime, pathlib). functools should follow datetime. The reference places it in sorted position (reference/src/textual/app.py:4-5).",
+            "Otherwise conventions match: Google-style docstring with Raises section, same 'App is not running' error text as the reference, line at :447 is 88 characters (black limit), and tests use pytest.raises with docstrings."
+          ],
+          "deficiency": "Minor, cosmetic: the import is out of alphabetical order relative to the file's existing sorted import block. No behavioral impact, and no lint hook in .pre-commit-config.yaml enforces import order (only black)."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Not running before run: app.py:472-473, exercised by test_call_from_thread_app_not_running (reference) and test_not_running_before_run (candidate).",
+            "Not running after run: the finally at app.py:904-907 clears state, so later calls raise immediately. The candidate's test_not_running_after_run_returns covers this.",
+            "Same-thread guard at :474-477, with a test (test_same_thread_raises).",
+            "Return value and awaitable handling at :483 and :486; test_returns_result and test_awaitable_is_awaited cover them. Background-thread exit with a return value is covered by test_call_from_thread via call_from_thread(self.app.exit, 123)."
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": false,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-06/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [
+          {
+            "phase": "candidate_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-q",
+              "--basetemp",
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-06/candidate-test-tmp",
+              "tests/test_concurrency.py"
+            ],
+            "returncode": 0,
+            "output": ".........                                                                [100%]\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n9 passed, 1 warning in 0.94s\n"
+          },
+          {
+            "phase": "reference_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-rA",
+              "tests/test_concurrency.py::test_call_from_thread_app_not_running",
+              "tests/test_concurrency.py::test_call_from_thread"
+            ],
+            "returncode": 0,
+            "output": "============================= test session starts ==============================\nplatform linux -- Python 3.9.25, pytest-8.4.2, pluggy-1.6.0\nrootdir: /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-06/evaluation\nconfigfile: pyproject.toml\ncollected 2 items\n\ntests/test_concurrency.py ..                                             [100%]\n\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n==================================== PASSES ====================================\n=========================== short test summary info ============================\nPASSED tests/test_concurrency.py::test_call_from_thread_app_not_running\nPASSED tests/test_concurrency.py::test_call_from_thread\n========================= 2 passed, 1 warning in 0.39s =========================\n"
+          }
+        ],
+        "candidate_test_changes": [
+          "tests/test_concurrency.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies=true; reference phase recorded 2 passed (test_call_from_thread_app_not_running, test_call_from_thread).",
+            "Re-run with PYTHONPATH forced to candidate src (scratch copy): reference tests 2 passed; same reference tests against base src: 2 failed (AttributeError), so they are genuine FAIL_TO_PASS.",
+            "Candidate tests/test_concurrency.py: 10 passed on candidate src.",
+            "Full existing suite (excluding tests/cli, tests/devtools, tests/snapshot_tests): base 605 passed/68 failed; candidate 615 passed/68 failed; failing sets identical; only added passes are the 10 new candidate tests.",
+            "venv/lib/python3.9/site-packages/textual.pth resolves to tasks/.../reference/src, so the recorded checks.json runs do not prove they exercised the candidate source; the re-run above does."
+          ],
+          "deficiency": "No failure. Limitations: the recorded checks.json runs did not force the candidate source; 68 async tests (pytest-asyncio absent) and the excluded directories (missing aiohttp/jinja2/CLI deps) could not be executed, so PASS_TO_PASS coverage for them is unverified."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "src/textual/app.py:445 adds call_from_thread to class App; reference places it in the same class (reference app.py:614).",
+            "Loop/thread state declared in __init__ at src/textual/app.py:361-362, matching reference app.py:361-362.",
+            "Loop/thread state set/cleared in run_async at src/textual/app.py:871-872 and 905-906.",
+            "Test file is tests/test_concurrency.py, the same path the reference uses."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "Signature at src/textual/app.py:445-449: call_from_thread(self, callback, *args, **kwargs) -> CallThreadReturnType, matching reference app.py:614-618.",
+            "RuntimeError('App is not running') at src/textual/app.py:471-472 matches reference app.py:637-638.",
+            "Same-thread RuntimeError at src/textual/app.py:473-476 matches reference app.py:640-642.",
+            "Returns future.result() at src/textual/app.py:485, consistent with reference app.py:86-87 behavior."
+          ],
+          "deficiency": "None blocking. Cosmetic: the thread error text omits backticks around call_from_thread (src/textual/app.py:474-476) versus the reference; the reference test checks only the exception type."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "New imports: functools.partial at src/textual/app.py:14 and typing.Awaitable at src/textual/app.py:22.",
+            "threading and asyncio are already imported at module top; invoke comes from the existing ._callback import and is used at src/textual/app.py:482.",
+            "No new cross-module imports are introduced."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "reference.diff touches only src/textual/app.py and tests/test_concurrency.py and adds no registration.",
+            "patch.diff touches only src/textual/app.py and tests/test_concurrency.py; no registration is required and none is missing."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "patch.diff adds no packages; new imports are stdlib (functools.partial, typing.Awaitable, threading.get_ident).",
+            "The new test file uses pytest and textual modules already used by the repo's tests."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "State is tracked in run_async (src/textual/app.py:871-872, cleared at 905-906); reference tracks it in run()'s run_app wrapper (reference app.py:929-939).",
+            "Candidate placement covers both run() and direct await run_async(); with the reference placement, call_from_thread under direct run_async raises 'App is not running'. The candidate is a valid alternative that is a superset.",
+            "The try/finally at src/textual/app.py:891-904 keeps the original order (process_messages, then auto_pilot await, then _shutdown) versus base app.py:841-852."
+          ],
+          "deficiency": "Not a failure: the candidate restructures the existing try/finally (added nesting, larger diff) where the reference used a wrapper in run(). Behavior is preserved."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Reuses the existing invoke helper (src/textual/app.py:482) and self._set_active() (src/textual/app.py:481), the same mechanisms as the reference (reference app.py:647-650).",
+            "Uses asyncio.run_coroutine_threadsafe (src/textual/app.py:484) rather than a parallel queue or mechanism."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "All cross-thread marshalling is confined to App.call_from_thread (src/textual/app.py:445-485).",
+            "No Driver, Widget, or transport code is touched.",
+            "The callback runs inside the app's own loop context via _set_active() (src/textual/app.py:481)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Google-style docstring with Args/Raises/Returns at src/textual/app.py:446-469, consistent with repo docstrings such as run_async (src/textual/app.py:847-864).",
+            "Private attribute names and error style match the reference.",
+            "Pre-commit runs black only (.pre-commit-config.yaml); black is not installed in the venv, so formatting was not mechanically verified.",
+            "Test file uses pytest plain functions, consistent with the reference test file."
+          ],
+          "deficiency": "Cosmetic only: from functools import partial is inserted out of alphabetical order between contextlib and datetime (src/textual/app.py:13-15); the thread error text lacks backticks; black formatting unverified."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Blocks the calling thread until the result is available (src/textual/app.py:484-485).",
+            "Forwards args/kwargs via partial (src/textual/app.py:478) and awaits awaitable results via invoke (src/textual/app.py:482).",
+            "RuntimeError when not running (src/textual/app.py:471-472) and when called from the app thread (src/textual/app.py:473-476).",
+            "Exceptions propagate (tests/test_concurrency.py:102, test_call_from_thread_propagates_timeout_like_exception).",
+            "Reference scenarios (same-thread error in on_ready; background thread writes to TextLog then exits with 123) pass on candidate source in the re-run."
+          ],
+          "deficiency": "None."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-07/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [
+          {
+            "phase": "candidate_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-q",
+              "--basetemp",
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-07/candidate-test-tmp",
+              "tests/test_concurrency.py"
+            ],
+            "returncode": 0,
+            "output": "..........                                                               [100%]\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n10 passed, 1 warning in 1.05s\n"
+          },
+          {
+            "phase": "reference_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-rA",
+              "tests/test_concurrency.py::test_call_from_thread_app_not_running",
+              "tests/test_concurrency.py::test_call_from_thread"
+            ],
+            "returncode": 0,
+            "output": "============================= test session starts ==============================\nplatform linux -- Python 3.9.25, pytest-8.4.2, pluggy-1.6.0\nrootdir: /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-07/evaluation\nconfigfile: pyproject.toml\ncollected 2 items\n\ntests/test_concurrency.py ..                                             [100%]\n\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n==================================== PASSES ====================================\n=========================== short test summary info ============================\nPASSED tests/test_concurrency.py::test_call_from_thread_app_not_running\nPASSED tests/test_concurrency.py::test_call_from_thread\n========================= 2 passed, 1 warning in 0.43s =========================\n"
+          }
+        ],
+        "candidate_test_changes": [
+          "tests/test_concurrency.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": false,
+          "evidence": [
+            "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-08/judge-context/checks.json:1"
+          ],
+          "deficiency": "Patch application or an executable check failed."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/src/textual/app.py:446 adds call_from_thread on class App, the same location as reference/src/textual/app.py:614.",
+            "Private state added in App.__init__ at generated/src/textual/app.py:362-363 (reference app.py:361-362).",
+            "Test file at generated/tests/test_concurrency.py, the same path the reference uses."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "Signature generated/src/textual/app.py:446-451 call_from_thread(self, callback, *args, **kwargs) -> CallThreadReturnType matches reference/src/textual/app.py:614-619.",
+            "'App is not running' RuntimeError at generated/src/textual/app.py:477 matches reference app.py:638.",
+            "Same-thread RuntimeError at generated/src/textual/app.py:478-480 matches reference app.py:640-643.",
+            "Awaitables are awaited via invoke at generated/src/textual/app.py:487, and invoke awaits them at base/src/textual/_callback.py:27-28.",
+            "Return value is the callable's result at generated/src/textual/app.py:508."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "New imports are stdlib only: generated/src/textual/app.py:14 (concurrent.futures.Future) and :16 (functools.partial).",
+            "invoke is the existing import from ._callback (base/src/textual/app.py:44), reused rather than duplicated."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "The feature adds a public method and two private attributes on App (generated/src/textual/app.py:362-363, 446). No registry, hook, or interface registration is needed.",
+            "The reference diff (tasks/.../reference.diff) also adds no registration."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No new third-party dependencies. The only new imports are concurrent.futures and functools from the standard library (generated/src/textual/app.py:14, :16)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Thread-to-loop bridging lives in the App layer (generated/src/textual/app.py:446-508), next to the existing exit and _set_active logic.",
+            "Loop/thread bookkeeping is set in run_async (generated/src/textual/app.py:894-895, cleared at :928-929). run_async is the public async entry point, so this covers both run() and direct run_async callers. Reference wires it only in run() (reference/src/textual/app.py:927-939). This is a superset, not a layering violation.",
+            "Manual concurrent-future bridge at generated/src/textual/app.py:491-508 reimplements what asyncio.run_coroutine_threadsafe does (reference app.py:653-655). It is about 20 lines of extra plumbing. Its purpose is to avoid asyncio's exception conversion (see requirement_intent), so it is justified, but it is more code than the reference."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Reuses the existing invoke helper (generated/src/textual/app.py:487) and _set_active (generated/src/textual/app.py:486), the same mechanisms the reference uses, rather than adding a new callback dispatch path.",
+            "The manual future bridge (app.py:491-508) is standard-library plumbing, not a parallel Textual mechanism."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Thread state stays private (_loop, _thread_id at generated/src/textual/app.py:362-363), and callables run through invoke in the app's context (app.py:486-487).",
+            "No transport, persistence, or framework types leak into the public API. Only Future, partial, and asyncio are used internally."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": false,
+          "evidence": [
+            "Misleading test comment: generated/tests/test_concurrency.py:84 says 'The background thread exits the app with a supplied code', but run_in_background exits with None (generated/tests/test_concurrency.py:179), and line 85 asserts 'is None'.",
+            "checks.json records the candidate's own test file with a failure at generated/tests/test_concurrency.py:148 (see patch_and_checks). Shipping a red test file goes against the repo's test conventions. The failure was not reproduced in scratch.",
+            "Code conventions otherwise hold: Google-style docstrings with Args/Raises sections (generated/src/textual/app.py:447-475), RuntimeError messages in the same style as the reference, and test_ naming matching reference/tests/test_concurrency.py."
+          ],
+          "deficiency": "Test hygiene: the stale comment at tests/test_concurrency.py:84 contradicts the code it describes (exit with None, not a supplied code). The candidate's own test file also carries a recorded failure (test_call_from_thread_exception_propagature, line 148) that conflicts with the convention of shipping green tests. The recorded failure is unreproduced here. Both are minor, but together they fail the tests part of this criterion."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Not-running behavior: _loop is None before run or after run_async returns (generated/src/textual/app.py:474-477, :928-929). Verified by the reference test test_call_from_thread_app_not_running passing.",
+            "Same-thread guard: generated/src/textual/app.py:478-480.",
+            "Runs the callable in the app's context and blocks for the result: app.py:483-508. Verified by the reference test test_call_from_thread passing (writes to TextLog, then exits with 123 via call_from_thread).",
+            "Divergence 1 (exception identity): reference converts a concurrent.futures.TimeoutError raised by the callable into asyncio.exceptions.TimeoutError. Probe on reference/src: type 'asyncio.exceptions TimeoutError', 'is original: False'. Cause: stdlib asyncio/futures.py _convert_future_exc, which converts on exact class match. Generated preserves the original object (probe on generated/src: 'concurrent.futures._base TimeoutError', 'is original: True'). Reference tests do not cover this, and the reference docstring does not promise conversion, so this reads as an incidental stdlib artifact. Treated as an acceptable, arguably better divergence, not a requirement failure.",
+            "Divergence 2 (run_async coverage): with generated, call_from_thread works under direct run_async use. Reference raises 'App is not running' there. Superset behavior; no reference test depends on the error."
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": false,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-08/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [
+          {
+            "phase": "candidate_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-q",
+              "--basetemp",
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-08/candidate-test-tmp",
+              "tests/test_concurrency.py"
+            ],
+            "returncode": 1,
+            "output": "......F.                                                                 [100%]\n=================================== FAILURES ===================================\n__________________ test_call_from_thread_exception_propagates __________________\n\n    def test_call_from_thread_exception_propagates() -> None:\n        \"\"\"A timeout-class exception from the callable reaches the calling thread unchanged.\"\"\"\n        caught: list[BaseException] = []\n        raised = FutureTimeoutError(\"third-party timeout\")\n    \n        def raiser() -> None:\n            raise raised\n    \n        class RaiseApp(App[None]):\n            def on_mount(self) -> None:\n                def work() -> None:\n                    try:\n                        self.call_from_thread(raiser)\n                    except BaseException as error:\n                        caught.append(error)\n    \n                run_in_background(self, work).start()\n    \n        RaiseApp().run(headless=True)\n        assert len(caught) == 1\n>       assert caught[0] is raised\nE       AssertionError: assert TimeoutError('third-party timeout') is TimeoutError('third-party timeout')\n\ntests/test_concurrency.py:148: AssertionError\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n=========================== short test summary info ============================\nFAILED tests/test_concurrency.py::test_call_from_thread_exception_propagates\n1 failed, 7 passed, 1 warning in 0.48s\n"
+          },
+          {
+            "phase": "reference_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-rA",
+              "tests/test_concurrency.py::test_call_from_thread_app_not_running",
+              "tests/test_concurrency.py::test_call_from_thread"
+            ],
+            "returncode": 0,
+            "output": "============================= test session starts ==============================\nplatform linux -- Python 3.9.25, pytest-8.4.2, pluggy-1.6.0\nrootdir: /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-08/evaluation\nconfigfile: pyproject.toml\ncollected 2 items\n\ntests/test_concurrency.py ..                                             [100%]\n\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n==================================== PASSES ====================================\n=========================== short test summary info ============================\nPASSED tests/test_concurrency.py::test_call_from_thread_app_not_running\nPASSED tests/test_concurrency.py::test_call_from_thread\n========================= 2 passed, 1 warning in 0.31s =========================\n"
+          }
+        ],
+        "candidate_test_changes": [
+          "tests/test_concurrency.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json:2 patch_applies=true; checks.json:15 candidate tests returncode 0 ('8 passed'); checks.json:28 reference FAIL_TO_PASS tests returncode 0 ('2 passed').",
+            "Re-run in a scratch copy with PYTHONPATH=<copy>/src: reference tests test_call_from_thread_app_not_running and test_call_from_thread -> 2 passed; candidate tests/test_concurrency.py -> 8 passed. Without PYTHONPATH, the venv imports reference/src (venv/lib/python3.9/site-packages/textual.pth), so the recorded passes only attest to generated code if the harness set PYTHONPATH; the PYTHONPATH re-run confirms they do.",
+            "Same reference tests against base src fail with AttributeError: 'ThreadTestApp' object has no attribute 'call_from_thread', so the FAIL_TO_PASS tests discriminate.",
+            "Regression sweep of 17 existing test modules (test_auto_pilot, test_unmount, test_message_pump, test_widget, test_screens, etc.): base and generated both give 42 failed / 36 passed with byte-identical failing sets (pre-existing environment failures, e.g. async tests without the plugin). prepared.json feabench_tests.PASS_TO_PASS is empty."
+          ],
+          "deficiency": "None found."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "call_from_thread is added to App in src/textual/app.py:467-510, the same module and class as the reference (reference/src/textual/app.py:614).",
+            "The new test file is at tests/test_concurrency.py, the same path as the reference test file (reference.diff new-file hunk)."
+          ],
+          "deficiency": "None found."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "Signature call_from_thread(self, callback, *args, **kwargs) -> CallThreadReturnType at app.py:467-473 matches reference.diff:44-49 (same name, forwarding, TypeVar return). Generated adds Any annotations on *args/**kwargs, which is harmless.",
+            "RuntimeError('App is not running') at app.py:496 matches the reference (reference app.py:638).",
+            "Same-thread message at app.py:499 differs from the reference (app.py:642) only by backticks around call_from_thread. Reference tests check only the exception type, so this is cosmetic and not a contract break."
+          ],
+          "deficiency": "None found. Cosmetic message-text difference only."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "New imports are stdlib only: functools.partial (app.py:15) and typing.Awaitable (app.py:22).",
+            "Reuses the existing invoke from ._callback (app.py:46, used at app.py:507) with no new cross-module import."
+          ],
+          "deficiency": "None found."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "The reference adds no registration, message type, or handler (reference.diff touches only App methods and __init__/run). The generated patch adds none and none is required; call_from_thread is a plain App method."
+          ],
+          "deficiency": "None found."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "diff -rq base vs generated shows only src/textual/app.py and tests/test_concurrency.py changed; no packages or pyproject/lock changes.",
+            "No external dependency is introduced; asyncio and threading are already used in app.py."
+          ],
+          "deficiency": "None found."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Generated sets loop/thread state in run_async (app.py:891-892, cleared at app.py:900-901). The reference sets it in run()'s run_app wrapper (reference.diff:101-111). Both keep the state on App.",
+            "Generated placement also covers callers who await run_async() directly. It clears the loop before the _shutdown() await, so calls during shutdown raise 'App is not running' rather than potentially blocking. The reference clears after the whole run_async. The reference tests do not exercise this timing, so it is an acceptable variant.",
+            "Responsibilities stay in App; no widget, driver, or message-pump internals are changed."
+          ],
+          "deficiency": "None found. The shutdown-timing difference is a valid variant, not a defect."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Reuses the existing invoke (app.py:507) and self._set_active() (app.py:506), matching the reference (reference.diff:79-81).",
+            "No parallel dispatch path or new event mechanism is introduced; it uses asyncio.run_coroutine_threadsafe (app.py:509), as the reference does."
+          ],
+          "deficiency": "None found."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "The thread bridge is a single App method that submits to the App's own loop (app.py:509). It does not reach into widgets, drivers, or the message pump beyond the existing _set_active.",
+            "Thread identity is tracked with threading.get_ident() (app.py:497, 892), and no transport or persistence concerns are mixed in."
+          ],
+          "deficiency": "None found."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Google-style docstring with Args/Raises/Returns (app.py:468-495), consistent with the reference docstring and the base docstring style.",
+            "Private state _thread_loop and _thread_id is initialised in __init__ next to _exit (app.py:361-362), following the existing private-attribute pattern.",
+            "Error messages use RuntimeError with 'App is not running' phrasing, matching the reference. The test file uses plain pytest functions with docstrings, like the reference test file."
+          ],
+          "deficiency": "None found."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Blocking behaviour: future.result() (app.py:510). Awaitables are awaited via invoke (app.py:507).",
+            "Errors: RuntimeError before start (app.py:496), same-thread call (app.py:498-500), and after stop (loop cleared at app.py:900-901).",
+            "Verified by the candidate tests (widget access, awaitable return, exception propagation, positional/keyword forwarding, exit from a thread, after-stop) and the reference FAIL_TO_PASS tests, all passing against the generated src."
+          ],
+          "deficiency": "None found."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-09/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [
+          {
+            "phase": "candidate_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-q",
+              "--basetemp",
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-09/candidate-test-tmp",
+              "tests/test_concurrency.py"
+            ],
+            "returncode": 0,
+            "output": "........                                                                 [100%]\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n8 passed, 1 warning in 0.70s\n"
+          },
+          {
+            "phase": "reference_tests",
+            "command": [
+              "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/bin/python",
+              "-m",
+              "pytest",
+              "-rA",
+              "tests/test_concurrency.py::test_call_from_thread_app_not_running",
+              "tests/test_concurrency.py::test_call_from_thread"
+            ],
+            "returncode": 0,
+            "output": "============================= test session starts ==============================\nplatform linux -- Python 3.9.25, pytest-8.4.2, pluggy-1.6.0\nrootdir: /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/Textualize__textual-1517/revision-02/run-09/evaluation\nconfigfile: pyproject.toml\ncollected 2 items\n\ntests/test_concurrency.py ..                                             [100%]\n\n=============================== warnings summary ===============================\n../../../../../tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474\n  /home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/tasks/Textualize__textual-1517/venv/lib/python3.9/site-packages/_pytest/config/__init__.py:1474: PytestConfigWarning: Unknown config option: asyncio_mode\n  \n    self._warn_or_fail_if_strict(f\"Unknown config option: {key}\\n\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n==================================== PASSES ====================================\n=========================== short test summary info ============================\nPASSED tests/test_concurrency.py::test_call_from_thread_app_not_running\nPASSED tests/test_concurrency.py::test_call_from_thread\n========================= 2 passed, 1 warning in 0.46s =========================\n"
+          }
+        ],
+        "candidate_test_changes": [
+          "tests/test_concurrency.py"
+        ],
+        "api_inspection": []
+      }
+    }
+  ]
+}

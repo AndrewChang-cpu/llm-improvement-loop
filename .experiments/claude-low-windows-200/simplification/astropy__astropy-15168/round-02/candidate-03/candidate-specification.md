@@ -1,0 +1,99 @@
+Cosmology parameter mapping attributes
+
+## Goals
+- Give `Cosmology` two public, read-only mapping attributes: `parameters` (non-derived parameters) and `derived_parameters` (derived parameters, such as Ode0 for flat cosmologies, including their subclasses).
+- Provide a supported way to reach a named parameter's Parameter object through the mapping, so users need not rely on class-level attribute access.
+- Make the new mappings the single source of truth for parameter names, so the attributes and every existing consumer (equality, cloning, non-flat conversion, string output, I/O writers) agree.
+
+## Scope
+- The feature applies to the `Cosmology` base class and is inherited by every subclass.
+- Direct class-level access to Parameter objects (for example the H0 attribute) keeps working.
+- Required work: the two attributes, computed at class creation; replacing the legacy classification (see Terminology); migrating every repository use of it, in source and existing tests, with unchanged behavior for existing cosmology classes; a changelog entry; and tests.
+- Repr and str formatting is not part of the contract, but must iterate over the same parameter set as the new mappings.
+
+## Terminology
+- Non-derived parameter: a Parameter definition not marked derived. Derived parameter: one marked derived.
+- Read-only mapping: an immutable mapping from name to value; item assignment and deletion are rejected.
+- Effective definition: for a name defined in several classes of a cosmology's hierarchy, the definition in the class nearest the cosmology class in method resolution order (MRO). Its derived status decides which mapping holds the name.
+- Legacy classification: the existing class-creation step that builds per-class tuples of parameter names from the parent's tuple and the class's own namespace only. This feature replaces it.
+
+## Workflows
+- Class access: reading `parameters` or `derived_parameters` from the class returns a read-only mapping from name to Parameter object.
+- Instance access: reading either from an instance returns a read-only mapping from name to that instance's current value.
+- Ordering of `parameters`: constructor signature names first, in signature order; remaining names follow in first-appearance order when walking the hierarchy from the most basic class toward the cosmology class.
+- Ordering of `derived_parameters`: same first-appearance order, without signature reordering.
+- Subclasses see the parameters of their whole hierarchy, including those from grandparent and further-up cosmology classes.
+- Ode0: for non-flat FLRW cosmologies such as LambdaCDM, Ode0 is non-derived, appears in `parameters`, and not in `derived_parameters`. For flat FLRW cosmologies such as FlatLambdaCDM and their subclasses, Ode0 is derived, appears in `derived_parameters`, and not in `parameters`.
+
+## Data model
+- The two mappings are computed once, at class creation, by a single classification pass over the whole hierarchy. Each maps name to the effective Parameter definition and is read-only.
+- The pass gathers namespace entries from every class in the MRO, including non-direct parents and non-cosmology mixins, and must not be limited to the class's own namespace, the parent's computed names, or names starting with an underscore. That limitation drops derived parameters inherited from a grandparent, such as Ode0 for a subclass of FlatLambdaCDM; correcting it is this feature's purpose.
+- When a name is defined in several classes, the effective definition applies. For example, the derived Ode0 from the flat mixin overrides the non-derived Ode0 from the FLRW base for flat cosmologies.
+- The two mappings are disjoint; their union is the complete parameter set. The union is stored privately per class and is what equality and equivalence compare.
+- The attributes store no copy of values; values are read through the instance's own parameter attributes at access time.
+- Remove the legacy classification: no second discovery algorithm may run at class creation, the legacy double-underscore tuple attributes are deleted, and every reader in source or tests must read the new mappings. No reference to the removed attributes remains, and no compatibility alias is added.
+
+## API contracts
+- `parameters` and `derived_parameters` are available on `Cosmology` and every subclass, from both the class and instances.
+- Reading either returns an immutable mapping keyed by strings.
+- Assigning either attribute on any instance is rejected and must not replace or shadow it. Reads still return the read-only mapping afterward.
+- No other public names are added. The removed legacy tuples were internal.
+
+## Module architecture
+- Implement both attributes with one shared data descriptor, placed in the parameter package or the cosmology core module.
+- The descriptor reads the mappings each class computes at creation, stored on the class under underscore-prefixed private names. Do not introduce a second registry.
+- The MRO namespace-gathering helper lives in the private module `astropy/cosmology/_utils.py`, not in the public `astropy/cosmology/utils.py`, which is a deprecation shim that only forwards deprecated names. The cosmology core imports the helper from the private module.
+- Dependency direction: the cosmology core may use the parameter package and the private helper. The parameter package references the cosmology class only for type checking, never at runtime. The helper must not import the cosmology core.
+
+## Implementation constraints
+- The descriptor must define both read and write hooks. A read-only descriptor is unacceptable because an instance attribute of the same name would shadow it.
+- The read hook returns Parameter objects from the class and parameter values from an instance.
+- The descriptor learns its public name from the owning class through the standard descriptor naming mechanism. Do not supply the name as a separate hand-written string.
+- Migrate every internal consumer in the same change: equality and equivalence, string output, cloning and argument building, non-flat conversion, and the table, mapping, model, HTML, LaTeX, and YAML-style I/O writers that read parameter names. Also migrate existing test modules that read the legacy classification, such as the realization parameters test and the per-format and per-class parameter tests.
+- Annotations in the helper and any new module must resolve on import at the minimum supported Python version: import every referenced name or postpone annotation evaluation. The cosmology core imports the helper at import time, so an unresolved name breaks the whole package.
+- Standard library only. No new dependency is permitted.
+
+## Naming
+- The public names are exactly `parameters` and `derived_parameters`.
+- Private helper and storage names start with an underscore.
+- The rejected-write error message quotes the public attribute name.
+
+## Validation
+- New and changed source and test modules must pass the repository's ruff hook from the pre-commit configuration. No import may be unused.
+- Ruff ignores E501, but the black hook enforces 88 columns. For every line the change adds or modifies in source and test modules, the statement must be black-stable: a statement that fits within 88 columns when joined is not split unless a trailing comma keeps it split, and a longer statement is wrapped the way black wraps it. This includes single-line return expressions such as equality comparisons. Untouched lines are not reformatted.
+- Importing the cosmology package must succeed on Python 3.9, the minimum supported version.
+
+## Error handling
+- Setting `parameters` or `derived_parameters` on an instance raises AttributeError.
+- The message begins with "cannot set", then the quoted attribute name, then "of", then the instance representation, and ends with a period.
+- Reads on valid instances must not raise.
+
+## Documentation
+- Each public attribute has a docstring directly beneath its definition in the Cosmology class body, stating that it returns an immutable mapping and describing class access (Parameter objects) versus instance access (values). Runtime-attached documentation is not acceptable.
+- Add a changelog fragment in the cosmology changes directory, named with the pull request number and typed as a feature. It states that both properties return read-only dictionaries and describes the class versus instance difference.
+
+## Compatibility
+- Class-level Parameter access and instance value reads are unchanged. Ode0 on the FLRW base remains non-derived for non-flat cosmologies.
+- Removing the legacy tuples is not a public contract change. For every shipped cosmology class, equality, equivalence, cloning, non-flat conversion, and every I/O writer must produce the same results as before.
+
+## Behavioral acceptance criteria
+- From the class, both attributes return read-only mappings whose values are Parameter objects. From an instance, their values equal the instance's parameter values.
+- For a flat cosmology class, its subclasses, and their subclasses, `derived_parameters` includes Ode0. For LambdaCDM, `parameters` includes Ode0 and `derived_parameters` does not.
+- Assigning either attribute on an instance raises AttributeError with the Error handling message, and the attribute still behaves as before. Returned mappings reject item assignment.
+- For a Parameter defined on a non-cosmology mixin, the mappings, equality, cloning, and I/O writers all treat that name as a parameter of the class.
+- For every shipped cosmology class, equality, equivalence, cloning, non-flat conversion, and table, mapping, and model I/O outputs match pre-change results.
+- No reads of the removed legacy tuples remain, and the realization parameter-values test still checks every parameter value against the realization's parameter mapping.
+
+## Test requirements
+- Tests cover class and instance reads of both attributes, the derived split, inheritance into subclasses (including a grandchild of a flat cosmology), and rejected instance assignment for both names.
+- Place tests beside the existing cosmology parameter tests, following their layout.
+- Migrate existing tests that read the legacy classification to the new mappings. Each keeps its original assertions in the same method and is not deleted or weakened. For example, the realization test iterates the realization's parameter mapping and compares each value with the mapping's entry for that name.
+- Keep assertions in the method whose name and docstring describe them. New checks go in a new method named and documented for that behavior. For example, the check that a subclass may not take Ode0 in its initializer stays in the existing flat-subclass initialization test, while checks for subclasses of flat cosmologies go in a new method.
+- Run rejected-assignment tests only against instances created through the normal `Cosmology` initialization path. Stub classes that bypass it fail with an unrelated error, because the error message formats the instance representation, which reads the instance name.
+- Every fixture a test uses must be available to it: defined in the same class, inherited from a shared mixin, or provided by a shared conftest.
+- A test that defines a new cosmology subclass must remove its registration with the registry-cleanup fixture from the cosmology test helper, as neighboring tests do.
+- Mixin tests run for every cosmology test class, including those with no derived parameters. Do not take the first item of an iterator over the derived mapping unguarded; an empty mapping raises StopIteration, which a TypeError expectation does not catch. Compare key sets or iterate in a way safe for empty mappings.
+- Stub cosmologies for a non-cosmology mixin's parameter must not be cloned or rebuilt from their mapping unless their constructor accepts every name in it, because cloning passes all parameters, including inherited ones, to the constructor. For such stubs, check membership and Parameter type through the mappings.
+- A stub overriding an attribute inherited from a cosmology base must keep the base's kind: a base property is overridden by a property, not called as a method.
+- Add a direct unit test for the private MRO helper in the existing private cosmology utilities test module. It checks that base-class names are included, that a nearer definition overrides a farther one, and that the helper does not add gathered names to the subclass's own namespace.
+- Ode0 assertions follow Workflows. Do not assert that the legacy tuples agree with the new mappings.

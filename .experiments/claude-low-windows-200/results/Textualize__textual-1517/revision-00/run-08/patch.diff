@@ -1,0 +1,141 @@
+diff --git a/src/textual/app.py b/src/textual/app.py
+index b207bbd..177a02a 100644
+--- a/src/textual/app.py
++++ b/src/textual/app.py
+@@ -12,6 +12,7 @@ import warnings
+ from asyncio import Task
+ from contextlib import asynccontextmanager, redirect_stderr, redirect_stdout
+ from datetime import datetime
++from functools import partial
+ from pathlib import Path, PurePath
+ from queue import Queue
+ from time import perf_counter
+@@ -293,6 +294,8 @@ class App(Generic[ReturnType], DOMNode):
+         self.mouse_captured: Widget | None = None
+         self._driver: Driver | None = None
+         self._exit_renderables: list[RenderableType] = []
++        self._loop: asyncio.AbstractEventLoop | None = None
++        self._thread_id: int = 0
+ 
+         self._action_targets = {"app", "screen"}
+         self._animator = Animator(self)
+@@ -1291,6 +1294,40 @@ class App(Generic[ReturnType], DOMNode):
+         self._exit_renderables.extend(pre_rendered)
+         self._close_messages_no_wait()
+ 
++    def call_from_thread(self, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
++        """Run a callback in the app's event loop from another thread, and block until it returns.
++
++        This is intended for use from a thread other than the app's thread, for example
++        when integrating a threaded third-party API. The callback is invoked in the app's
++        loop, and its return value (or exception) is returned to the calling thread.
++
++        Calling this from the app's own thread would deadlock, so it raises a RuntimeError.
++
++        Args:
++            callback (Callable[..., Any]): A callable, which may be a coroutine function.
++            *args: Positional arguments passed to the callback.
++            **kwargs: Keyword arguments passed to the callback.
++
++        Raises:
++            RuntimeError: If the app is not running, or if called from the app's thread.
++
++        Returns:
++            Any: The return value of the callback.
++        """
++        if self._loop is None or not self._running:
++            raise RuntimeError("App is not running")
++        if threading.get_ident() == self._thread_id:
++            raise RuntimeError(
++                "The `call_from_thread` method must run in a different thread from the app"
++            )
++        callback_with_args = partial(callback, *args, **kwargs)
++
++        async def run_callback() -> Any:
++            return await invoke(callback_with_args)
++
++        future = asyncio.run_coroutine_threadsafe(run_callback(), loop=self._loop)
++        return future.result()
++
+     def _handle_exception(self, error: Exception) -> None:
+         """Called with an unhandled exception.
+ 
+@@ -1328,6 +1365,8 @@ class App(Generic[ReturnType], DOMNode):
+         terminal_size: tuple[int, int] | None = None,
+     ) -> None:
+         self._set_active()
++        self._loop = asyncio.get_running_loop()
++        self._thread_id = threading.get_ident()
+ 
+         if self.devtools is not None:
+             from .devtools.client import DevtoolsConnectionError
+diff --git a/tests/test_call_from_thread.py b/tests/test_call_from_thread.py
+new file mode 100644
+index 0000000..b081a5a
+--- /dev/null
++++ b/tests/test_call_from_thread.py
+@@ -0,0 +1,64 @@
++import asyncio
++
++import pytest
++
++from textual.app import App
++
++
++class CallFromThreadApp(App[None]):
++    pass
++
++
++async def test_call_from_thread_returns_value() -> None:
++    """Check that call_from_thread runs the callback in the app and returns its result."""
++    app = CallFromThreadApp()
++
++    def add(a: int, b: int) -> int:
++        return a + b
++
++    async with app.run_test():
++        result = await asyncio.to_thread(app.call_from_thread, add, 2, b=3)
++        assert result == 5
++
++
++async def test_call_from_thread_runs_in_app_loop() -> None:
++    """Check that the callback is executed in the app's event loop thread."""
++    app = CallFromThreadApp()
++    loop = asyncio.get_running_loop()
++    seen_loops: list[asyncio.AbstractEventLoop] = []
++
++    def record() -> None:
++        seen_loops.append(asyncio.get_running_loop())
++
++    async with app.run_test():
++        await asyncio.to_thread(app.call_from_thread, record)
++        assert seen_loops == [loop]
++
++
++async def test_call_from_thread_awaits_coroutine() -> None:
++    """Check that a coroutine callback is awaited before call_from_thread returns."""
++    app = CallFromThreadApp()
++
++    async def compute() -> str:
++        await asyncio.sleep(0)
++        return "done"
++
++    async with app.run_test():
++        result = await asyncio.to_thread(app.call_from_thread, compute)
++        assert result == "done"
++
++
++async def test_call_from_thread_from_app_thread_raises() -> None:
++    """Check that calling call_from_thread from the app's own thread raises instead of deadlocking."""
++    app = CallFromThreadApp()
++
++    async with app.run_test():
++        with pytest.raises(RuntimeError):
++            app.call_from_thread(lambda: None)
++
++
++async def test_call_from_thread_when_not_running_raises() -> None:
++    """Check that call_from_thread raises if the app is not running."""
++    app = CallFromThreadApp()
++    with pytest.raises(RuntimeError):
++        app.call_from_thread(lambda: None)

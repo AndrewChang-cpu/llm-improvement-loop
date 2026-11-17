@@ -1,0 +1,1359 @@
+{
+  "current_specification": "## Goals\n\n- Add a string format for `TimeDelta` named `quantity_str`. It represents a physical time delta as an optionally signed sequence of components: years (`yr`), days (`d`), hours (`hr`), minutes (`min`), and seconds (`s`). It is meant to be human-readable and usable in configuration files and command-line options.\n- Make strings in this form valid `TimeDelta` input without an explicit format. Bare-string construction is the primary usage, so construction without a format must succeed for these strings.\n- Provide output subformats `multi`, `yr`, `d`, `hr`, `min`, and `s` through the existing output-subformat mechanism, with `precision` applied to the selected subformat.\n- Make `precision`, `in_subfmt`, `out_subfmt`, and `copy` keyword-only arguments of `TimeDelta` construction. Their names and relative order follow the `Time` initializer, but that initializer takes these arguments positionally. The keyword-only marker is new for `TimeDelta` only and must not be described as existing for `Time`.\n- Rationale: ISO 8601 durations depend on a calendar reference date, so they cannot express a physical delta that is independent of the start date. The units of this format are physical, not calendar.\n\n## Scope\n\nIn scope:\n- The new format class in the time formats module, with its registration and public export.\n- `TimeDelta` construction: format resolution, the new keyword-only arguments, and where the numeric-without-unit warning is raised.\n- The shared format-resolution routine used by both `Time` and `TimeDelta`, limited to the changes listed under Workflows and Error handling.\n- The `subfmt` keyword of `TimeDelta.to_value`.\n- The precision range for delta formats.\n- Tests, changelog fragments, and documentation.\n\nOut of scope:\n- Arithmetic and comparison behavior of `TimeDelta`.\n- Calendar-aware semantics. Years are never calendar years.\n- Registering the new format for `Time`.\n- Parsing ISO 8601 durations, and components other than the five listed units.\n- Changing how unitless numeric strings are guessed. They keep their existing behavior (see Compatibility).\n- Glob-pattern resolution of subformat names (see Terminology).\n\n## Assumptions\n\n- Units are physical: 1 yr = 365.25 d (the astropy `yr` unit), 1 d = 24 hr, 1 hr = 60 min, 1 min = 60 s. Leap seconds are not handled.\n- Values are held in a two-part representation: `jd1` (whole days) and `jd2` (fraction of a day), both float64. The fractional part is kept in `jd2`, so fractional seconds survive large spans. For example, 1e8 days plus 1.0123456789012345 s keeps the fractional seconds. The format must not be described as losing precision at the level of total seconds.\n- The `precision` setting controls only the number of printed digits.\n\n## Terminology\n\n- Component: a non-negative decimal number, followed by optional whitespace and then a unit name from {yr, d, hr, min, s}.\n- Unit names are lowercase and case-sensitive.\n- Subformat: an output selector. `multi` is the multi-component form. `yr`, `d`, `hr`, `min`, and `s` are single-unit forms. `*` is the wildcard default and resolves to `multi`.\n- Subformat pattern: a requested subformat string that the existing subformat-validation mechanism matches against the declared names with shell-style glob rules. Matching decides only whether the request is valid. The new format does not replace a pattern with a matched name; it passes the requested string on as the output selector (see Workflows). Glob patterns are not a supported output selector for this format, and no behavior is specified for them.\n- Multi output: output containing only the non-zero components among d, hr, min, and s.\n- TimeUnique format: a format class marked as TimeUnique. It can be identified from its input without an explicit format name. The shared guessing routine consults these classes, and only these classes.\n- Numeric without unit: a numeric input with no unit attribute. This includes numeric strings and bytes with no unit (for example \"1.0\" or \"2.5\"), which the numeric delta format reads as days.\n\n## Workflows\n\nConstruction of a `TimeDelta` from a non-TimeDelta value:\n1. Accept the value, optional `val2`, optional `format`, optional `scale`, and the keyword-only `precision`, `in_subfmt`, `out_subfmt`, and `copy`.\n2. If the value is already a `TimeDelta`, keep the existing replicate path unchanged.\n3. If `format` is given, it must be a string (TypeError otherwise) and must name a registered delta format (ValueError otherwise). Resolve it through the same single-candidate path as step 4, so that a failure in that class is wrapped as described under Error handling.\n4. If `format` is absent, the shared format-resolution routine (the same routine `Time` uses; see Module architecture) runs. First, reject zero-size input (both `val` and `val2`, if present, have size zero) with a ValueError. Then try every registered TimeUnique delta format in registration order: jd, datetime, quantity_str. The first class that accepts the input wins.\n   - The guessing order is the only selection mechanism. The routine must not add any input-type filter of its own (for example, excluding string input from a class). Whether a class accepts an input is decided by its own input validation.\n   - `TimeDelta` must not keep a special-case default-format method.\n   - Expected outcomes: a `datetime.timedelta` resolves to the datetime format; a Quantity resolves to jd; a plain numeric without unit resolves to jd; a numeric string or bytes without unit (for example \"1.0\") resolves to jd, which reads it as days; a string in quantity_str form (for example \"2.5hr\") resolves to quantity_str, because jd rejects it.\n5. Instantiate the chosen class with `val`, `val2`, `scale`, `precision`, `in_subfmt`, and `out_subfmt`. Pass `precision` None through unchanged so the format applies its own default. An unspecified `in_subfmt` or `out_subfmt` on `TimeDelta` is resolved to the wildcard `*` before the format is instantiated.\n6. Apply `scale` to the `TimeDelta` as before.\n7. After construction, if no format was given, the input has no unit, and the resolved format is numeric (including numeric strings and bytes resolved to jd), emit the missing-unit warning described under Logging.\n\nOutput:\n- `value` returns the output in the current `out_subfmt`.\n- `to_value` with a format, or with a `subfmt` keyword and no format, uses the current format and the given subformat.\n- Subformat resolution, in the output path of the new format:\n  - The requested `out_subfmt` (or the `subfmt` keyword of `to_value`) is checked with the existing subformat-validation mechanism that `TimeNumeric` formats use for output (see Module architecture).\n  - If the mechanism accepts the request, the requested string is used unchanged as the output selector. A glob pattern is not resolved to a concrete name (see Terminology).\n  - If the mechanism rejects the request, the output selector is the wildcard `*`, which means multi. The output path must not fail on it.\n  - Public setters for `out_subfmt` and `in_subfmt` reject names that the existing mechanism rejects, with ValueError.\n  - No separate name list or name-matching logic may be added to the format class for this purpose. Matching is not done by string comparison against a private unit list.\n- Once resolved, `*` and `multi` produce multi output, and each other concrete name produces single-unit output.\n- For a negative total, compute the output from the absolute value and prefix the whole output with a single \"-\".\n\nMulti output:\n- Split the two-part total into whole days, whole hours, whole minutes, and remaining seconds (see Implementation constraints).\n- Round the seconds to `precision` first. Then carry: if the rounded seconds reach 60, move 60 s into one minute; a minute count reaching 60 moves into hours; an hour count reaching 24 moves into days. Carries happen after rounding.\n- Days, hours, and minutes are integers. Seconds are the rounded number.\n- Emit only the non-zero components, in the order d, hr, min, s, separated by one space. Years are never emitted in multi output; the day count absorbs them.\n- If all components are zero, the output is the text \"0.0s\".\n- Expected results: 1 yr gives \"365d 6hr\"; 2.5 hr gives \"2hr 30min\"; 60 s gives \"1min\"; 1 s gives \"1.0s\"; 3e7 s gives \"347d 5hr 20min\"; 3.000001e7 s gives \"347d 5hr 20min 10.0s\".\n\nSingle-unit output:\n- Convert the total to the resolved unit using astropy's day-based unit conversion (yr = 365.25 d, d, hr, min, s).\n- Round to `precision`. Render the rounded number in the default shortest float text, followed by the unit name, with the sign prefix.\n- Do not pad trailing zeros beyond what float text produces; whole numbers keep \".0\".\n- Expected results for a total of 30000010 s: yr \"0.951yr\", d \"347.222d\", hr \"8333.336hr\", min \"500000.167min\", s \"30000010.0s\". The multi result is \"347d 5hr 20min 10.0s\".\n\n## Data model\n\nPer element, the internal state is `jd1` (float64, whole days) and `jd2` (float64, fraction of a day), normalized with the standard day-fraction split.\n\nInput grammar (pseudocode, to be implemented as one full-match pattern):\n\n    delta      := ws* [sign] ws* ( yr-part )? ( d-part )? ( hr-part )? ( min-part )? ( s-part )? ws*\n    yr-part    := number ws* \"yr\" ws*        (and likewise for d, hr, min, s; the order is fixed)\n    number     := digits [if \".\" [digits]] | \".\" digits, optionally followed by an exponent (\"e\" or \"E\", optional sign, digits)\n\n- The whole string must match. At least one component is required, and the string must contain at least one character that is neither a sign nor whitespace.\n- The sign is optional and appears once, at the start. It applies to the whole delta.\n- Each component appears at most once, in the order yr, d, hr, min, s. Whitespace between components and between a number and its unit is optional.\n- Accepted examples: \"1s\", \"1min\", \"2.5hr\", \"3e7s\", \"3.e7s\", \"  100.0 d1.0123456789012345 s \", \"2yr 3d 4hr 5min 6.789s\", \"-1yr 2d 23hr 10min 5.6s\".\n- Rejected examples: the empty string, whitespace only, a sign only, \"1.0\" (no unit), \"1.0s 2.0s\", \"1.0s 2.0\", \"1.0s 2min\" (out of order), \"++1.0s\", \"2min +1s\", \"2d -1s\", \"1sec\".\n\nParsing steps for one element:\n- Match the whole string against the grammar. A non-match is an error.\n- Missing components are zero. Apply the sign to all components.\n- Whole days = yr \u00d7 365.25 + d (exact for integer inputs). Fraction = hr/24 + min/1440 + s/86400.\n- Normalize into `jd1` and `jd2` with the standard day-fraction split. Do not compute a single total-seconds float.\n\nPrecision (per format instance):\n- Default is 3 when the value is None. The precision setter maps None to the format's default, so None is accepted both at construction and when the property is set.\n- Delta formats accept integers from -99 to 99 inclusive. `Time` formats keep 0 to 9.\n- Negative values round to tens (for example, 21.123456789012345 s at precision -1 gives \"20.0s\").\n- Precision applies to every subformat, including the single-unit ones and the seconds of multi output.\n\n`in_subfmt`: stored and validated against the subformat names. Parsing does not depend on it.\n\n## API contracts\n\n- `TimeDelta` construction: `val`, `val2`, `format`, and `scale` remain positional. `precision` (default None), `in_subfmt` (default None, which the format resolves to the wildcard `*`), `out_subfmt` (default None, resolved the same way), and `copy` (default False) are keyword-only on the construction entry point that performs initialization. `copy` must not be accepted positionally there.\n- `TimeDelta.__new__` keeps the original parameter list exactly as it is in the original code: the same positional-or-keyword parameters, including `location` (default None) and `copy`, with no keyword-only marker added. Do not remove `location`, and do not add a bare-star separator. Only the initialization entry point changes, and the values are applied at initialization.\n- `TimeDelta.to_value`, in the order the checks are applied:\n  - No arguments: TypeError with the existing \"missing required format or unit argument\" message.\n  - Allowed keyword names are format, subfmt, unit, and equivalencies. Any other keyword raises TypeError naming it.\n  - A `format` keyword, or a first positional argument that is None or a registered delta format, delegates to the base implementation.\n  - A `subfmt` keyword with no format and no positional argument outputs in the current format with that subformat. Any other keyword passed with it (for example `unit` or `equivalencies`) is forwarded to the base `to_value` signature, which does not accept it, so the call raises TypeError. This is a TypeError even though the keyword is in the allowlist; it is not a ValueError.\n  - A `subfmt` keyword together with a positional argument that is not a format raises ValueError.\n  - Otherwise the first positional argument is parsed as a unit, as before.\n- Format class: name \"quantity_str\"; class `TimeDeltaQuantityString`; a delta-format subclass that is also TimeUnique; subformats in the order multi, yr, d, hr, min, s. Its output method accepts an optional parent and an optional output subformat, and returns an array of text (masked when the input is masked). Its `value` property returns the output of that method.\n- Input validation for the format class: a non-empty array whose dtype is not string (unicode or bytes) is rejected. A zero-size array of any dtype is accepted and produces a zero-size result. A present `val2` is rejected.\n- `TimeDeltaJD` gains the TimeUnique marking. Its signature does not change.\n- `TimeDelta.FORMATS` lists sec, jd, datetime, quantity_str, in that order.\n\n## Module architecture\n\n- Parsing and rendering belong in the new format class in the time formats module. `TimeDelta` must not parse strings itself.\n- Subformat selection for output belongs to the format layer's existing subformat-validation mechanism, the one `TimeNumeric` formats use to resolve `out_subfmt`. The new class must reuse it rather than add a parallel selection path. Its fallback for rejected names is the wildcard `*`.\n- Format guessing belongs to the shared format-resolution routine in the time core module, which is used by both `Time` and `TimeDelta`. That routine owns the zero-size check, the candidate list (TimeUnique formats in registry order), the pseudo-format fallback for `Time` only, and the aggregated error message. The routine must not contain format-specific or input-type-specific exclusions. Candidate acceptance is decided by TimeUnique membership and each format's own input validation.\n- The TimeDelta-specific default-format method (which returns datetime for timedelta objects and jd for everything else) is removed. Its behavior comes from TimeUnique guessing.\n- The keyword plumbing for `precision`, `in_subfmt`, and `out_subfmt`, and the numeric-without-unit check, belong to `TimeDelta` construction in the core time module. The numeric-without-unit check uses the resolved format class and applies to string input as well.\n- Registration uses the existing subclass-registration mechanism: declare the format name on the class. Do not create a separate registry.\n- Each subformat entry of the new class uses the same tuple shape as the other delta format classes (a name followed by placeholder entries), not a bare two-element pair.\n- The subformat handling for `subfmt` in `to_value` belongs in `TimeDelta.to_value`.\n\n## Implementation constraints\n\n- Keep two-part storage end to end. Do not convert the total to a single seconds float before splitting. Use the existing two-sum helper to split the total into whole days and a remainder for output.\n- Do not add a parallel unit table. Single-unit conversion uses astropy's day-based unit conversion, and the unit name passed to it is the requested subformat string accepted by the existing subformat-validation mechanism.\n- Check the requested subformat through the existing subformat-validation mechanism, and map `*` to multi, before any unit lookup.\n- Pass a precision of None through to the format.\n- Perform the numeric-without-unit check after construction, using the chosen format.\n- The zero-size rejection is a guessing rule of the shared format-resolution routine only. The format class itself does not reject zero-size arrays; parsing and output of zero-size arrays produce zero-size results.\n- Do not change `TimeDelta` arithmetic or scale handling, or the output of the existing sec, jd, and datetime formats.\n- Do not change the case-sensitivity of format-name lookup beyond the existing behavior.\n\n## Dependencies\n\n- Add no third-party or project dependencies. Use the regular-expression module, numpy, astropy units, and the day-fraction and two-sum helpers already used by the time formats module.\n\n## Naming\n\n- Class name: `TimeDeltaQuantityString`. Format name: \"quantity_str\". Subformat names: exactly multi, yr, d, hr, min, s.\n- Add the class to the formats module's public export list, next to the other delta format classes.\n- Keyword names `precision`, `in_subfmt`, `out_subfmt`, and `copy` are unchanged.\n\n## Validation\n\n- Input arrays use string dtypes, either unicode or bytes. Bytes are decoded as ASCII before parsing, and byte input is accepted.\n- A non-empty non-string array raises TypeError. Empty arrays are accepted.\n- Each element must fully match the grammar in Data model.\n- `val2` must be absent. A present `val2` raises ValueError.\n- `precision` must be None (meaning the format default) or an integer within the range for the format class.\n- `in_subfmt` and `out_subfmt` are validated against the subformat names (including the glob-matching rule in Terminology) when they are set.\n- Ordering when a format class is constructed directly: the base initializer sets `precision`, `in_subfmt`, and `out_subfmt` before it checks the input values. A None subformat is not a subformat name and raises ValueError from that subformat validation, so a non-string array passed to the format class with None subformats raises ValueError, not the non-string TypeError. The non-string TypeError is reached only when both subformats are valid strings (for example \"*\"). `TimeDelta` resolves unspecified subformats to `*` before instantiating the format, so the TypeError applies there without this caveat.\n- The `to_value` keyword allowlist is enforced.\n- The scale check is the existing delta-scale check.\n\n## Error handling\n\n- `format` is not a string: TypeError, \"format must be a string\". This applies to `Time` and `TimeDelta`.\n- `format` names no registered format: ValueError, \"Format <name> is not one of the allowed formats <sorted names>\".\n- Explicit format fails: ValueError, \"Input values did not match the format class <name>:\", then the platform line separator (`os.linesep`, as the original code uses), then \"<ErrorClass>: <message>\". Chain the original error. This is a ValueError for every format, including quantity_str; do not raise TypeError for an explicit-format failure.\n- No format, and guessing fails for all candidates: ValueError, \"Input values did not match any of the formats where the format keyword is optional:\", then a literal newline character (not the platform line separator), then one line per candidate in the form \"- '<name>': <error>\", with lines separated by a literal newline character.\n- Unit-conversion errors propagate immediately, unwrapped.\n- Zero-size input with no format, for `Time` and `TimeDelta` alike: ValueError, \"cannot guess format from input values with zero-size array\". Time([]) must keep raising this error.\n- An element that does not match the grammar: ValueError, \"Time delta '<text>' does not match quantity_str format\".\n- Non-string input: TypeError, \"Input values for quantity_str class must be strings\". This is raised when the subformat arguments are valid strings. When the format class is constructed directly with None subformats, the subformat ValueError is raised first (see Validation).\n- `val2` provided: ValueError, \"quantity_str objects do not accept a val2 but you provided <val2>\".\n- `precision` out of range: ValueError, \"precision attribute must be an int between <min> and <max>\", using the limits for the format class.\n- Unknown `to_value` keyword: TypeError, \"TimeDelta.to_value() got an unexpected keyword argument '<name>'\".\n- `subfmt` with a positional argument that is not a format: ValueError, \"cannot specify 'subfmt' and positional argument that is not a valid format\".\n- `subfmt` keyword combined with a `unit` or `equivalencies` keyword and no format: TypeError, raised by the base signature. Do not wrap it or convert it to ValueError.\n\n## Logging\n\n- Missing-unit warning: category TimeDeltaMissingUnitWarning, text \"Numerical value without unit or explicit format passed to TimeDelta, assuming days\".\n- Emit it once per construction, only when no format was given, the input has no unit, and the resolved format is numeric. This includes numeric strings and bytes that resolve to jd (for example \"1.0\" or \"2.5\"); they warn exactly like numeric arrays. Do not emit it for inputs with a unit, for inputs that resolve to quantity_str or datetime, or when a format was given.\n- No other logging.\n\n## Documentation\n\n- `TimeDelta` class docstring: document the `precision`, `in_subfmt`, and `out_subfmt` parameters. Update the listed FORMATS output to include quantity_str, in the order given in API contracts.\n- `to_value` docstring: list the built-in TimeDelta format names, including quantity_str.\n- Format class docstring: describe the grammar in prose and the units. Include the calendar note: adding one year to 2000-01-01 00:00:00 gives 2000-12-31 06:00:00. Describe the subformats, and state that the default output is not finalized (see Compatibility).\n- Docstring examples are doctests. In the format class docstring and the TimeDelta docstring, each example's expected text must equal exactly what printing the value produces, meaning the str form, not the repr form. Do not put quotation marks in expected output unless the printed text itself contains them. Show each value by printing it, one value per example.\n- Documentation index for time: add a quantity_str row to the TimeDelta format table, widening the table to fit. Add a short section on the format and its subformats that references the class.\n- Release notes: in the existing in-development whatsnew page for the current development series (docs/whatsnew/6.0.rst), in its existing sections, add all of the following. Do not create a new version page and do not add a new toctree entry.\n  - A bullet in the page's highlights list that references a new labelled section for the format.\n  - A labelled section with a title for the quantity_str format. It describes the format, its grammar in prose, the units, and the subformats.\n  - A warning note that the default output format is not yet finalized and may change in version 6.1, and that the input format is stable, referencing issue 15485.\n  - The keyword-only construction change, stated accurately (see the changelog rule below).\n- Changelog fragments under docs/changes/time/, named with pull request number 15264: one feature fragment and one api fragment. The api fragment states the previous positional order (val, val2, format, scale, copy) and the new order with the keyword-only group after scale. It must not say that Time's arguments are already keyword-only, because the `Time` initializer takes precision, in_subfmt, out_subfmt, and copy positionally. The whatsnew wording follows the same rule.\n- Keep existing attribute docstrings directly after their attribute definitions. Do not move a docstring so that it documents a different attribute.\n\n## Maintainability\n\n- Code lines are at most 88 characters, which satisfies the repository's black and ruff settings.\n- The repository's ruff configuration selects all rules and enforces the pre-commit ruff hook on every commit. Write membership negation as \"x not in y\", never as \"not x in y\" (rule E713). Other ruff rules are not exempted by this change.\n- The TimeDelta default-format method is removed, not kept as dead code.\n- Remove any import that the change leaves unused (for example, the datetime timedelta name in the core time module once the default-format method is gone). The repository's lint configuration does not exempt non-__init__ modules from unused-import checks. The existing os import in the core time module is still used for the platform line separator in the explicit-format error, so it stays; do not remove it and do not replace the platform line separator in existing messages with a literal newline.\n- Each name is imported in exactly one import statement per module. Do not import the same name twice in a module, even in a separate statement. The repository's ruff/pyflakes configuration flags a redefined import (F811), and a duplicate import fails the lint check.\n\n## Compatibility\n\n- `TimeDelta` construction: `copy` becomes keyword-only on the initialization path. `val`, `val2`, `format`, and `scale` remain positional. `TimeDelta.__new__` keeps its original signature, including `location`. The api changelog fragment records the keyword-only change accurately (see Documentation).\n- Numeric, datetime, and sec output is unchanged. Existing precision defaults are unchanged. The TimeDelta precision range widens to -99 through 99.\n- Format guessing for TimeDelta now includes every TimeUnique delta format, and jd is now TimeUnique. quantity_str is one of those guessed formats.\n- Numeric input without a unit still means days, with the warning. Numeric strings and bytes without a unit (for example \"1.0\") are still accepted as days with the warning, as in the original code. Only strings in the quantity_str grammar are newly accepted without a format.\n- `Time` guessing considers all TimeUnique formats in registry order, with the astropy_time pseudo-format last. Its failure message wording changes to the multi-line list. A non-string `format` on `Time` raises TypeError. Zero-size input with no format still raises ValueError for `Time`.\n- `TimeDelta.FORMATS` gains quantity_str. The private default-format method is removed.\n\n## Behavioral acceptance criteria\n\n- Bare strings in the grammar construct a `TimeDelta` without a format and produce these multi outputs: \"1s\" gives \"1.0s\"; \"1min\" gives \"1min\"; \"2.5hr\" gives \"2hr 30min\"; \"3.000001e7s\" gives \"347d 5hr 20min 10.0s\"; \"3.e7s\" and \"3e7s\" give \"347d 5hr 20min\"; \"1.0123456789012345s\" gives \"1.012s\"; \"  100.0 d1.0123456789012345 s \" gives \"100d 1.012s\"; \"2yr 3d 4hr 5min 6.789s\" gives \"733d 16hr 5min 6.789s\"; \"2.5yr 3.5d 4.5hr 5.5min 6.789s\" gives \"916d 19hr 35min 36.789s\".\n- A leading \"+\" gives the same output as no sign. A leading \"-\" gives the same output prefixed with \"-\", and the total is negated.\n- \"1yr 3.6d\" with subformat d gives \"368.85d\". \"-1yr 2d 23hr 10min 5.6s\" with subformat d gives \"-368.215d\".\n- A 40-hour delta gives \"1d 16hr\" in multi, \"1.667d\" with out_subfmt \"d\" and also with the subfmt keyword \"d\", and \"1.666666667d\" with subformat d at precision 9.\n- Invalid strings in Data model raise ValueError. With an explicit format, the message contains \"Input values did not match the format class quantity_str\". Without a format, the guessing message is raised.\n- \"100.0d 1.0123456789012345s\" at precision 9 gives \"100d 1.012345679s\". \"21.123456789012345s\" gives \"21.123s\" by default, \"20.0s\" at precision -1, and \"21.123456789012s\" at precision 12. Setting precision to 100 raises ValueError naming the range -99 to 99.\n- For a total of 30000010 s, every single-unit subformat gives the values in Workflows, and the multi output gives \"347d 5hr 20min 10.0s\". The same results apply through `to_value` with a subfmt keyword and no format, and through a Quantity of 30000010.0 s with an explicit format and subfmt.\n- \"100.0d 1.0123456789012345s\" at precision 9 with out_subfmt d gives \"100.000011717d\".\n- Overflow: \"1d 23hr 59min 59.9999s\" gives \"2d\" by default and \"1d 23hr 59min 59.9999s\" at precision 9. \"1d 23hr 58min 59.9999s\" gives \"1d 23hr 59min\". \"1d 23hr 59min 60.0001s\" gives \"2d\", and \"2d 0.0001s\" at precision 9.\n- A zero delta (\"0d\") gives \"0.0s\".\n- \"100000000d 1.0123456789012345s\" has `jd1` equal to 100000000, and `jd2` times 86400 approximately equal to 1.0123456789012345.\n- `TimeDelta(\"1s\", \"2s\")` raises ValueError about `val2`.\n- Byte-string input is parsed as ASCII.\n- `TimeDelta(\"1.0\")` and `TimeDelta(\"2.5\")` without a format each give a one-day-per-unit numeric TimeDelta (1 day, 2.5 days) and emit the missing-unit warning. The same numeric string with an explicit format, or a numeric value with a unit, gives no warning.\n- A numeric value without unit and without a format gives a numeric TimeDelta and the missing-unit warning. A `datetime.timedelta` resolves to the datetime format.\n- `to_value` with an unknown keyword raises TypeError. `to_value` with a unit as a positional argument and a subfmt keyword raises ValueError. `to_value` with a `unit` keyword and a `subfmt` keyword and no format raises TypeError. `to_value` with \"sec\" and a unit keyword still raises TypeError.\n- A rejected out_subfmt or in_subfmt value set on a TimeDelta raises ValueError. A rejected subfmt passed to `to_value` produces multi output rather than an error.\n- `TimeDelta.FORMATS` lists sec, jd, datetime, quantity_str.\n- `Time` with a non-string format raises TypeError, \"format must be a string\".\n- `Time([])` with no format raises ValueError (zero-size guessing message), unchanged from the original.\n\n## Test requirements\n\n- Add tests to astropy/time/tests/test_delta.py. Cover the following:\n  - Basic parsing and multi output, with sign variants.\n  - Precision, including negative values, values above 9, and None meaning the default.\n  - Invalid strings, both with an explicit format and through guessing. An explicit-format failure is asserted as ValueError, not TypeError.\n  - Each output subformat through out_subfmt, through `to_value` with a subfmt keyword, and from a Quantity. Do not test glob patterns (see Terminology).\n  - The two-part internal precision check.\n  - A zero value.\n  - Overflow carry.\n  - Non-string input and `val2` errors. For non-string input, either construct the format class directly with valid subformat strings such as `*`, or go through `TimeDelta` with an explicit quantity_str format (where unspecified subformats resolve to `*`). Do not assert TypeError for a direct construction that passes None subformats; that case raises ValueError first (see Validation).\n  - `to_value` keyword validation: an unknown keyword raises TypeError naming it, and a `unit` keyword combined with a `subfmt` keyword and no format raises TypeError.\n  - The FORMATS list.\n  - Unitless numeric strings (\"1.0\", \"2.5\") without a format: parsed as days and warned, both through the warning check and the value check.\n- Any regular expression passed to a match argument, or otherwise containing backslash escapes, must be a raw string literal. A non-raw literal with an invalid escape (for example a backslash before an opening parenthesis) raises a DeprecationWarning at compile time. The repository's pytest configuration sets warnings to errors, so the whole test module would fail to collect, including pre-existing tests.\n- Update astropy/time/tests/test_basic.py. Replace the old \"No time format was given\" assertion with the new guessing message. Add a TypeError test for a non-string format on `Time`. Keep the existing assertion that `Time([])` raises ValueError. The explicit-format assertions keep the platform line separator (`os.linesep`) in their expected text, as the original tests do; only the guessing-message assertion changes to the new message form.\n- Update astropy/time/tests/test_quantity_interaction.py. A positional unit with a subfmt keyword must raise ValueError with the new message, not TypeError.\n- Run the time test suite. The docstring doctests in the format class and in TimeDelta must pass as doctests, with their expected output written as described under Documentation.\n- Lint: the changed modules must pass the repository's ruff configuration, including the E713 membership rule described under Maintainability.",
+  "categories": {
+    "Purpose": [
+      "Goals",
+      "Scope",
+      "Assumptions",
+      "Terminology"
+    ],
+    "Behavior": [
+      "Workflows"
+    ],
+    "Data": [
+      "Data model"
+    ],
+    "Interfaces": [
+      "API contracts"
+    ],
+    "Architecture": [
+      "Module architecture",
+      "Implementation constraints",
+      "Dependencies"
+    ],
+    "Conventions": [
+      "Naming",
+      "Validation",
+      "Error handling",
+      "Logging",
+      "Documentation"
+    ],
+    "Quality": [
+      "Performance",
+      "Security",
+      "Reliability",
+      "Usability",
+      "Maintainability"
+    ],
+    "Compatibility": [
+      "Compatibility"
+    ],
+    "Operations": [
+      "Operations"
+    ],
+    "Acceptance": [
+      "Behavioral acceptance criteria",
+      "Test requirements"
+    ]
+  },
+  "requirements": {
+    "patch_and_checks": "Patch applies to the original snapshot (no tests are run).",
+    "file_location": "Code is placed in the required existing module or component.",
+    "api_contract": "API names, visibility, parameters, types, and return contracts match requirements.",
+    "dependency_direction": "Imports and dependency directions respect existing boundaries.",
+    "extension_registration": "Required registration and interface implementation are present.",
+    "approved_dependencies": "No unapproved dependencies are introduced.",
+    "architectural_fit": "Responsibilities belong in the intended layer or component.",
+    "extension_point_adherence": "Existing extension mechanisms are used rather than a parallel path.",
+    "abstraction_integrity": "Domain, transport, persistence, and framework boundaries are preserved.",
+    "convention_fit": "Follow the repository conventions visible in the original and reference code for validation, errors, naming, logging, and tests.",
+    "requirement_intent": "The feature satisfies its behavioral intent and constraints."
+  },
+  "runs": [
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json: patch_applies=true, commands=[] (no tests executed, per experiment setup).",
+            "Applied judge-context/patch.diff to a fresh temp copy of the 9 base files it touches: applied cleanly. Results are byte-identical to generated/ for astropy/time/core.py, formats.py, tests/test_basic.py, tests/test_delta.py, tests/test_quantity_interaction.py, docs/time/index.rst, docs/whatsnew/6.0.rst, docs/changes/time/15264.api.rst and 15264.feature.rst. Temp copy removed afterward.",
+            "diff -rq base vs generated lists only those same 9 paths (plus generated/.git), so no extra additions or removals beyond the patch."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/core.py:2803-2842: TimeDelta.__init__ stays in the TimeDelta class (base core.py:2792 was the same method).",
+            "generated/astropy/time/formats.py:2204-2360: TimeDeltaQuantityString lives in formats.py beside TimeDeltaDatetime, the module that already holds every TimeDelta format. Reference does the same (reference.diff formats hunk @@ -2175,6 +2189,177 @@).",
+            "generated/astropy/time/formats.py:145, 2102, 282-295: precision limits and the None default live on the format classes, where the original precision validation lives (base formats.py:274-281)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/core.py:2803-2814: TimeDelta.__init__(val, val2=None, format=None, scale=None, *, precision=None, in_subfmt=None, out_subfmt=None, copy=False). Matches the reference keyword-only group (reference.diff core hunk @@ -2789,30 +2800,44 @@). Base core.py:2792 had copy as the fifth positional.",
+            "generated/astropy/time/formats.py:2241 name='quantity_str'; formats.py:52 adds TimeDeltaQuantityString to __all__.",
+            "generated/astropy/time/core.py:2731: documented FORMATS list ['sec','jd','datetime','quantity_str'] matches registration order from class definition order (TimeDeltaSec, TimeDeltaJD, TimeDeltaDatetime, TimeDeltaQuantityString).",
+            "generated/astropy/time/core.py:3126-3131: unknown kwargs raise TypeError \"TimeDelta.to_value() got an unexpected keyword argument '...'\", same contract as reference.",
+            "generated/astropy/time/formats.py:282-283: precision=None maps to 3, as in the reference setter."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/core.py:38: TimeNumeric is added to core.py's existing `from .formats import (...)` block. formats.py does not import core, so the core-to-formats direction is unchanged.",
+            "generated/astropy/time/core.py:14: removes the now-unused `timedelta` import. Base core.py:2805 was its only use, inside the removed _get_format."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No new packages. formats.py already imports re, numpy, astropy.units as u, and two_sum/day_frac (base formats.py:2-18). The new class uses only those.",
+            "generated/astropy/time/tests/test_delta.py:23 imports TimeDeltaQuantityString from in-repo astropy.time.formats. No new test dependency."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Parsing and formatting sit in the TimeDeltaFormat subclass: generated formats.py:2204-2360 (_parse 2261, set_jds 2277, _format_multi 2288, to_value 2342).",
+            "TimeDelta.__init__ owns only the no-unit warning (generated core.py:2819, 2835-2841), decided by the chosen format (self._time is TimeNumeric).",
+            "Time-only pseudo-format stays on Time: generated core.py:585 `if isinstance(self, Time)` gates the astropy_time append."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "Automatic registration: base formats.py:175-177 (TimeFormat.__init_subclass__ writes cls._registry[cls.name] = cls). TimeDeltaQuantityString has name='quantity_str' (formats.py:2241) and inherits _registry=TIME_DELTA_FORMATS from TimeDeltaFormat (formats.py:2101), so it registers for TimeDelta only, not Time.",
+            "generated/astropy/time/formats.py:2139: TimeDeltaJD(TimeDeltaNumeric, TimeUnique) makes jd a TimeUnique format, so the guess loop includes jd as the reference's does (reference.diff formats hunk @@ -2122,7 +2136,7 @@).",
+            "generated/astropy/time/formats.py:52: __all__ export added, matching the reference."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "New format uses the existing subfmts tuple mechanism (generated formats.py:2242-2249) and the existing _get_allowed_subfmt fallback (formats.py:2347), not a parallel path.",
+            "_regexify_subfmts only regexifies string patterns (base formats.py:93-96), so the None placeholders are safe.",
+            "Guessing reuses the existing issubclass(cls, TimeUnique) registry walk (generated core.py:572-584), not a new hook.",
+            "Precision validation extends the existing setter through the _precision_limits class attribute (formats.py:145, 2102, 285-295)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "TimeDelta.to_value (generated core.py:3141-3149) routes to the format layer only through super().to_value(format=self.format, ...). No quantity-string formatting is added to core.",
+            "Time-specific pseudo-format stays inside the Time-only branch (core.py:585).",
+            "UnitConversionError re-raise is retained from base (patch.diff:97-99 context), so unit errors are not wrapped in the new message."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Error wording follows original phrasing: generated core.py:589 'format must be a string' (TypeError); core.py:590-594 keeps 'Format ... is not one of the allowed formats' (base core.py:580-589). Guess-failure text at core.py:615-618 uses the reference's '- name: err' bullet list.",
+            "Zero-size guess error at core.py:574-576 matches the reference wording.",
+            "New tests use the repo's pytest.raises(..., match=...) pattern (patch.diff:496-516 test_basic.py; patch.diff:770-781 test_quantity_interaction.py; test_delta.py hunk at patch.diff:517-769).",
+            "Line length: no added line in patch.diff exceeds 88 columns (pyproject.toml:237/322 line-length=88)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Hand-traced outputs (not executed): '1min' -> '1min'; '2.5hr' -> '2hr 30min'; '3e7s' -> '347d 5hr 20min'; '2.5yr 3.5d 4.5hr 5.5min 6.789s' -> '916d 19hr 35min 36.789s'; '-1yr 2d 23hr 10min 5.6s' with out_subfmt='d' -> '-368.215d'. All match the reference's expected strings and the candidate's own docstring examples (formats.py:2204-2240).",
+            "Guessing: '1.0' -> jd with TimeDeltaMissingUnitWarning (core.py:2835-2841). '1.0s 2.0s', '2d -1s', '1sec' are rejected via the composite error (core.py:615-618).",
+            "Zero-size guess raises (core.py:574-576). This is a behavior change shared with the reference (reference.diff core hunk @@ -558,15 +557,23 @@), not a candidate-only defect.",
+            "to_value(u.s, subfmt=...) raises ValueError 'cannot specify subfmt...' (core.py:3141-3147), as in the reference.",
+            "precision: TimeDelta range -99..99 (formats.py:2102); None -> 3 (formats.py:282-283).",
+            "Non-blocking: docs narrative is thinner than the reference's. Candidate changes only the format table (patch.diff:809-843); reference also adds Time Deltas examples and a '.. _time-delta:' anchor. Not a behavioral requirement."
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/astropy__astropy-15264/revision-06/run-00/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "astropy/time/tests/test_basic.py",
+          "astropy/time/tests/test_delta.py",
+          "astropy/time/tests/test_quantity_interaction.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json: patch_applies=true; commands=[] (no tests run, per experiment setup); candidate_test_changes lists astropy/time/tests/test_basic.py, test_delta.py, test_quantity_interaction.py.",
+            "generated/ staged diff against its 'Original snapshot' commit, with index lines removed, is identical to patch.diff (compared with diff).",
+            "Read-only review: new code in generated/astropy/time/formats.py:2189-2372 and generated/astropy/time/core.py:554-615, 2804-2832, 3121-3146 shows no visible syntax or name errors. The unused `timedelta` import was removed (core.py:14) and nothing else references it."
+          ],
+          "deficiency": "None observed by reading. Runtime pass/fail of the candidate tests is unverified because no tests were run."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/formats.py:45 (__all__ entry), :145 (TimeFormat._precision_limits), :2097 (TimeDeltaFormat._precision_limits), :2134 (TimeDeltaJD(TimeDeltaNumeric, TimeUnique)), :2189-2200 (quantity_str helpers), :2286 (class TimeDeltaQuantityString body).",
+            "generated/astropy/time/core.py:554 (_get_time_fmt), :2804 (TimeDelta.__init__), :3053 (TimeDelta.to_value).",
+            "Same modules as reference.diff: the format class lives in formats.py and guessing/init/to_value live in core.py."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/core.py:2804-2815: TimeDelta.__init__ takes `*` then precision, in_subfmt, out_subfmt, copy as keyword-only. Matches reference.diff.",
+            "generated/astropy/time/core.py:2726: FORMATS docstring lists 'quantity_str' after 'datetime'; registration order matches TIME_DELTA_FORMATS.",
+            "generated/astropy/time/core.py:3121-3127: unknown kwargs raise TypeError naming the bad key. :3136-3146: subfmt keyword path. Both match reference behavior.",
+            "generated/astropy/time/formats.py:280-291: precision setter maps None to 3 and checks per-class range (0..9 for Time, -99..99 for TimeDelta at :2097), same as reference.",
+            "Error text matches reference.diff verbatim: core.py:567 zero-size message, :583 'format must be a string', :612 'keyword is optional:\\n' list."
+          ],
+          "deficiency": "None. __new__ (core.py:2785) is unchanged, as in the reference."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/core.py:31-40: pre-existing `from .formats import (...)`; the patch only adds TimeNumeric (core.py:38).",
+            "generated/astropy/time/formats.py:1-25 imports only stdlib, numpy, erfa, astropy.units, and astropy.utils and .utils; formats.py does not import core."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/formats.py:5 `import re` and formats.py:18 `two_sum`/`day_frac` imports are pre-existing.",
+            "The patch adds no third-party package or new import module."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Parsing and rendering live in the format class: generated/astropy/time/formats.py:2189-2372.",
+            "Format guessing lives in TimeBase._get_time_fmt: generated/astropy/time/core.py:554-615.",
+            "Keyword validation and subfmt routing live in TimeDelta.to_value: generated/astropy/time/core.py:3121-3146.",
+            "The unit-less numeric warning sits in TimeDelta.__init__: core.py:2823-2832."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/formats.py:45: `__all__` includes TimeDeltaQuantityString.",
+            "generated/astropy/time/formats.py:177 (`cls._registry[cls.name] = cls` in __init_subclass__) auto-registers the class via `name = \"quantity_str\"` at formats.py:2286. TIME_DELTA_FORMATS is therefore populated.",
+            "formats.py:2134: TimeDeltaJD gains the TimeUnique marker, as in reference.diff.",
+            "patch.diff adds docs/changes/time/15264.api.rst and 15264.feature.rst."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": false,
+          "evidence": [
+            "generated/astropy/time/formats.py:2338-2350: TimeDeltaQuantityString.to_value re-implements the coercion inline: `try: self._select_subfmts(out_subfmt) except ValueError: out_subfmt = \"*\"`.",
+            "Base helper: astropy/time/formats.py:184-196 defines TimeFormat._get_allowed_subfmt, which does exactly this. It is used by the repo's own paths: base core.py:657-659 (format setter) and base core.py:1328-1329 (_apply).",
+            "reference.diff: to_value calls `self._get_allowed_subfmt(out_subfmt)` instead of re-implementing it."
+          ],
+          "deficiency": "Minor. The candidate duplicates the existing _get_allowed_subfmt coercion instead of calling it, which is a small parallel path. Behavior is identical, so this is a convention deviation, not a functional failure. The other extension mechanisms are used correctly: __init_subclass__ registration, _check_val_type/set_jds/to_value overrides, the TimeUnique marker, and _select_subfmts."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/core.py:3136-3146: TimeDelta.to_value delegates subformat handling to TimeBase.to_value (core.py:924-1003, `tm._time.to_value(parent=tm, **kwargs)`).",
+            "generated/astropy/time/formats.py:2189-2372 owns all string parsing and rendering; core.py only routes."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Error wording matches reference.diff (core.py:567, :583, :612) and the existing 'Input values did not match ...' style.",
+            "Docstrings were updated: core.py:561-565 (guessing), :2726 (FORMATS), :2760-2774 (precision/in_subfmt/out_subfmt and keyword-only note), :3079 (to_value format list).",
+            "Tests follow the repo style of module-level parametrize lists (candidate test_delta.py, test_basic.py)."
+          ],
+          "deficiency": "Minor and shared with the reference: the TimeBase.precision docstring still says 'between 0 and 9' (core.py:788-793), though TimeDelta now accepts -99..99. The duplicated helper is charged under extension_point_adherence."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Guess order: TimeDeltaJD (now TimeUnique, formats.py:2134) is tried before datetime and quantity_str, so numeric input resolves to jd and timedelta objects to datetime. This matches reference.",
+            "Traced by reading: TimeDelta('2.5hr') -> '2hr 30min'; TimeDelta('3e7s') -> '347d 5hr 20min'; out_subfmt='d' -> '347.222d'; TimeDelta('-1.5d') -> '-1d 12hr'; TimeDelta('1yr') -> '365d 6hr'; '1d 23hr 59min 59.9999s' -> '2d' at default precision.",
+            "The 30000010 s subfmt table (yr 0.951yr, d 347.222d, hr 8333.336hr, min 500000.167min, s 30000010.0s, multi) matches the reference test expectations.",
+            "Invalid strings, the zero-size guess error, the TypeError for a non-str format, and the unit-less warning (core.py:2823-2832) all match reference behavior."
+          ],
+          "deficiency": "None against the reference. Note: the zero-size-string and format=\"\" behavior changes from the original are shared with the reference and are not candidate-specific."
+        }
+      ],
+      "passed": false,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/astropy__astropy-15264/revision-06/run-01/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "astropy/time/tests/test_basic.py",
+          "astropy/time/tests/test_delta.py",
+          "astropy/time/tests/test_quantity_interaction.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies=true; no commands run; api_inspection empty (no verified API facts to contradict).",
+            "Generated tree differs from the original snapshot only in the 9 files named in patch.diff (core.py, formats.py, three test files, docs/time/index.rst, docs/whatsnew/6.0.rst, and two new docs/changes/time files).",
+            "Staged diff in generated/ matches patch.diff line-for-line in counts: core.py +88/-43 and formats.py +171/-4.",
+            "Candidate test assertion at astropy/time/tests/test_delta.py:754-756 expects value \"21.123456789012\" for TimeDelta(\"21.123456789012345s\", precision=12). Rendering path formats.py:2221 (round) and formats.py:2239-2240 (appends \"s\") produces \"21.123456789012s\". The reference expects the \"s\" suffix (reference.diff test_quantity_str_precision: \"21.123456789012s\")."
+          ],
+          "deficiency": "Not a failure of this criterion (no tests are run here): the patch applies. Separately, the candidate's added assertion at astropy/time/tests/test_delta.py:754-756 is wrong and would fail if run, because the implementation appends the 's' unit suffix (formats.py:2240)."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "TimeDeltaQuantityString is defined in astropy/time/formats.py:2244 next to the other TimeDelta formats (TimeDeltaJD at 2142, TimeDeltaDatetime at 2149), as in the reference.",
+            "TimeDelta.__init__ keyword-only parameters and format-guess warning live in astropy/time/core.py:2807-2840, the same class as the reference.",
+            "Format guessing and the zero-size guard live in TimeBase._get_time_fmt at astropy/time/core.py:555-615, as in the reference."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "astropy/time/core.py:2807-2818: TimeDelta.__init__(val, val2=None, format=None, scale=None, *, precision=None, in_subfmt=None, out_subfmt=None, copy=False). This matches the reference signature exactly.",
+            "formats.py:2104-2105 sets TimeDeltaFormat precision bounds to -99..99; formats.py:286-296 setter maps None to the default 3 and raises 'precision attribute must be an int between {min} and {max}', matching the reference message.",
+            "formats.py:2244-2254 defines name='quantity_str' and subfmts multi/yr/d/hr/min/s, matching the reference.",
+            "core.py:3128-3152: to_value keyword validation raises TypeError \"TimeDelta.to_value() got an unexpected keyword argument '{name}'\" and the positional-plus-subfmt case raises ValueError \"cannot specify 'subfmt' and positional argument that is not a valid format\", both matching the reference.",
+            "TimeDelta.__new__ still takes precision/in_subfmt/out_subfmt positionally (core.py:2794-2797). The reference does the same, so this is shared and not a generated-specific gap."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "core.py:39 imports TimeNumeric from .formats, following the existing one-way core -> formats import.",
+            "formats.py has no import of core or Time/TimeDelta. Only the stdlib import 'math' is added."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "formats.py:2244 subclasses TimeDeltaFormat, so it registers via TimeFormat.__init_subclass__ into TIME_DELTA_FORMATS (base registration at formats.py:162-175), as the reference does.",
+            "formats.py:53 adds \"TimeDeltaQuantityString\" to __all__, so astropy/time/__init__.py's 'from .formats import *' exports it.",
+            "formats.py:2142 TimeDeltaJD(TimeDeltaNumeric, TimeUnique) makes it guessable, matching the reference.",
+            "Registry order sec, jd, datetime, quantity_str gives the expected guess order (candidate test test_formats_list)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "formats.py imports only 'math' (stdlib) as new; re, u, day_frac were already imported by formats.py.",
+            "No new third-party or repo-external dependency."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Parsing and rendering stay in the format class (formats.py:2296-2360: _check_val_type, _parse, set_jds, _render, to_value), as in the reference.",
+            "Format guessing, zero-size rejection, and the unitless-numeric warning stay in TimeBase/TimeDelta (core.py:564-575, core.py:2827-2837), as in the reference.",
+            "Multi-component rounding and carry helper is a module-level private function (formats.py:2207-2241). Placement differs from the reference's methods but is in the same module and layer."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Uses the existing TimeFormat hooks: _check_val_type, set_jds, to_value(parent, out_subfmt), value property, precision setter via class attrs, and _get_allowed_subfmt for subfmt fallback.",
+            "Uses the existing TimeBase.to_value routing (core.py:925-1004) and the TimeDelta.to_value dispatch (core.py:3128-3152), not a parallel path.",
+            "TimeDeltaJD gains TimeUnique via the existing marker-class mechanism, the same as the reference."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Time-only astropy_time pseudo-format is added only when self is a Time (core.py:578-580 region, 'if isinstance(self, Time)'), as in the reference.",
+            "Formats do not reference Time or TimeDelta classes; the boundary is preserved.",
+            "_apply's transient TimeJD precision=0 (core.py:1281 in original, unchanged in generated) is immediately replaced by NewFormat(..., precision=self.precision), so it does not leak. The reference changed it to None, but this is cosmetic."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Error messages follow the existing style: TypeError 'format must be a string', ValueError 'Format {format!r} is not one of the allowed formats', and 'Input values did not match ... :\\n' (core.py:581-615).",
+            "New tests use the file's existing class-based style (test_delta.py:47 TestTimeDelta, :692 TestQuantityString) and parametrize usage.",
+            "Import order in test_delta.py is consistent with isort conventions."
+          ],
+          "deficiency": "None. The wrong assertion at test_delta.py:754-756 is a test-correctness issue, reported under patch_and_checks."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "quantity_str grammar and parsing: formats.py:2198-2206 regex and formats.py:2308-2324 _parse (sign once at start, each unit once, ordered yr/d/hr/min/s, at least one component). Behavior matches the reference's invalid list (e.g. '1.0', '2d -1s', '1sec' rejected).",
+            "Multi rendering: formats.py:2207-2241 drops zero components, carries overflow (60s->1min, 60min->1hr, 24hr->1d), and returns '0.0s' for zero. Matches the reference examples (e.g. '2hr 30min', '347d 5hr 20min 10.0s', '1d 16hr').",
+            "Single-unit rendering and precision: formats.py:2336-2342 and the precision setter give the reference outputs ('368.85d', '0.951yr', '1.666666667d').",
+            "Guessing: core.py:564-575 rejects zero-size input and tries TimeUnique formats in registry order. core.py:581 raises TypeError for non-str format, matching the reference. Unitless numeric TimeDelta warns only when format is None (core.py:2827-2837), matching the reference.",
+            "Shared with the reference, not generated-specific: the zero-size guard now makes TimeDelta([]) raise, where the original accepted it with a warning (original core.py:2804-2815 via _get_format). TimeDelta(float32) errors change type from TypeError to ValueError because of guessing. Both are in the reference's own behavior, so they are not counted against the generated patch.",
+            "Minor non-behavioral differences from the reference: the val2 check precedes the dtype check in _check_val_type (formats.py:2296-2303), and the non-multi value uses jd1*f + jd2*f instead of (jd1+jd2)*f (formats.py:2342). Both can change error wording or a last-bit float, not the documented behavior."
+          ],
+          "deficiency": "None against the reference behavior. The one wrong test expectation (test_delta.py:754-756) is an error in the candidate's added tests, not in the feature implementation."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/astropy__astropy-15264/revision-06/run-02/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "astropy/time/tests/test_basic.py",
+          "astropy/time/tests/test_delta.py",
+          "astropy/time/tests/test_quantity_interaction.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies=true, commands=[] (no tests executed; judged by reading)",
+            "Scratch copy of base/astropy and base/docs: `patch -p1 --dry-run` and apply both succeed; resulting astropy/ and docs/ trees are identical to generated/ (diff -r empty)",
+            "patch.diff touches astropy/time/core.py, astropy/time/formats.py, three test files, docs/time/index.rst, docs/whatsnew/6.0.rst, and two new changelog fragments"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/formats.py:2189-2355 places the quantity_str parser, formatter, and TimeDeltaQuantityString beside TimeDeltaDatetime (formats.py:2141), the same module the reference uses (reference.diff:319)",
+            "generated/astropy/time/core.py:557-615 holds format guessing in TimeBase, where reference.diff:52-97 also puts it",
+            "generated/astropy/time/core.py:2803-2836 holds TimeDelta.__init__ and the unit warning, matching reference.diff:132-188",
+            "docs/changes/time/15264.api.rst and 15264.feature.rst use the same paths as reference.diff:752-771"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/core.py:2803-2813: __init__(val, val2=None, format=None, scale=None, *, precision=None, in_subfmt=None, out_subfmt=None, copy=False), identical to reference.diff:137-148",
+            "generated/astropy/time/core.py:2790-2800: __new__ untouched, as in base core.py:2773-2787 and reference",
+            "generated/astropy/time/formats.py:281-291: precision None\u21923, range check with a clear message; formats.py:145 (0,9) for Time and formats.py:2097 (-99,99) for TimeDelta, matching reference.diff:276-302",
+            "generated/astropy/time/formats.py:2297: name='quantity_str'; core.py:3121-3144: to_value kwarg validation and subfmt keyword, same contract as reference.diff:217-250",
+            "core.py:580-588: TypeError for non-str format and ValueError for unknown format, identical to reference.diff:70-77"
+          ],
+          "deficiency": "No failure. Non-blocking divergence: formats.py:2307-2314 checks val2 before dtype, while reference.diff:415-422 checks dtype first. The two differ only in which error type is raised for input that is both non-string and has val2. Not in the stated requirements."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/core.py:31-40: TimeNumeric is added to the existing `from .formats import (...)` block, preserving the core\u2192formats direction",
+            "generated/astropy/time/formats.py imports are unchanged: re, astropy.units as u, and two_sum/day_frac were already imported (formats.py:4, 13, 18)",
+            "The patch adds no new core import into formats.py"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/formats.py:177: `cls._registry[cls.name] = cls` in __init_subclass__ registers TimeDeltaQuantityString via name='quantity_str' (formats.py:2297)",
+            "generated/astropy/time/formats.py:45: 'TimeDeltaQuantityString' added to __all__",
+            "generated/astropy/time/formats.py:2134: TimeDeltaJD now inherits TimeUnique, so it participates in guessing (core.py:570-577)",
+            "TimeDelta docstring format list updated to include 'quantity_str' (core.py TimeDelta class docstring)"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "Only the stdlib `re` (formats.py:4) and existing numpy, erfa, and astropy.units are used by the new code",
+            "test_delta.py adds stdlib `import warnings`; no new third-party dependency appears in patch.diff"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/formats.py:2198-2254: parsing and multi-component formatting live in the format layer",
+            "generated/astropy/time/formats.py:2328-2357: TimeDeltaQuantityString.to_value formats output in the format class",
+            "generated/astropy/time/core.py:557-615: format guessing stays in TimeBase._get_time_fmt",
+            "generated/astropy/time/core.py:2825-2836: unit-missing warning stays in TimeDelta.__init__ (reference uses _check_numeric_no_unit, reference.diff:176-188)",
+            "generated/astropy/time/core.py:3144: TimeDelta.to_value delegates the format work to the base class"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "New format reuses the existing subfmts tuple pattern and _select_subfmts (formats.py:2298-2305, 2334), and the TimeUnique marker (formats.py:2256)",
+            "Registration uses the existing _registry/__init_subclass__ mechanism (formats.py:177)",
+            "New hooks follow the existing class-attribute pattern (_default_scale, _registry): core.py:485 `_extra_guess_formats` (set at core.py:1809 on Time), and formats.py:145/2097 `_precision_range`",
+            "Reference uses isinstance(self, Time) instead (reference.diff:57-58). The class-attribute hook is an acceptable alternative"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/formats.py:2339 uses jd2_filled for masked-value handling, as existing formats do (formats.py:1144)",
+            "generated/astropy/time/core.py:3144 delegates format and subfmt handling to base TimeBase.to_value rather than duplicating it",
+            "No transport, persistence, or framework code is touched"
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "core.py:614: 'Input values did not match any of the formats where the format keyword is optional' keeps the existing phrasing",
+            "formats.py:288: 'precision attribute must be an int between {low} and {high}' follows the existing message pattern",
+            "core.py:571: zero-size message matches reference.diff:569",
+            "Tests are added to the existing modules test_basic.py, test_delta.py, and test_quantity_interaction.py, and the stale assertion in test_basic and the TypeError\u2192ValueError change in test_quantity_interaction are updated the same way as the reference",
+            "core.py:3124 hard-codes 'TimeDelta.to_value()' where the reference uses __qualname__ (same output text)"
+          ],
+          "deficiency": "No failure. Nits only: test_delta.py adds a function-local import (`from astropy.time.formats import TimeDeltaQuantityString`) and a `_text` helper, and docs/time/index.rst:666-672 rewrites an example output."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "quantity_str parse/format: formats.py:2198-2254 and 2328-2357; subformats: formats.py:2298-2305",
+            "Guess without format: core.py:570-615, with jd tried first (TimeDeltaJD is TimeUnique at formats.py:2134); TimeNumeric string handling (formats.py:~482-500) accepts '1.0' and rejects non-numeric text with TypeError",
+            "Unitless warning preserved: core.py:2825-2836; existing expectations at base test_delta.py:645-690 still reach this path",
+            "Precision default 3 and range: formats.py:281-291, 2097",
+            "Keyword-only init and to_value subfmt keyword: core.py:2803-2813, 3133-3144",
+            "_apply's intermediate precision=0 (core.py:1281) is overwritten by precision=self.precision (core.py:1327), so the reference's change at reference.diff:105-106 has no observable effect"
+          ],
+          "deficiency": "No failure. Behavior shared with the reference, so not patch-specific: (a) zero-size input with no format now raises (core.py:570-572; reference.diff:41-48), where base built an empty jd TimeDelta with a warning (base core.py:2797 and _get_format at base core.py:2804); (b) format='' now errors instead of being treated as absent (core.py:576-589 vs base core.py:2797 `format or`); (c) a glob out_subfmt matching several names (e.g. 'm*') passes setter validation via _select_subfmts (formats.py:436-456) and then fails at u.day.to(out_subfmt) (formats.py:2350) when .value is read; reference.diff:487-495 has the same path; (d) in_subfmt is validated for quantity_str but does not affect parsing (formats.py:2316-2326), as in the reference."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/astropy__astropy-15264/revision-06/run-03/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "astropy/time/tests/test_basic.py",
+          "astropy/time/tests/test_delta.py",
+          "astropy/time/tests/test_quantity_interaction.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json: \"patch_applies\": true, \"commands\": [] (no tests executed, as specified for this experiment).",
+            "Generated tree differs from base only in astropy/time/core.py, astropy/time/formats.py, and the three test files, matching the five files in judge-context/patch.diff.",
+            "generated/astropy/time/core.py:3126-3131 and generated/astropy/time/formats.py:2320-2321 are consistent with the patch hunks."
+          ],
+          "deficiency": "None. Tests were not run, which is expected for this experiment; behavior was judged by reading the code."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "Guessing logic stays in TimeBase._get_time_fmt (generated/astropy/time/core.py:558-607), the same class that owns the reference change.",
+            "TimeDelta.__init__ and to_value stay in the TimeDelta class (generated/astropy/time/core.py:2803-2834 and 3053-3150).",
+            "Precision limits live in TimeFormat/TimeDeltaFormat (generated/astropy/time/formats.py:145, 278-290, 2098).",
+            "The quantity_str parser, renderer, and class are in formats.py (generated/astropy/time/formats.py:2191-2374), where the reference also places them.",
+            "Docs and changelog entries are under docs/time, docs/whatsnew, and docs/changes/time, matching the reference."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "TimeDelta.__init__ signature is (val, val2=None, format=None, scale=None, *, precision=None, in_subfmt=None, out_subfmt=None, copy=False) (generated/astropy/time/core.py:2803-2812), identical to the reference.",
+            "Error text matches the reference: \"format must be a string\" (core.py:579-580), \"precision attribute must be an int between -99 and 99\" (formats.py:285-290), \"TimeDelta.to_value() got an unexpected keyword argument\" (core.py:3126-3131), and \"cannot specify 'subfmt' and positional argument that is not a valid format\" (core.py:3142-3148).",
+            "TimeDeltaQuantityString.to_value(self, parent=None, out_subfmt=None) (formats.py:2349) matches the reference signature; format name is \"quantity_str\" (formats.py:2320).",
+            "The reference's extra helpers (parse_string, get_multi_comps, fix_comp_vals_overflow, re_ydhms) are absent, but they are incidental private-style helpers, not contract."
+          ],
+          "deficiency": "None. Only incidental helper names differ from the reference."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "core.py:31-36 adds TimeDeltaNumeric to the existing `from .formats import (...)` block, which is the existing core-to-formats direction.",
+            "formats.py adds no new imports; re, np, u, and day_frac are already imported (base formats.py:4, 11, 13, 18)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "TimeDeltaQuantityString sets name = \"quantity_str\" (formats.py:2320) and is auto-registered by the existing TimeFormat.__init_subclass__ (formats.py:164-177).",
+            "\"TimeDeltaQuantityString\" is added to formats.py __all__ (formats.py:52), so astropy/time/__init__.py's `from .formats import *` exports it.",
+            "TimeDeltaJD now inherits TimeUnique (formats.py:2135), matching the reference, so it participates in format guessing."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No new third-party or package dependencies. Only the existing numpy, astropy.units, and utils helpers are used."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Parsing and rendering of quantity_str live in the format layer (formats.py:2191-2374), not in TimeDelta.",
+            "The guessing extension point is a TimeBase class attribute (core.py:486) that Time overrides with astropy_time (core.py:1808), replacing the hard-coded append. Base code therefore no longer names a Time-only format.",
+            "Module-level private helpers are used rather than class methods. formats.py already has module-level helpers (for example _check_val_type_not_quantity), so this is consistent."
+          ],
+          "deficiency": "None. Using module-level helpers instead of class methods is an acceptable alternative to the reference."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "quantity_str uses the existing subfmts tuple, _select_subfmts validation, the __init_subclass__ registry, the TimeUnique marker, and _check_scale.",
+            "TimeDelta.to_value delegates to super().to_value(self.format, **kwargs) (core.py:3150), using the existing dispatch path.",
+            "Subformat fallback at formats.py:2353-2357 re-implements what the existing classmethod _get_allowed_subfmt (formats.py:186-194) already does; the reference calls that helper directly."
+          ],
+          "deficiency": "Minor: the subformat fallback at formats.py:2353-2357 duplicates the existing _get_allowed_subfmt logic instead of reusing it. Behavior is the same as the reference, so it is not a failure."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "quantity_str parsing and rendering are self-contained in formats.py and depend only on day_frac and numpy.",
+            "TimeDelta.to_value only validates keywords and delegates rendering to the format object (core.py:3126-3150), keeping the boundary between TimeDelta and its format classes.",
+            "TimeBase._get_time_fmt (core.py:568-578) only consults the format registry and an extension tuple, not format internals."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Error wording matches the reference (core.py:599-607 for \"Input values did not match ... :\\n- 'name': err\"; formats.py:2327-2332 for the val2 and must-be-strings messages).",
+            "Tests use the repo's pytest.raises/parametrize style (generated/astropy/time/tests/test_delta.py), with additions only; no original tests were removed.",
+            "Literal default precision 3 at formats.py:282-283 matches the original `precision = 3` literal in _init_from_vals."
+          ],
+          "deficiency": "Minor: the to_value keyword error hard-codes \"TimeDelta.to_value()\" (core.py:3128) rather than using __qualname__ as the reference does. No functional impact."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Multi-component normalization handles fraction<0 carry (formats.py:2224-2236). Traced \"2.5yr 3.5d 4.5hr 5.5min 6.789s\" to \"916d 19hr 35min 36.789s\", matching the test table.",
+            "Overflow carry for \"1d 23hr 59min 59.9999s\" to \"2d\" is handled by the minutes/hours/days carry (formats.py:2237-2246), matching the reference.",
+            "Negative single-unit output: \"-1yr 2d 23hr 10min 5.6s\" with subfmt d gives \"-368.215d\" (formats.py:2263-2273), the same as the reference.",
+            "Unitless numeric input without format goes to jd and warns (core.py:2824-2834), matching the original warning. timedelta objects go to datetime through guessing. Zero-size guessing raises (core.py:568-575), as in the reference.",
+            "Time keeps the 0-9 precision range (formats.py:145), and TimeDelta uses -99..99 (formats.py:2098). Invalid subfmts fall back to multi in to_value, matching the reference."
+          ],
+          "deficiency": "None blocking. in_subfmt is accepted and validated but not used for parsing; the reference behaves the same way."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/astropy__astropy-15264/revision-06/run-04/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "astropy/time/tests/test_basic.py",
+          "astropy/time/tests/test_delta.py",
+          "astropy/time/tests/test_quantity_interaction.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies is true; commands is empty; no test execution was performed for this experiment.",
+            "patch.diff touches astropy/time/core.py, astropy/time/formats.py, three test files, and three docs files (lines 1, 266, 515, 540, 808, 824, 838, 849, 883).",
+            "Removed lines in patch.diff correspond to intended changes: _get_format removal, precision=3 default removal, old guess branch, old 'No time format' message, TimeDeltaJD base change."
+          ],
+          "deficiency": "None blocking. Tests were not run, so pass/fail of the new test assertions is unverified."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "formats.py:2267 defines TimeDeltaQuantityString in the time-delta section of formats.py.",
+            "formats.py:2134 defines TimeDeltaJD(TimeDeltaNumeric, TimeUnique).",
+            "core.py:2800 TimeDelta.__init__ and core.py:3051 TimeDelta.to_value contain the TimeDelta-specific logic.",
+            "core.py:554-612 _get_time_fmt contains the generic format-guessing logic, same location as the reference."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "core.py:2800-2811 TimeDelta.__init__ has keyword-only precision, in_subfmt, out_subfmt, copy after scale, matching reference.diff @@ -2789.",
+            "core.py:3123-3130 raises TypeError for unknown to_value keywords; core.py:3140-3146 raises ValueError for subfmt with a positional non-format argument; both match reference messages.",
+            "formats.py:2097 sets time-delta precision range (-99, 99); formats.py:145 keeps Time range (0, 9); formats.py:282-283 maps None to 3.",
+            "core.py:563-567 zero-size ValueError; core.py:580-581 'format must be a string' TypeError; core.py:610-612 bulleted problems message, matching reference."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "core.py:36 imports TimeDeltaNumeric from .formats, the existing core-to-formats direction.",
+            "formats.py imports only re, numpy, astropy.units, and utils (formats.py:4-18); no import of core is added."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "formats.py:52 adds TimeDeltaQuantityString to __all__.",
+            "formats.py:2267 defines name = 'quantity_str' in the class; registration uses the existing __init_subclass__ mechanism (formats.py:180 shows the surrounding hook).",
+            "formats.py:2134 adds TimeUnique to TimeDeltaJD so guessing includes jd, matching reference.diff."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No new third-party or project dependencies. formats.py uses re (line 4), numpy (line 11), astropy.units (line 13), and utils.day_frac/two_sum (line 18), all already imported."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Parsing and formatting live in the format class: module helpers at formats.py:2191-2265 and methods at formats.py:2330-2365.",
+            "core.py keeps generic guessing (core.py:554-612) and the TimeDelta-specific unitless warning (core.py:2823-2830).",
+            "Reference puts parse/multi logic on class methods; generated uses module-level private helpers, consistent with formats.py's existing module helpers (_regexify_subfmts at formats.py:82)."
+          ],
+          "deficiency": "None. The helper-placement difference from the reference is an acceptable alternative."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Uses existing mechanisms: name-based registration, subfmts with _get_allowed_subfmt (formats.py:2338-2345), TimeUnique for guessing (formats.py:2134, 2267), _check_scale (formats.py:2331).",
+            "Precision range uses a class attribute _precision_range (formats.py:145, 2097), the same pattern as the reference's _min_precision/_max_precision.",
+            "No parallel registration or dispatch path is introduced."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Format-specific parsing stays in formats.py (formats.py:2191-2365), not core.py.",
+            "TimeDelta.to_value subfmt branch delegates to super().to_value (core.py:3140-3146), which still routes through _time.to_value, preserving the existing layering."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Error wording follows existing patterns: 'Input values for {name} class must be strings' (formats.py:2330 area) and 'Input values did not match the format class ...' (core.py:600-606).",
+            "New tests are a class in test_delta.py, matching the file's existing TestTimeDelta class style (test_delta.py:45 in base).",
+            "docs/time/index.rst subformat table (base lines ~326-334, 'The complete list of subformat options for the TimeDelta formats') does not add the quantity_str row that reference.diff adds at hunk @@ -330."
+          ],
+          "deficiency": "Minor, non-blocking: the quantity_str row is missing from the docs subformat table (base docs/time/index.rst ~326-334). This is documentation completeness rather than an enumerated convention."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "quantity_str parsing and output: formats.py:2191-2265 and 2330-2365.",
+            "Keyword-only init (core.py:2800-2811), precision range (formats.py:2097, 282-292), guessing with zero-size and format-type errors (core.py:563-581), to_value validation (core.py:3123-3146).",
+            "Unitless warning fires only for numeric formats (core.py:2823-2830), matching reference _check_numeric_no_unit.",
+            "Shared limitation (also in reference, so not counted against the candidate): an out_subfmt glob naming a non-multi subformat such as 'h*' passes _select_subfmts, but the non-multi branch calls u.day.to(subfmt) (formats.py ~2357), which cannot parse a glob. Reference uses (jd*u.day).to_value(subfmt) and fails the same way."
+          ],
+          "deficiency": "None against the reference. The glob limitation above is a shared gap, not a deviation introduced by the candidate."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/astropy__astropy-15264/revision-06/run-05/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "astropy/time/tests/test_basic.py",
+          "astropy/time/tests/test_delta.py",
+          "astropy/time/tests/test_quantity_interaction.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json:2-3 records patch_applies=true and no executed commands; no test results are claimed here.",
+            "diff -rq base vs generated lists exactly the files the patch touches (astropy/time/core.py, formats.py, the three test files, docs/time/index.rst, docs/whatsnew/6.0.rst, docs/changes/time/15264.api.rst and .feature.rst); no stray edits.",
+            "generated/astropy/time/core.py:2803-2824 and generated/astropy/time/formats.py:2197-2356 match the hunks in patch.diff."
+          ],
+          "deficiency": "None blocking. Tests were not executed, per the experiment setup, so pass/fail on test IDs is judged by reading only."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/formats.py:2197 places class TimeDeltaQuantityString beside TimeDeltaDatetime, the same module and location as the reference (reference.diff formats.py hunk @@ -2175).",
+            "generated/astropy/time/core.py:554-611 holds the format-guess and zero-size logic in TimeBase._get_time_fmt, where the original code already lived.",
+            "generated/astropy/time/core.py:2803-2824 holds the keyword-only TimeDelta.__init__, and core.py:3121-3148 holds the to_value keyword validation and subfmt routing.",
+            "generated/astropy/time/formats.py:146, 280-291, 2096 hold the precision default and per-class range in the format layer."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/core.py:2803-2814 gives __init__(val, val2=None, format=None, scale=None, *, precision=None, in_subfmt=None, out_subfmt=None, copy=False), identical to reference.diff lines 137-148.",
+            "core.py:2784-2795 (__new__) still accepts precision/in_subfmt/out_subfmt positionally. This is unchanged from base and from the reference, so the keyword-only restriction lives only in __init__.",
+            "core.py:580 raises TypeError('format must be a string'); formats.py:287-288 raises 'precision attribute must be an int between {low} and {high}' with -99/99 for TimeDelta, the same text as the reference test expectation.",
+            "core.py:3124-3129 raises TypeError \"TimeDelta.to_value() got an unexpected keyword argument '<name>'\", matching the reference regex.",
+            "Accepted vs rendered: precision is rendered (formats.py:2296, 2313); out_subfmt is rendered (formats.py:2335-2350); in_subfmt is validated by the base setter but not consulted by quantity_str parsing (formats.py:2276-2284), which is also true of the reference set_jds."
+          ],
+          "deficiency": "None. in_subfmt is accepted but has no effect on quantity_str parsing; the reference behaves the same way."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/core.py:33-38 imports TimeDeltaNumeric from .formats, following the existing core-to-formats direction.",
+            "formats.py adds no imports. It uses re (formats.py:4), astropy.units as u (formats.py:13), and two_sum/day_frac (formats.py:18), which were already imported."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "formats.py:2239 sets name = \"quantity_str\", so TimeFormat.__init_subclass__ registers it into TIME_DELTA_FORMATS via the inherited _registry (formats.py:2095).",
+            "formats.py:56 adds \"TimeDeltaQuantityString\" to __all__, which the package's `from .formats import *` (astropy/time/__init__.py) exports.",
+            "formats.py:2133 makes TimeDeltaJD(TimeDeltaNumeric, TimeUnique), so jd takes part in format guessing, as in reference.diff line 311.",
+            "FORMATS order is sec, jd, datetime, quantity_str, as in the TimeDelta docstring and the reference."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "The patch adds no packages. formats.py uses stdlib re and the existing astropy/numpy/erfa imports only."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Parsing and rendering live in the format class: formats.py:2250-2262 (_parse), 2265-2274 (_check_val_type), 2285-2333 (_render), 2335-2354 (to_value).",
+            "core.py only dispatches: core.py:3134-3148 routes subfmt and format to the format, and core.py:2826-2836 adds the unit-less warning.",
+            "This is the same layering as reference.diff: parsing in formats.py, dispatch and guessing in core.py."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Uses the existing subfmts + _get_allowed_subfmt machinery (formats.py:2240-2246, 2335-2340) and the TIME_DELTA_FORMATS registry through name.",
+            "Precision range uses a class attribute override (formats.py:146 base, 2096 TimeDeltaFormat), the same extension style as reference _min_precision/_max_precision.",
+            "Non-blocking note: the subfmt tuples are 4-tuples, (name, None, None, None) at formats.py:2240-2246. The reference uses 3-tuples, and string formats use the 3-tuple shape (formats.py:1658 `_, _, str_fmt = subfmts[0]`; formats.py:1927 `for _, regex, _ in subfmts`). No code path unpacks these tuples for quantity_str, so this has no functional effect."
+          ],
+          "deficiency": "None blocking. Tuple arity is a cosmetic deviation from the string-format convention."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "The precision default moved into the format layer: formats.py:284-289 sets None to 3 in the setter. core.py no longer defaults precision in _init_from_vals.",
+            "TimeAstropyTime forwards precision into the format constructor (formats.py:1033), which goes through the setter, so None is handled there.",
+            "_apply still builds an intermediate TimeJD with precision=0 (core.py:1278-1281), but the public format is rebuilt with self.precision (core.py:1324), so 0 does not leak into outputs."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Messages follow the repo style: \"Input values did not match ...\" (core.py:607-611), \"Time delta '...' does not match quantity_str format\" (formats.py:2250-2262), and the precision range message (formats.py:287-288).",
+            "Changelog fragments follow docs/changes/time convention: 15264.api.rst and 15264.feature.rst.",
+            "Tests are appended to the existing modules (test_delta.py, test_basic.py, test_quantity_interaction.py) using parametrize in the file's style. The one existing assertion changed in test_basic and test_quantity_interaction is the intended behavior change, as in the reference.",
+            "Non-blocking differences from the reference: formats.py:2265-2270 checks val2 before the dtype (reference checks dtype first), which changes only which error is raised for invalid two-argument input. docs/time/index.rst:328-332 is not extended with a quantity_str row, which the reference adds."
+          ],
+          "deficiency": "None blocking. Two non-blocking notes listed in evidence."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Parsing matches the reference grammar (formats.py:2186-2194 regex, fullmatch plus the all-None check at formats.py:2250-2262). It accepts '2yr 3d 4hr 5min 6.789s', '  100.0 d1.0123456789012345 s ', '+ 2.5hr' and rejects '', '+', '1.0', '1.0s 2.0s', '2min +1s', '1sec'.",
+            "Multi rendering with carry (formats.py:2285-2333) gives '347d 5hr 20min 10.0s', '1d 23hr 59min' for 1d 23hr 58min 59.9999s, '2d' for 1d 23hr 59min 59.9999s at precision 3, and '0.0s' for zero. Unit subformats give '0.951yr', '347.222d', '8333.336hr', '500000.167min', '30000010.0s'. A negative input with out_subfmt='d' gives '-368.215d' (formats.py:2295-2296).",
+            "The ValueError for subfmt plus a non-format positional arg is at core.py:3141-3145, matching the reference regex. The unknown-subfmt fallback to multi comes from base _get_allowed_subfmt (core.py ~184-195 in base; the reference test expects multi).",
+            "Guessing: zero-size error (core.py:564-568), TypeError for non-str format (core.py:579-580), and unit-less warning only when format is None and the value is numeric (core.py:2826-2836).",
+            "Intentional change from base that matches the reference: an empty array with no format now raises (core.py:564-568). This is a behavior change, but the reference does the same."
+          ],
+          "deficiency": "None blocking. No checked reference behavior diverges from the candidate code."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/astropy__astropy-15264/revision-06/run-06/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "astropy/time/tests/test_basic.py",
+          "astropy/time/tests/test_delta.py",
+          "astropy/time/tests/test_quantity_interaction.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json: patch_applies=true, commands=[], api_inspection=[]; no tests executed for this experiment.",
+            "Base blob hashes match the patch index lines: astropy/time/core.py 32c0af6, formats.py 1d01871, tests/test_basic.py 39edda8, tests/test_delta.py e4e85b4, tests/test_quantity_interaction.py 52dda8c (git hash-object on the base snapshot).",
+            "`git diff --cached` in the generated tree is byte-identical to patch.diff (9 files: core.py, formats.py, 3 test files, docs/changes/time/15264.api.rst, 15264.feature.rst, docs/time/index.rst, docs/whatsnew/6.0.rst)."
+          ],
+          "deficiency": "None. Behavior was verified by reading the code and hand-tracing examples only; nothing was executed."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "TimeDeltaQuantityString is defined in astropy/time/formats.py:2212, after TimeDeltaDatetime (formats.py:2140), in the same module as the reference.",
+            "Format guessing and error aggregation are in astropy/time/core.py:554-614 (_get_time_fmt).",
+            "TimeDelta.__init__ and to_value are in astropy/time/core.py:2808-2840 and ~3120-3152, the same TimeDelta class the reference edits.",
+            "Docs changes land in docs/changes/time/15264.{api,feature}.rst, docs/time/index.rst, and docs/whatsnew/6.0.rst, matching the reference's file set."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "TimeDelta.__init__ signature at astropy/time/core.py:2808-2817 is (val, val2=None, format=None, scale=None, *, precision=None, in_subfmt=None, out_subfmt=None, copy=False), identical to the reference's keyword-only contract.",
+            "precision range hooks: TimeFormat._precision_range=(0,9) at formats.py:145, TimeDeltaFormat._precision_range=(-99,99) at formats.py:2096; setter at formats.py:279-290 maps None to 3 and raises 'between {low} and {high}', which yields 'between -99 and 99' for TimeDelta.",
+            "TimeDelta.to_value validates kwargs (core.py:3124-3129, message 'TimeDelta.to_value() got an unexpected keyword argument ...', same wording as reference); subfmt with a non-format positional raises ValueError (core.py:3140-3146); subfmt-only routes to super().to_value(self.format, ...) (core.py:3147-3152).",
+            "Format name 'quantity_str' at formats.py:2264; FORMATS order becomes ['sec','jd','datetime','quantity_str'] because the class is registered after TimeDeltaDatetime.",
+            "Observation (not a failure, shared with reference and unchanged base code): when val is a TimeDelta, precision/in_subfmt/out_subfmt are accepted but not applied. __new__ replicates with format/copy only, and __init__ only handles scale (core.py:2818-2820)."
+          ],
+          "deficiency": "No contract failure. The TimeDelta-input ignoring of precision/in_subfmt/out_subfmt is identical in the reference."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "core.py:31-36 imports TimeDeltaNumeric from .formats, the same core->formats edge that already exists.",
+            "formats.py adds no imports; re, numpy, astropy.units (u), day_frac and two_sum are already imported at formats.py:4, 11, 13, 18.",
+            "core.py removes the unused 'timedelta' import (core.py:14). Grep shows no remaining uses (only a docstring at core.py:2849)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "class TimeDeltaQuantityString(TimeDeltaFormat, TimeUnique) at formats.py:2212 with name='quantity_str' (formats.py:2264). TimeFormat.__init_subclass__ auto-registers named subclasses into cls._registry, and TimeDeltaFormat._registry=TIME_DELTA_FORMATS (formats.py:2095).",
+            "TimeUnique marking is what makes the format guessable; TimeDeltaJD is now TimeDeltaNumeric+TimeUnique (formats.py:2133), matching the reference.",
+            "__all__ export at formats.py:52; package export works via astropy/time/__init__.py:23 (from .formats import *)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No new third-party or internal dependencies. The new code uses only the existing numpy, erfa-independent numpy operations, astropy.units, and the re module that formats.py already imports (formats.py:4, 11, 13)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Parsing, validation and output formatting live in the format class in formats.py (formats.py:2212-2370), which is the layer that owns format behavior.",
+            "Format guessing, the zero-size guard, the Time-only astropy_time pseudo-format, and the implicit-days warning live in the TimeBase/TimeDelta layer (core.py:565-614, 2829-2837), as in the reference.",
+            "Responsibilities are split the same way as the reference (format class parses/prints; core guesses and dispatches)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Uses the existing extension hooks rather than a parallel path: _registry plus __init_subclass__ (formats.py:2095, 2212), subfmts tuples read by _select_subfmts/_get_allowed_subfmt (formats.py:184-195, 436-462), and the set_jds/to_value/value override pattern (formats.py:2283, 2296, 2371).",
+            "Precision limits use a class-attribute hook (_precision_range, formats.py:145, 2096), the same extension approach as the reference's _min/_max/_default_precision.",
+            "Format guessing reuses the TimeUnique marker and the existing registry loop (core.py:568-582)."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "String grammar and unit arithmetic are encapsulated in formats.py (_QUANTITY_STR_PATTERN formats.py:2187, _parse_quantity_str formats.py:2197). core.py does not parse strings.",
+            "TimeDelta.to_value only routes by the existing FORMATS membership check (core.py:3131-3135) and delegates to TimeBase.to_value; it does not reimplement formatting.",
+            "Errors surface through the existing ValueError/TypeError convention used by the format classes."
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Error texts match the reference: 'format must be a string' (core.py:565-566), 'cannot guess format from input values with zero-size array' (core.py:568-575), 'Input values did not match any of the formats where the format keyword is optional:' with '- name: err' lines and 'from' chaining (core.py:602-614), 'Input values for quantity_str class must be strings' (formats.py:2274 region).",
+            "Naming and layout follow the repo: module-level compiled regex and helper with docstrings (formats.py:2187-2210), numpy-style class docstring with Examples (formats.py:2212-2262), keyword-only args with ** unchanged in __new__.",
+            "Tests use pytest.raises(match=...) like the base tests (test_basic.py, test_quantity_interaction.py).",
+            "Two added lines exceed 88 chars (core.py:3127; candidate test line 713). E501 is disabled in .ruff.toml:54, so this is not a lint failure."
+          ],
+          "deficiency": "None blocking. Two long lines are style-only."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Input grammar: optional sign, ordered optional yr/d/hr/min/s components, optional whitespace, decimal or exponent numbers, at least one component (formats.py:2187-2194, 2197-2210). Physical units: yr=365.25 d, d=24 hr, hr=60 min, min=60 s (formats.py:2205-2208).",
+            "Output subformats multi/yr/d/hr/min/s (formats.py:2296-2334). Multi output omits zero components, uses a single space between components, and outputs a zero delta as '0.0s' (formats.py:2336-2368).",
+            "Carry on rounding overflow (60s->min, 60min->hr, 24hr->d) is handled in _multi_strings (formats.py:2336-2368), matching the reference's fix_comp_vals_overflow. Hand trace: '1d 23hr 59min 59.9999s' at precision 3 gives '2d'; at precision 9 it stays '1d 23hr 59min 59.9999s'.",
+            "precision is honored for multi and single-unit subformats (formats.py:2326, 2345). Signs are applied to the text (formats.py:2300-2330). Keyword-only arguments per the requirement (core.py:2814).",
+            "Non-blocking divergences from the reference: (a) _apply still passes precision=0 to a transient TimeJD (core.py:1281), which the reference changes to None; the value is immediately replaced by precision=self.precision (core.py:1327), so no behavior change. (b) The generated code does not expose the reference's undocumented helpers parse_string/get_multi_comps/fix_comp_vals_overflow/re_ydhms; no reference test calls them."
+          ],
+          "deficiency": "None. The behavioral intent (grammar, physical units, subformats, precision, guessing, keyword-only args) is satisfied."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/astropy__astropy-15264/revision-06/run-07/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "astropy/time/tests/test_basic.py",
+          "astropy/time/tests/test_delta.py",
+          "astropy/time/tests/test_quantity_interaction.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "checks.json:2 records \"patch_applies\": true; \"commands\": [] (no execution was run, per the no-tests instruction).",
+            "generated astropy/time/formats.py:4 imports `re`, formats.py:18 imports day_frac/two_sum from .utils, and formats.py:2190 `_QUANTITY_STR_PATTERN = re.compile(` uses them; all names referenced by the new code are defined.",
+            "generated astropy/time/core.py:14 drops `timedelta` from the datetime import; the only remaining occurrence in core.py is the docstring text at 2847, so no NameError path remains.",
+            "generated astropy/time/core.py:36 imports TimeDeltaNumeric from .formats and it is used at core.py:2832, matching reference core.py:36/2832."
+          ],
+          "deficiency": "None found by reading. Test and doc results are not established because nothing was executed."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated astropy/time/formats.py:2200-2358 places TimeDeltaQuantityString beside TimeDeltaDatetime, the same module and neighborhood as reference formats.py:2194.",
+            "generated astropy/time/core.py:555-613 (_get_time_fmt), 2806-2838 (TimeDelta.__init__), and 3054-3150 (TimeDelta.to_value) sit in the same classes as reference core.py:555, 2799, and 3056.",
+            "Docs follow the reference layout: docs/changes/time/15264.feature.rst, docs/changes/time/15264.api.rst, docs/time/index.rst, docs/whatsnew/6.0.rst (patch.diff file list)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated astropy/time/core.py:2806-2816: TimeDelta.__init__(val, val2=None, format=None, scale=None, *, precision=None, in_subfmt=None, out_subfmt=None, copy=False), the same keyword-only layout as reference core.py:2799-2810.",
+            "generated astropy/time/core.py:2787-2797: __new__ is unchanged and already accepts precision/in_subfmt/out_subfmt, identical to reference core.py:2780-2790, so keyword calls reach __init__.",
+            "generated astropy/time/formats.py:282-291: precision setter maps None to the class default and validates against _precision_range; formats.py:146-147 sets (0, 9)/3 on TimeFormat, and formats.py:2098 sets (-99, 99) on TimeDeltaFormat. Reference formats.py:282-293 and 2098 agree.",
+            "generated astropy/time/core.py:3126-3130 raises TypeError for an unknown keyword; core.py:3141-3150 raises ValueError for subfmt with a positional non-format and otherwise calls super().to_value(self.format, **kwargs). Both match reference core.py:3056-3150.",
+            "FORMATS exposes 'quantity_str' via class-name registration (formats.py:2238 `name = \"quantity_str\"`) and the list order is sec, jd, datetime, quantity_str."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated astropy/time/formats.py:4-18 imports only stdlib re and existing .utils/astropy modules; no new imports from core.py into formats.py.",
+            "generated astropy/time/core.py:36 adds one import from .formats into core.py, in the existing direction (core imports formats, and formats imports core only at the bottom, formats.py:2398, as before)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated astropy/time/formats.py:2200 `class TimeDeltaQuantityString(TimeDeltaFormat, TimeUnique)` defines `name`, so it self-registers through the existing __init_subclass__ hook (formats.py:166) into TIME_DELTA_FORMATS, the same mechanism reference uses.",
+            "generated astropy/time/formats.py:52 adds \"TimeDeltaQuantityString\" to __all__, and generated astropy/time/__init__.py:23 `from .formats import *` exports it, matching reference formats.py:45.",
+            "generated astropy/time/formats.py:2135 `class TimeDeltaJD(TimeDeltaNumeric, TimeUnique)` makes jd a guessable TimeDelta format, same as reference formats.py:2141."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "No new third-party dependency. The new code uses numpy, astropy.units, and the existing .utils helpers already imported in generated astropy/time/formats.py:4-18.",
+            "The `re` module is standard library and already imported (formats.py:4)."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "Parsing and rendering of quantity_str live in the format layer: generated astropy/time/formats.py:2200-2358 (_check_val_type 2248, _parse 2258, set_jds 2276, _multi_texts 2288, _single_texts 2326, to_value 2332), matching reference formats.py:2194-2412.",
+            "core.py only dispatches and handles user-facing concerns: format guessing at core.py:565-613, the missing-unit warning at core.py:2829-2838. Reference keeps the same division (core.py:555-616, 2830-2840).",
+            "The candidate inlines the warning in __init__ where the reference uses a helper `_check_numeric_no_unit`; the placement and the condition are the same, so this is an acceptable alternative."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "Uses the existing hooks rather than a parallel path: `subfmts` (formats.py:2239-2245) with `_get_allowed_subfmt` (formats.py:2337), `_check_val_type` (2248), `set_jds` (2276), `_check_scale` (2277), and the `precision` setter via `_precision_range` (formats.py:282-291, 2098).",
+            "Base `_regexify_subfmts` (formats.py:94-112) only inspects index 1 when it is a str; the candidate's None second entries pass through untouched, and nothing unpacks this class's 4-tuples, so the 4-tuple shape does not break the hook (the reference uses 3-tuples; both are fine).",
+            "Guessing uses the existing TimeUnique mechanism (core.py:571-580), as the reference does."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "Formats own their parsing and output; TimeDelta/Time-specific logic stays in core.py, with the Time-only pseudo-format guarded by `isinstance(self, Time)` at core.py:577-580, the same guard as reference core.py:577-580.",
+            "The output path depends only on jd1/jd2 and self.precision/self.out_subfmt (formats.py:2332-2354), with no transport or persistence concerns introduced."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "Error messages reuse the established wording: core.py:568 zero-size message; core.py:582 `format must be a string`; core.py:609-613 aggregated `keyword is optional:` message; formats.py:2264 `Time delta '...' does not match quantity_str format` (reference formats.py:2305). Changelog fragments use docs/changes/time/15264.{feature,api}.rst.",
+            "Minor, non-failing style differences from reference: the regex is a module-level constant (formats.py:2188-2197) rather than a class attribute (reference formats.py:2276); the subformat helper names (_multi_texts, _single_texts) differ from reference get_multi_comps/fix_comp_vals_overflow. Neither affects behavior, and reference-only helper names are not exercised by any test I found (grep of reference tests/docs returned no use of parse_string, get_multi_comps, fix_comp_vals_overflow, or re_ydhms).",
+            "Candidate tests added in generated astropy/time/tests/test_delta.py (e.g. lines 709-711, 937) follow the existing test style and reuse pytest.raises(match=...) patterns."
+          ],
+          "deficiency": ""
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "Format guessing without an explicit format: core.py:565-580 tries TimeUnique formats in registry order and applies the zero-size guard at core.py:566-569. Reference core.py:565-580 is the same.",
+            "Keyword-only construction: core.py:2812-2816; a positional copy is rejected by __init__ (test at generated astropy/time/tests/test_delta.py:937). The reference behavior is the same.",
+            "Precision: default None -> 3 at formats.py:283-284; range -99..99 for time deltas at formats.py:2098; the setter error text is at formats.py:289.",
+            "to_value subfmt without format: core.py:3141-3150; unknown keyword rejection at core.py:3126-3130.",
+            "Output semantics checked by hand against the reference tests: '1yr' -> '365d 6hr' (formats.py:2288-2324); '-1yr 2d 23hr 10min 5.6s' -> '-368d 5hr 10min 5.6s' (sign handling at formats.py:2339-2351); '1d 23hr 59min 59.9999s' -> '2d' (carry logic at formats.py:2300-2310); '3.000001e7s' with yr/d/hr/min/s subfmts matches the reference expected values.",
+            "Accepted-but-not-rendered options: in_subfmt is validated through subfmts but is not used for parsing, in both the reference (reference formats.py:2315-2342) and the candidate (formats.py:2276-2286). This matches the reference and is not a gap.",
+            "Reference-tree docs contain extra quantity_str text (docs/time/index.rst:333 subformat table row and 1265-1268 example) that is absent from base and from reference.diff. It is documentation only and does not affect behavior, so it is noted, not counted as a failure."
+          ],
+          "deficiency": ""
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/astropy__astropy-15264/revision-06/run-08/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "astropy/time/tests/test_basic.py",
+          "astropy/time/tests/test_delta.py",
+          "astropy/time/tests/test_quantity_interaction.py"
+        ],
+        "api_inspection": []
+      }
+    },
+    {
+      "criteria": [
+        {
+          "criterion": "patch_and_checks",
+          "passed": true,
+          "evidence": [
+            "judge-context/checks.json: patch_applies=true, api_inspection=[]",
+            "Dry run `patch -p1 --dry-run` on a copy of base astropy/time: all five astropy/time files checked with no hunk failures; docs hunks not checked because that copy omitted docs/",
+            "diff -rq base vs generated: only core.py, formats.py, three test files, and docs files differ, all covered by patch.diff"
+          ],
+          "deficiency": "None. No tests were run (per experiment setup); judged by reading."
+        },
+        {
+          "criterion": "file_location",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/formats.py:2189-2199: TimeDeltaQuantityString and its grammar live in formats.py, same as reference/astropy/time/formats.py:2194",
+            "generated/astropy/time/core.py:559-615: guess and error logic in core.py, same as reference core.py:563",
+            "generated/astropy/time/core.py:2806-2835: TimeDelta.__init__ and inline unitless warning in core.py, matching reference core.py:2799-2825"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "api_contract",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/core.py:2806-2816: __init__(val, val2, format, scale, *, precision, in_subfmt, out_subfmt, copy) matches reference/astropy/time/core.py:2799-2810",
+            "generated/astropy/time/core.py:3126-3152: to_value keyword validation and subfmt routing; messages match reference core.py:3126 and 3144",
+            "generated/astropy/time/formats.py:2243-2250 uses 4-element subfmts; reference uses 3-element at formats.py:2263. Nothing generic unpacks subfmts for this class (only TimeNumeric at base formats.py:500 and TimeString at base formats.py:1476 do)"
+          ],
+          "deficiency": "None against the reference. Shared with reference: TimeDelta(existing_TimeDelta, precision=..., in_subfmt=..., out_subfmt=...) accepts the options but ignores them (generated core.py:2818-2819; reference core.py:2811-2812), whereas Time applies them (base core.py:1855-1860)."
+        },
+        {
+          "criterion": "dependency_direction",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/core.py:36 imports TimeDeltaNumeric from .formats, the existing core-to-formats direction",
+            "generated/astropy/time/formats.py:4 adds only stdlib math; no new import from core into formats"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_registration",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/formats.py:2199: name = \"quantity_str\" on a TimeDeltaFormat subclass auto-registers via TimeFormat.__init_subclass__ (base formats.py:162-175) into TIME_DELTA_FORMATS",
+            "generated/astropy/time/formats.py:53: added to __all__, re-exported by astropy/time/__init__.py via `from .formats import *`",
+            "generated/astropy/time/formats.py:2134: TimeDeltaJD(TimeDeltaNumeric, TimeUnique) makes jd guessable, as in reference formats.py:2141"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "approved_dependencies",
+          "passed": true,
+          "evidence": [
+            "Only new import is stdlib math (generated/astropy/time/formats.py:4); regex uses stdlib re, already imported"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "architectural_fit",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/formats.py:2271-2357: parsing and rendering stay in the format class",
+            "generated/astropy/time/core.py:559-615: guess loop and error aggregation; core.py:3126-3152: to_value validation and delegation",
+            "generated/astropy/time/core.py:486 _pseudo_guess_formats with Time override at core.py:1809 replaces base's inline astropy_time append (base core.py:576-578)"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "extension_point_adherence",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/formats.py:2243 subfmts tuples validated via _get_allowed_subfmt (formats.py:2344)",
+            "generated/astropy/time/formats.py:2134 and :2199 use the existing TimeUnique marker",
+            "generated/astropy/time/formats.py:146 and :2097 _precision_range class attribute, analogous to the per-class attribute pattern; no parallel registry or parser outside formats.py"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "abstraction_integrity",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/core.py:3141-3143: TimeDelta.to_value delegates format/subfmt handling to TimeBase.to_value",
+            "Removed TimeDelta._get_format (base core.py:2803-2815) is private and has no remaining references in astropy/time"
+          ],
+          "deficiency": "None."
+        },
+        {
+          "criterion": "convention_fit",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/core.py:601-606: explicit-format error keeps base wording 'Input values did not match the format class {format}:' (base core.py:604-609)",
+            "generated/astropy/time/formats.py:286-289: 'precision attribute must be an int between {low} and {high}' keeps base prefix (base formats.py:281)",
+            "generated/astropy/time/core.py:581: TypeError('format must be a string') matches reference core.py:581-582 intent",
+            "No added line in the patch exceeds 88 characters; test style follows pytest parametrize usage in test_delta.py"
+          ],
+          "deficiency": "None blocking. Minor: the new 'Quantity String Format' subsection in docs/time/index.rst sits in the Time subformat discussion rather than the 'Time Deltas' section; not a convention violation."
+        },
+        {
+          "criterion": "requirement_intent",
+          "passed": true,
+          "evidence": [
+            "generated/astropy/time/formats.py:2306-2310: '1min' rounds to 60.0 and carries to '1min'",
+            "generated/astropy/time/formats.py:2297-2323: '1d 23hr 59min 59.9999s' carries to '2d' at precision 3 and is unchanged at precision 9",
+            "generated/astropy/time/formats.py:2336: out_subfmt 'yr' of 30000010s gives '0.951yr'; multi gives '347d 5hr 20min 10.0s' (hand-traced)",
+            "generated/astropy/time/formats.py:2271-2285 and 2330-2338: sign handling, and '2.5yr 3.5d 4.5hr 5.5min 6.789s' gives '916d 19hr 35min 36.789s' (hand-traced)",
+            "generated/astropy/time/core.py:2826-2833: unitless '1.0' warns and resolves to jd, which accepts numeric strings (base formats.py:484-504)"
+          ],
+          "deficiency": "None against the reference. Shared behavior changes vs original, also in reference: TimeDelta([]) now raises ValueError (generated core.py:569-573) where base succeeded via _get_format (base core.py:2797); format='' now raises (generated core.py:581-590) where base treated it as unspecified (base core.py:2797)."
+        }
+      ],
+      "passed": true,
+      "generated": "/home/andrew/llm-improvement-loop/.experiments/claude-low-windows-200/results/astropy__astropy-15264/revision-06/run-09/generated",
+      "checks": {
+        "patch_applies": true,
+        "commands": [],
+        "candidate_test_changes": [
+          "astropy/time/tests/test_basic.py",
+          "astropy/time/tests/test_delta.py",
+          "astropy/time/tests/test_quantity_interaction.py"
+        ],
+        "api_inspection": []
+      }
+    }
+  ]
+}

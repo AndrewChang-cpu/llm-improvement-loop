@@ -1,0 +1,357 @@
+diff --git a/monai/utils/__init__.py b/monai/utils/__init__.py
+index 324f6aa..f5a8d3d 100644
+--- a/monai/utils/__init__.py
++++ b/monai/utils/__init__.py
+@@ -12,6 +12,7 @@
+ # have to explicitly bring these in here to resolve circular import issues
+ from .aliases import alias, resolve_name
+ from .decorators import MethodReplacer, RestartGenerator
++from .deprecate_utils import DeprecatedError, deprecated, deprecated_arg, version_leq
+ from .enums import (
+     Activation,
+     Average,
+diff --git a/monai/utils/deprecate_utils.py b/monai/utils/deprecate_utils.py
+new file mode 100644
+index 0000000..599e48f
+--- /dev/null
++++ b/monai/utils/deprecate_utils.py
+@@ -0,0 +1,194 @@
++# Copyright 2020 - 2021 MONAI Consortium
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#     http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""
++Decorators for marking functions, methods, classes and arguments as deprecated.
++
++Each decorator takes a ``since`` and/or ``removed`` version string. When the running MONAI version is at or past
++``since`` a ``DeprecationWarning`` is issued on use; when it is at or past ``removed`` a ``DeprecatedError`` is raised.
++"""
++
++import inspect
++import re
++import warnings
++from functools import wraps
++from typing import Any, Callable, Optional, Tuple
++
++__all__ = ["DeprecatedError", "deprecated", "deprecated_arg", "version_leq"]
++
++
++class DeprecatedError(Exception):
++    """Raised when a deprecated feature is used after its removal version."""
++
++
++def _parse_version(version: Optional[str]) -> Tuple[int, ...]:
++    """Parse the leading numeric components of a version string, e.g. "0.6.0+12" -> (0, 6, 0)."""
++    if version is None:
++        return ()
++    m = re.match(r"^\s*v?(\d+(?:\.\d+)*)", str(version))
++    if m is None:
++        return ()
++    return tuple(int(p) for p in m.group(1).split("."))
++
++
++def version_leq(lhs: Optional[str], rhs: Optional[str]) -> bool:
++    """
++    Returns True if version `lhs` is less than or equal to version `rhs`. Missing or unparseable versions compare as
++    the lowest version, and shorter versions are zero-padded (so "0.6" == "0.6.0").
++    """
++    a, b = _parse_version(lhs), _parse_version(rhs)
++    n = max(len(a), len(b))
++    a = a + (0,) * (n - len(a))
++    b = b + (0,) * (n - len(b))
++    return a <= b
++
++
++def _current_version() -> str:
++    import monai  # local import to avoid circular import during package initialisation
++
++    return str(monai.__version__)
++
++
++def _check_status(since: Optional[str], removed: Optional[str]) -> Tuple[bool, bool]:
++    """Returns (is_deprecated, is_removed) for the currently running MONAI version."""
++    current = _current_version()
++    is_removed = removed is not None and version_leq(removed, current)
++    is_deprecated = since is not None and version_leq(since, current)
++    return is_deprecated or is_removed, is_removed
++
++
++def _message(what: str, since: Optional[str], removed: Optional[str], msg_suffix: str, removed_flag: bool) -> str:
++    parts = [what]
++    if removed_flag:
++        parts.append(f"was removed in version {removed}")
++    else:
++        if since is not None:
++            parts.append(f"was deprecated in version {since}")
++        if removed is not None:
++            parts.append(f"will be removed in version {removed}")
++    msg = " ".join(parts) + "."
++    if msg_suffix:
++        msg = f"{msg} {msg_suffix}"
++    return msg
++
++
++def _raise_or_warn(msg: str, is_deprecated: bool, is_removed: bool) -> None:
++    if is_removed:
++        raise DeprecatedError(msg)
++    if is_deprecated:
++        warnings.warn(msg, category=DeprecationWarning, stacklevel=3)
++
++
++def deprecated(
++    since: Optional[str] = None, removed: Optional[str] = None, msg_suffix: str = ""
++) -> Callable[[Any], Any]:
++    """
++    Marks a function, method or class as deprecated. Apply as a decorator. When the running MONAI version is at or
++    past `since` a `DeprecationWarning` is issued each time the object is called (or instantiated); when it is at or
++    past `removed` a `DeprecatedError` is raised instead.
++
++    Args:
++        since: version in which the object was deprecated.
++        removed: version in which the object is/will be removed.
++        msg_suffix: additional message appended to the warning or error.
++    """
++    if since is None and removed is None:
++        raise ValueError("at least one of `since` or `removed` must be given.")
++
++    def _decorator(obj):
++        if inspect.isclass(obj):
++            orig_init = obj.__init__
++            what = f"Class `{obj.__name__}`"
++
++            @wraps(orig_init)
++            def __init__(self, *args, **kwargs):
++                is_dep, is_rem = _check_status(since, removed)
++                msg = _message(what, since, removed, msg_suffix, is_rem)
++                _raise_or_warn(msg, is_dep, is_rem)
++                orig_init(self, *args, **kwargs)
++
++            obj.__init__ = __init__
++            _add_doc_note(obj, since, removed, msg_suffix)
++            return obj
++
++        what = f"Function `{obj.__name__}`"
++
++        @wraps(obj)
++        def _wrapper(*args, **kwargs):
++            is_dep, is_rem = _check_status(since, removed)
++            msg = _message(what, since, removed, msg_suffix, is_rem)
++            _raise_or_warn(msg, is_dep, is_rem)
++            return obj(*args, **kwargs)
++
++        _add_doc_note(_wrapper, since, removed, msg_suffix)
++        return _wrapper
++
++    return _decorator
++
++
++def deprecated_arg(
++    name: str,
++    since: Optional[str] = None,
++    removed: Optional[str] = None,
++    msg_suffix: str = "",
++) -> Callable[[Callable], Callable]:
++    """
++    Marks the argument `name` of a callable as deprecated. Apply as a decorator. The warning or error is only raised
++    when the caller explicitly supplies the argument (positionally or by keyword), not when it takes its default.
++
++    Args:
++        name: name of the deprecated argument.
++        since: version in which the argument was deprecated.
++        removed: version in which the argument is/will be removed.
++        msg_suffix: additional message appended to the warning or error.
++    """
++    if since is None and removed is None:
++        raise ValueError("at least one of `since` or `removed` must be given.")
++
++    def _decorator(func: Callable) -> Callable:
++        sig = inspect.signature(func)
++
++        @wraps(func)
++        def _wrapper(*args, **kwargs):
++            if name in kwargs or _bound_has(sig, args, name):
++                is_dep, is_rem = _check_status(since, removed)
++                what = f"Argument `{name}` of `{func.__name__}`"
++                msg = _message(what, since, removed, msg_suffix, is_rem)
++                _raise_or_warn(msg, is_dep, is_rem)
++            return func(*args, **kwargs)
++
++        _add_doc_note(_wrapper, since, removed, msg_suffix, arg=name)
++        return _wrapper
++
++    return _decorator
++
++
++def _bound_has(sig: inspect.Signature, args: tuple, name: str) -> bool:
++    """True if positional `args` bind to parameter `name`."""
++    try:
++        return name in sig.bind_partial(*args).arguments
++    except TypeError:
++        return False
++
++
++def _add_doc_note(obj, since, removed, msg_suffix, arg: Optional[str] = None) -> None:
++    """Append a deprecation note to the object's docstring, if it has one."""
++    target = f"`{arg}` argument" if arg else "this"
++    note = f"\n\n.. deprecated:: {since or removed}\n    {target} is deprecated"
++    if removed:
++        note += f"; will be removed in {removed}"
++    if msg_suffix:
++        note += f". {msg_suffix}"
++    note += "\n"
++    try:
++        obj.__doc__ = (obj.__doc__ or "") + note
++    except (AttributeError, TypeError):
++        pass
+diff --git a/tests/test_deprecated.py b/tests/test_deprecated.py
+new file mode 100644
+index 0000000..541cbb1
+--- /dev/null
++++ b/tests/test_deprecated.py
+@@ -0,0 +1,139 @@
++# Copyright 2020 - 2021 MONAI Consortium
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#     http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import unittest
++import warnings
++from unittest import mock
++
++from monai.utils import DeprecatedError, deprecated, deprecated_arg, version_leq
++
++
++def _with_version(version):
++    return mock.patch("monai.utils.deprecate_utils._current_version", return_value=version)
++
++
++class TestVersionLeq(unittest.TestCase):
++    def test_compare(self):
++        self.assertTrue(version_leq("0.5.3", "0.6.0"))
++        self.assertTrue(version_leq("0.6", "0.6.0"))
++        self.assertTrue(version_leq("0.6.0", "0.6.0"))
++        self.assertFalse(version_leq("0.10.0", "0.9.9"))
++        self.assertTrue(version_leq("0.6.0+12.gabc", "0.6.1"))
++
++
++class TestDeprecated(unittest.TestCase):
++    def test_function_warns_after_since(self):
++        @deprecated(since="0.5")
++        def f(x):
++            return x + 1
++
++        with _with_version("0.6.0"), warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("always")
++            self.assertEqual(f(1), 2)
++        self.assertEqual(len(w), 1)
++        self.assertTrue(issubclass(w[0].category, DeprecationWarning))
++        self.assertIn("deprecated in version 0.5", str(w[0].message))
++
++    def test_function_silent_before_since(self):
++        @deprecated(since="0.7")
++        def f(x):
++            return x
++
++        with _with_version("0.6.0"), warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("always")
++            self.assertEqual(f(3), 3)
++        self.assertEqual(len(w), 0)
++
++    def test_function_raises_after_removed(self):
++        @deprecated(since="0.4", removed="0.6")
++        def f():
++            return 1
++
++        with _with_version("0.6.0"):
++            with self.assertRaises(DeprecatedError):
++                f()
++        with _with_version("0.5.0"), warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("always")
++            self.assertEqual(f(), 1)
++        self.assertEqual(len(w), 1)
++        self.assertIn("will be removed in version 0.6", str(w[0].message))
++
++    def test_msg_suffix_and_docstring(self):
++        @deprecated(since="0.5", msg_suffix="Use g instead.")
++        def f():
++            """Doc."""
++
++        self.assertIn("deprecated:: 0.5", f.__doc__)
++        with _with_version("0.6.0"), warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("always")
++            f()
++        self.assertIn("Use g instead.", str(w[0].message))
++
++    def test_class(self):
++        @deprecated(since="0.5", removed="0.7")
++        class C:
++            def __init__(self, v):
++                self.v = v
++
++        with _with_version("0.6.0"), warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("always")
++            self.assertEqual(C(4).v, 4)
++        self.assertEqual(len(w), 1)
++        self.assertIn("Class `C`", str(w[0].message))
++        with _with_version("0.7.0"):
++            with self.assertRaises(DeprecatedError):
++                C(1)
++
++    def test_requires_version(self):
++        with self.assertRaises(ValueError):
++            deprecated()
++
++
++class TestDeprecatedArg(unittest.TestCase):
++    def _make(self):
++        @deprecated_arg("old", since="0.5", removed="0.7")
++        def f(a, old=None):
++            return a
++
++        return f
++
++    def test_keyword_warns(self):
++        f = self._make()
++        with _with_version("0.6.0"), warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("always")
++            self.assertEqual(f(1, old=2), 1)
++        self.assertEqual(len(w), 1)
++        self.assertIn("Argument `old`", str(w[0].message))
++
++    def test_positional_warns(self):
++        f = self._make()
++        with _with_version("0.6.0"), warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("always")
++            f(1, 2)
++        self.assertEqual(len(w), 1)
++
++    def test_default_not_warned(self):
++        f = self._make()
++        with _with_version("0.6.0"), warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("always")
++            self.assertEqual(f(5), 5)
++        self.assertEqual(len(w), 0)
++
++    def test_raises_after_removed(self):
++        f = self._make()
++        with _with_version("0.7.0"):
++            with self.assertRaises(DeprecatedError):
++                f(1, old=2)
++            self.assertEqual(f(1), 1)
++
++
++if __name__ == "__main__":
++    unittest.main()

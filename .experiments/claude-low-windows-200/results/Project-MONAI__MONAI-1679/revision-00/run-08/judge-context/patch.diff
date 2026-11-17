@@ -1,0 +1,183 @@
+diff --git a/monai/data/grid_dataset.py b/monai/data/grid_dataset.py
+index f85569d..ade0adf 100644
+--- a/monai/data/grid_dataset.py
++++ b/monai/data/grid_dataset.py
+@@ -10,15 +10,15 @@
+ # limitations under the License.
+ 
+ import math
+-from typing import Callable, Dict, Optional, Sequence, Union
++from typing import Callable, Dict, Generator, Optional, Sequence, Tuple, Union
+ 
+ import torch
+ from torch.utils.data import IterableDataset
+ 
+ from monai.data.dataset import Dataset
+-from monai.data.utils import iter_patch
++from monai.data.utils import get_valid_patch_size, iter_patch, iter_patch_slices
+ from monai.transforms import apply_transform
+-from monai.utils import NumpyPadMode, ensure_tuple
++from monai.utils import NumpyPadMode, ensure_tuple, ensure_tuple_size
+ 
+ __all__ = ["PatchDataset", "GridPatchDataset"]
+ 
+@@ -26,6 +26,28 @@ __all__ = ["PatchDataset", "GridPatchDataset"]
+ class GridPatchDataset(IterableDataset):
+     """
+     Yields patches from arrays read from an input dataset. The patches are chosen in a contiguous grid sampling scheme.
++    An optional `transform` is applied to each patch (the tuple of patches taken from one item of the input dataset),
++    and the start coordinates of each patch in its source array can be yielded alongside the patches.
++
++    For example, to yield patches with their coordinates and a patch-level intensity shift:
++
++    .. code-block:: python
++
++        import numpy as np
++
++        from monai.data import GridPatchDataset, DataLoader
++        from monai.transforms import RandShiftIntensity
++
++        images = [np.arange(16, dtype=float).reshape(1, 4, 4)]
++        ds = GridPatchDataset(
++            dataset=images,
++            patch_size=(2, 2),
++            transform=lambda patches: tuple(RandShiftIntensity(offsets=1.0, prob=1.0)(p) for p in patches),
++            with_coordinates=True,
++        )
++        for patches, coords in DataLoader(ds, batch_size=1, num_workers=0):
++            print(patches[0].shape, coords[0])
++
+     """
+ 
+     def __init__(
+@@ -34,6 +56,8 @@ class GridPatchDataset(IterableDataset):
+         patch_size: Sequence[int],
+         start_pos: Sequence[int] = (),
+         mode: Union[NumpyPadMode, str] = NumpyPadMode.WRAP,
++        transform: Optional[Callable] = None,
++        with_coordinates: bool = False,
+         **pad_opts: Dict,
+     ) -> None:
+         """
+@@ -44,13 +68,20 @@ class GridPatchDataset(IterableDataset):
+         specified by a `patch_size` of (10, 10, 10).
+ 
+         Args:
+-            dataset: the dataset to read array data from
++            dataset: the dataset to read array data from. Each item must be a sequence of arrays, which are patched
++                together with the same grid.
+             patch_size: size of patches to generate slices for, 0/None selects whole dimension
+             start_pos: starting position in the array, default is 0 for each dimension
+             mode: {``"constant"``, ``"edge"``, ``"linear_ramp"``, ``"maximum"``, ``"mean"``,
+                 ``"median"``, ``"minimum"``, ``"reflect"``, ``"symmetric"``, ``"wrap"``, ``"empty"``}
+                 One of the listed string values or a user supplied function. Defaults to ``"wrap"``.
+                 See also: https://numpy.org/doc/1.18/reference/generated/numpy.pad.html
++            transform: patch-level transform, applied to the tuple of patches from each grid position
++                (``transform(patches)``), before any coordinates are attached.
++            with_coordinates: if True, each yielded item is a tuple ``(patches, coordinates)`` where ``coordinates``
++                is a tuple with one entry per array, each being the start index (a tuple of ints, one per dimension,
++                possibly negative when the patch starts in the padded region) of the patch in that array.
++                If False (default), each yielded item is the tuple of patches.
+             pad_opts: padding options, see numpy.pad
+         """
+ 
+@@ -58,8 +89,23 @@ class GridPatchDataset(IterableDataset):
+         self.patch_size = (None,) + tuple(patch_size)
+         self.start_pos = ensure_tuple(start_pos)
+         self.mode: NumpyPadMode = NumpyPadMode(mode)
++        self.transform = transform
++        self.with_coordinates = with_coordinates
+         self.pad_opts = pad_opts
+ 
++    def _patch_starts(self, shape: Sequence[int]) -> Generator[Tuple[int, ...], None, None]:
++        """
++        Yield the start coordinates (in the unpadded array) of each patch, in the same order as `iter_patch` yields
++        patches for an array of shape `shape`.
++        """
++        patch_size_ = get_valid_patch_size(shape, self.patch_size)
++        start_pos = ensure_tuple_size(self.start_pos, len(shape))
++        # mirror the padding offsets used by `iter_patch`
++        iter_size = tuple(s + p for s, p in zip(shape, patch_size_))
++        start_pos_padded = tuple(s + p for s, p in zip(start_pos, patch_size_))
++        for slices in iter_patch_slices(iter_size, patch_size_, start_pos_padded):
++            yield tuple(sl.start - p for sl, p in zip(slices, patch_size_))
++
+     def __iter__(self):
+         worker_info = torch.utils.data.get_worker_info()
+         iter_start = 0
+@@ -76,8 +122,18 @@ class GridPatchDataset(IterableDataset):
+             arrays = self.dataset[index]
+ 
+             iters = [iter_patch(a, self.patch_size, self.start_pos, False, self.mode, **self.pad_opts) for a in arrays]
+-
+-            yield from zip(*iters)
++            if self.with_coordinates:
++                starts = [self._patch_starts(a.shape) for a in arrays]
++                for patch_tuple, *loc in zip(zip(*iters), *starts):
++                    yield self._finalise(patch_tuple, tuple(loc))
++            else:
++                for patch_tuple in zip(*iters):
++                    yield self._finalise(patch_tuple, None)
++
++    def _finalise(self, patches: Tuple, coords: Optional[Tuple]):
++        if self.transform is not None:
++            patches = apply_transform(self.transform, patches, map_items=False)
++        return (patches, coords) if self.with_coordinates else patches
+ 
+ 
+ class PatchDataset(Dataset):
+diff --git a/tests/test_patch_dataset.py b/tests/test_patch_dataset.py
+index 3dadbe3..edf656d 100644
+--- a/tests/test_patch_dataset.py
++++ b/tests/test_patch_dataset.py
+@@ -14,7 +14,7 @@ import unittest
+ 
+ import numpy as np
+ 
+-from monai.data import DataLoader, Dataset, PatchDataset
++from monai.data import DataLoader, Dataset, GridPatchDataset, PatchDataset
+ from monai.transforms import RandShiftIntensity, RandSpatialCropSamples
+ from monai.utils import set_determinism
+ 
+@@ -24,6 +24,41 @@ def identity(x):
+     return x
+ 
+ 
++class TestGridPatchDataset(unittest.TestCase):
++    def test_patches_without_coordinates(self):
++        img = np.arange(16, dtype=float).reshape(1, 4, 4)
++        ds = GridPatchDataset(dataset=[img], patch_size=(2, 2))
++        items = list(ds)
++        self.assertEqual(len(items), 4)
++        for patches in items:
++            self.assertIsInstance(patches, tuple)
++            self.assertEqual(patches[0].shape, (1, 2, 2))
++
++    def test_patches_with_coordinates(self):
++        img = np.arange(16, dtype=float).reshape(1, 4, 4)
++        ds = GridPatchDataset(dataset=[img], patch_size=(2, 2), with_coordinates=True)
++        items = list(ds)
++        self.assertEqual(len(items), 4)
++        for patches, coords in items:
++            self.assertEqual(len(coords), 1)
++            start = coords[0]
++            self.assertEqual(len(start), 3)
++            r, c = start[1], start[2]
++            np.testing.assert_equal(patches[0], img[:, r : r + 2, c : c + 2])
++
++    def test_patch_transform(self):
++        img = np.arange(16, dtype=float).reshape(1, 4, 4)
++
++        def shift(patches):
++            return tuple(p + 100.0 for p in patches)
++
++        ds = GridPatchDataset(dataset=[img], patch_size=(2, 2), transform=shift, with_coordinates=True)
++        for patches, coords in ds:
++            start = coords[0]
++            r, c = start[1], start[2]
++            np.testing.assert_allclose(patches[0], img[:, r : r + 2, c : c + 2] + 100.0)
++
++
+ class TestPatchDataset(unittest.TestCase):
+     def test_shape(self):
+         test_dataset = ["vwxyz", "hello", "world"]

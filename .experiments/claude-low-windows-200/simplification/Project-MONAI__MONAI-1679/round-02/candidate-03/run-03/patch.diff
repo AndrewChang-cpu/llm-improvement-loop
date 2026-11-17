@@ -1,0 +1,380 @@
+diff --git a/docs/source/data.rst b/docs/source/data.rst
+index eed4b30..3dffeb8 100644
+--- a/docs/source/data.rst
++++ b/docs/source/data.rst
+@@ -77,6 +77,11 @@ Patch-based dataset
+ .. autoclass:: GridPatchDataset
+   :members:
+ 
++`PatchIter`
++~~~~~~~~~~~
++.. autoclass:: PatchIter
++  :members:
++
+ `PatchDataset`
+ ~~~~~~~~~~~~~~
+ .. autoclass:: PatchDataset
+diff --git a/monai/data/__init__.py b/monai/data/__init__.py
+index 54ee790..9fa5c93 100644
+--- a/monai/data/__init__.py
++++ b/monai/data/__init__.py
+@@ -22,7 +22,7 @@ from .dataset import (
+     ZipDataset,
+ )
+ from .decathlon_datalist import load_decathlon_datalist, load_decathlon_properties
+-from .grid_dataset import GridPatchDataset, PatchDataset
++from .grid_dataset import GridPatchDataset, PatchDataset, PatchIter
+ from .image_dataset import ImageDataset
+ from .image_reader import ImageReader, ITKReader, NibabelReader, NumpyReader, PILReader, WSIReader
+ from .iterable_dataset import IterableDataset
+diff --git a/monai/data/grid_dataset.py b/monai/data/grid_dataset.py
+index f85569d..ecf6e62 100644
+--- a/monai/data/grid_dataset.py
++++ b/monai/data/grid_dataset.py
+@@ -9,9 +9,9 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-import math
+ from typing import Callable, Dict, Optional, Sequence, Union
+ 
++import numpy as np
+ import torch
+ from torch.utils.data import IterableDataset
+ 
+@@ -20,64 +20,151 @@ from monai.data.utils import iter_patch
+ from monai.transforms import apply_transform
+ from monai.utils import NumpyPadMode, ensure_tuple
+ 
+-__all__ = ["PatchDataset", "GridPatchDataset"]
++__all__ = ["PatchDataset", "GridPatchDataset", "PatchIter"]
+ 
+ 
+-class GridPatchDataset(IterableDataset):
++class PatchIter:
+     """
+-    Yields patches from arrays read from an input dataset. The patches are chosen in a contiguous grid sampling scheme.
++    Creates a patch generator over a single image item using grid sampling.
+     """
+ 
+     def __init__(
+         self,
+-        dataset: Sequence,
+         patch_size: Sequence[int],
+         start_pos: Sequence[int] = (),
+         mode: Union[NumpyPadMode, str] = NumpyPadMode.WRAP,
+         **pad_opts: Dict,
+     ) -> None:
+         """
+-        Initializes this dataset in terms of the input dataset and patch size. The `patch_size` is the size of the
+-        patch to sample from the input arrays. It is assumed the arrays first dimension is the channel dimension which
+-        will be yielded in its entirety so this should not be specified in `patch_size`. For example, for an input 3D
+-        array with 1 channel of size (1, 20, 20, 20) a regular grid sampling of eight patches (1, 10, 10, 10) would be
+-        specified by a `patch_size` of (10, 10, 10).
+-
+         Args:
+-            dataset: the dataset to read array data from
+-            patch_size: size of patches to generate slices for, 0/None selects whole dimension
+-            start_pos: starting position in the array, default is 0 for each dimension
++            patch_size: size of patches to generate slices for, 0/None selects whole dimension. The channel dimension
++                is not included here, it is always yielded whole and is added internally. For example, for an input
++                3D array with 1 channel of size (1, 20, 20, 20), a regular grid sampling of eight patches of size
++                (1, 10, 10, 10) is specified by a `patch_size` of (10, 10, 10).
++            start_pos: starting position in the full channel-first array, including the channel entry as the first
++                entry, default is 0 for each dimension.
+             mode: {``"constant"``, ``"edge"``, ``"linear_ramp"``, ``"maximum"``, ``"mean"``,
+                 ``"median"``, ``"minimum"``, ``"reflect"``, ``"symmetric"``, ``"wrap"``, ``"empty"``}
+                 One of the listed string values or a user supplied function. Defaults to ``"wrap"``.
+                 See also: https://numpy.org/doc/1.18/reference/generated/numpy.pad.html
+             pad_opts: padding options, see numpy.pad
+-        """
+ 
+-        self.dataset = dataset
++        Note:
++            The channel is excluded from `patch_size`. For a one-channel 3D image of shape (1, 20, 20, 20) and
++            `patch_size` (10, 10, 10), each patch has shape (1, 10, 10, 10) and its coordinates have four rows,
++            one for the channel and one for each spatial dimension.
++        """
+         self.patch_size = (None,) + tuple(patch_size)
+         self.start_pos = ensure_tuple(start_pos)
+         self.mode: NumpyPadMode = NumpyPadMode(mode)
+         self.pad_opts = pad_opts
+ 
++    def __call__(self, image):
++        """
++        Yields (patch, coordinates) tuples for the single image item `image`.
++        """
++        return iter_patch(image, self.patch_size, self.start_pos, False, self.mode, **self.pad_opts)
++
++
++class GridPatchDataset(IterableDataset):
++    """
++    Yields patches from image items read from an input dataset. The patches are chosen in a contiguous grid sampling
++    scheme by a patch generator, such as :py:class:`PatchIter`, and each patch can then be transformed by `transform`.
++
++    Each item of `dataset` is a single channel-first image. For each item the patch generator yields
++    (patch, coordinates) tuples. A patch has the full channel extent and the requested spatial size, for example
++    a one-channel 4x4 image with a patch size of 2x2 gives patches of shape (1, 2, 2). The coordinates are an integer
++    array of shape (number of dimensions including channel, 2) where each row is ``[start, stop]`` in the original
++    image, so for a one-channel 2D image the coordinates have shape (3, 2) with channel row ``[0, 1]``.
++
++    For example, to sample 2x2 patches from a list of single-channel 4x4 images with a per-patch intensity shift
++    and two data loader workers:
++
++    .. code-block:: python
++
++        import numpy as np
++
++        from monai.data import DataLoader, GridPatchDataset, PatchIter
++        from monai.transforms import RandShiftIntensity
++
++        # image dataset
++        images = [np.arange(16, dtype=float).reshape(1, 4, 4),
++                  np.arange(16, dtype=float).reshape(1, 4, 4)]
++        # patch generator: 2x2 patches starting from the origin
++        patch_iter = PatchIter(patch_size=(2, 2), start_pos=(0, 0))
++        # patch-level intensity shifts
++        patch_intensity = RandShiftIntensity(offsets=1.0, prob=1.0)
++        # construct the patch dataset
++        ds = GridPatchDataset(dataset=images, patch_iter=patch_iter, transform=patch_intensity)
++
++        # each element is a (patch, coordinates) pair, the first patch has shape (1, 2, 2)
++        patch, coords = next(iter(GridPatchDataset(dataset=images, patch_iter=patch_iter)))
++        print(patch.shape)
++
++        >>> (1, 2, 2)
++
++        for patch, coords in DataLoader(ds, batch_size=2, num_workers=2):
++            print(patch.shape, coords.shape)
++
++        >>> torch.Size([2, 1, 2, 2]) torch.Size([2, 3, 2])
++        >>> torch.Size([2, 1, 2, 2]) torch.Size([2, 3, 2])
++        >>> torch.Size([2, 1, 2, 2]) torch.Size([2, 3, 2])
++        >>> torch.Size([2, 1, 2, 2]) torch.Size([2, 3, 2])
++
++    """
++
++    def __init__(
++        self,
++        dataset: Sequence,
++        patch_iter: Callable,
++        transform: Optional[Callable] = None,
++        with_coordinates: bool = True,
++    ) -> None:
++        """
++        Args:
++            dataset: the image dataset to read items from, must support `len()`. Each item is a single channel-first
++                image.
++            patch_iter: a callable which takes one image item and returns an iterable of tuples. The first element of
++                each tuple is the patch and the second is its coordinate array. Further elements are ignored. See
++                :py:class:`PatchIter` for the built-in generator.
++            transform: a transform applied to each patch alone, the coordinates are never passed to it. Defaults to
++                None, which yields patches unchanged.
++            with_coordinates: whether to yield `(patch, coordinates)` pairs. If False only the patches are yielded.
++                Defaults to True.
++        """
++        self.dataset = dataset
++        self.patch_iter = patch_iter
++        self.transform = transform
++        self.with_coordinates = with_coordinates
++
+     def __iter__(self):
++        if not hasattr(self.dataset, "__len__"):
++            raise NotImplementedError("image dataset must implement `len()`.")
++
+         worker_info = torch.utils.data.get_worker_info()
+         iter_start = 0
+         iter_end = len(self.dataset)
+ 
+         if worker_info is not None:
+             # split workload
+-            per_worker = int(math.ceil((iter_end - iter_start) / float(worker_info.num_workers)))
++            per_worker = int(np.ceil((iter_end - iter_start) / float(worker_info.num_workers)))
+             worker_id = worker_info.id
+             iter_start = iter_start + worker_id * per_worker
+             iter_end = min(iter_start + per_worker, iter_end)
+ 
+         for index in range(iter_start, iter_end):
+-            arrays = self.dataset[index]
++            image = self.dataset[index]
++
++            for result in self.patch_iter(image):
++                if self.with_coordinates:
++                    patch, coords = result[:2]
++                else:
++                    patch = result[0]
+ 
+-            iters = [iter_patch(a, self.patch_size, self.start_pos, False, self.mode, **self.pad_opts) for a in arrays]
++                if self.transform is not None:
++                    patch = apply_transform(self.transform, patch, map_items=False)
+ 
+-            yield from zip(*iters)
++                yield (patch, coords) if self.with_coordinates else patch
+ 
+ 
+ class PatchDataset(Dataset):
+@@ -95,8 +182,8 @@ class PatchDataset(Dataset):
+         from monai.transforms import RandSpatialCropSamples, RandShiftIntensity
+ 
+         # image dataset
+-        images = [np.arange(16, dtype=np.float).reshape(1, 4, 4),
+-                  np.arange(16, dtype=np.float).reshape(1, 4, 4)]
++        images = [np.arange(16, dtype=float).reshape(1, 4, 4),
++                  np.arange(16, dtype=float).reshape(1, 4, 4)]
+         # image patch sampler
+         n_samples = 5
+         sampler = RandSpatialCropSamples(roi_size=(3, 3), num_samples=n_samples,
+diff --git a/monai/data/utils.py b/monai/data/utils.py
+index 60250af..6e69b58 100644
+--- a/monai/data/utils.py
++++ b/monai/data/utils.py
+@@ -174,7 +174,7 @@ def iter_patch(
+     copy_back: bool = True,
+     mode: Union[NumpyPadMode, str] = NumpyPadMode.WRAP,
+     **pad_opts: Dict,
+-) -> Generator[np.ndarray, None, None]:
++) -> Generator[Tuple[np.ndarray, np.ndarray], None, None]:
+     """
+     Yield successive patches from `arr` of size `patch_size`. The iteration can start from position `start_pos` in `arr`
+     but drawing from a padded array extended by the `patch_size` in each dimension (so these coordinates can be negative
+@@ -192,8 +192,15 @@ def iter_patch(
+         pad_opts: padding options, see `numpy.pad`
+ 
+     Yields:
+-        Patches of array data from `arr` which are views into a padded array which can be modified, if `copy_back` is
+-        True these changes will be reflected in `arr` once the iteration completes.
++        Tuples of (patch, coordinates). Each patch is a view into a padded array which can be modified, if `copy_back`
++        is True these changes will be reflected in `arr` once the iteration completes. Each coordinate array is paired
++        with its patch and gives the start and stop of the patch in `arr` for every dimension, including the channel.
++
++    Note:
++        The coordinates are an integer array of shape (number of dimensions, 2), where each row is ``[start, stop]``
++        for one dimension of `arr`. The first row is the channel dimension, which is always yielded whole, so for a
++        channel-first array with C channels its row is ``[0, C]``. Stop can exceed the extent of `arr` for patches
++        taken from the padded border, and start is negative only when the start position is negative.
+     """
+     # ensure patchSize and startPos are the right length
+     patch_size_ = get_valid_patch_size(arr.shape, patch_size)
+@@ -210,7 +217,9 @@ def iter_patch(
+     iter_size = tuple(s + p for s, p in zip(arr.shape, patch_size_))
+ 
+     for slices in iter_patch_slices(iter_size, patch_size_, start_pos_padded):
+-        yield arrpad[slices]
++        # convert the padded slices back to the original (unpadded) frame of `arr`
++        coords = np.asarray([[s.start - p, s.stop - p] for s, p in zip(slices, patch_size_)], dtype=int)
++        yield arrpad[slices], coords
+ 
+     # copy back data from the padded image if required
+     if copy_back:
+@@ -411,6 +420,8 @@ def set_rnd(obj, seed: int) -> int:
+         obj.set_random_state(seed=seed % MAX_SEED)
+         return seed + 1  # a different seed for the next component
+     for key in obj.__dict__:
++        if key.startswith("__"):
++            continue
+         seed = set_rnd(obj.__dict__[key], seed=seed)
+     return seed
+ 
+diff --git a/tests/test_grid_dataset.py b/tests/test_grid_dataset.py
+new file mode 100644
+index 0000000..6de8fff
+--- /dev/null
++++ b/tests/test_grid_dataset.py
+@@ -0,0 +1,97 @@
++# Copyright 2020 - 2021 MONAI Consortium
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#     http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import sys
++import unittest
++
++import numpy as np
++
++from monai.data import DataLoader, GridPatchDataset, PatchIter
++from monai.transforms import RandShiftIntensity
++from monai.utils import set_determinism
++
++
++def _char_iter(item):
++    # module-level so that it can be pickled for multi-worker data loaders
++    for i, c in enumerate(item):
++        yield c, i
++
++
++class _NoLen:
++    def __getitem__(self, index):
++        return np.zeros((1, 4, 4))
++
++
++class TestGridPatchDataset(unittest.TestCase):
++    def setUp(self):
++        set_determinism(seed=1234)
++
++    def tearDown(self):
++        set_determinism(seed=None)
++
++    def test_shape(self):
++        items = ["abcdef", "ghi", "jklmno"]
++        expected = sorted(c for item in items for c in item)
++        dataset = GridPatchDataset(dataset=items, patch_iter=_char_iter, with_coordinates=False)
++        num_workers = 0 if sys.platform == "win32" else 2
++
++        output = []
++        for batch in DataLoader(dataset, batch_size=3, num_workers=num_workers):
++            output.extend(batch)
++
++        self.assertEqual(len(output), len(expected))
++        self.assertEqual(sorted(output), expected)
++
++    def test_loading_array(self):
++        set_determinism(seed=1234)
++        images = [np.arange(16, dtype=float).reshape(1, 4, 4), np.arange(16, dtype=float).reshape(1, 4, 4)]
++        transform = RandShiftIntensity(offsets=1.0, prob=1.0)
++        patch_iter = PatchIter(patch_size=(2, 2), start_pos=(0, 0))
++        dataset = GridPatchDataset(dataset=images, patch_iter=patch_iter, transform=transform)
++
++        # single-process block
++        batches = list(DataLoader(dataset, batch_size=2, num_workers=0))
++        for patch, _ in batches:
++            self.assertEqual(tuple(patch.shape), (2, 1, 2, 2))
++        patch, coords = batches[-1]
++        np.testing.assert_allclose(
++            patch[0, 0].numpy(), np.array([[1.7413, 2.7413], [5.7413, 6.7413]]), rtol=1e-5, atol=0
++        )
++        np.testing.assert_allclose(
++            patch[1, 0].numpy(), np.array([[9.1419, 10.1419], [13.1419, 14.1419]]), rtol=1e-5, atol=0
++        )
++        np.testing.assert_array_equal(coords[0].numpy(), np.array([[0, 1], [0, 2], [2, 4]]))
++        np.testing.assert_array_equal(coords[1].numpy(), np.array([[0, 1], [2, 4], [2, 4]]))
++
++        # two-worker block, reuses the same dataset, transform and generator objects
++        if sys.platform != "win32":
++            batches_mp = list(DataLoader(dataset, batch_size=2, num_workers=2))
++            self.assertEqual(len(batches_mp), len(batches))
++            for patch, _ in batches_mp:
++                self.assertEqual(tuple(patch.shape), (2, 1, 2, 2))
++            patch, coords_mp = batches_mp[-1]
++            np.testing.assert_array_equal(coords_mp.numpy(), coords.numpy())
++            np.testing.assert_allclose(
++                patch[0, 0].numpy(), np.array([[2.3944, 3.3944], [6.3944, 7.3944]]), rtol=1e-3, atol=0
++            )
++            np.testing.assert_allclose(
++                patch[1, 0].numpy(), np.array([[10.6551, 11.6551], [14.6551, 15.6551]]), rtol=1e-3, atol=0
++            )
++
++    def test_missing_len(self):
++        dataset = GridPatchDataset(dataset=_NoLen(), patch_iter=PatchIter(patch_size=(2, 2)))
++        with self.assertRaises(NotImplementedError) as cm:
++            next(iter(dataset))
++        self.assertIn("image dataset must implement `len()`.", str(cm.exception))
++
++
++if __name__ == "__main__":
++    unittest.main()

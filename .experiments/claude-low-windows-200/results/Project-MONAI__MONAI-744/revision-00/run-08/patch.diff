@@ -1,0 +1,171 @@
+diff --git a/docs/source/losses.rst b/docs/source/losses.rst
+index ce2e4a8..3f87f17 100644
+--- a/docs/source/losses.rst
++++ b/docs/source/losses.rst
+@@ -35,6 +35,14 @@ Segmentation Losses
+ .. autoclass:: generalized_dice
+     :members:
+ 
++`GeneralizedWassersteinDiceLoss`
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++.. autoclass:: GeneralizedWassersteinDiceLoss
++    :members:
++
++.. autoclass:: generalized_wasserstein_dice
++    :members:
++
+ `FocalLoss`
+ ~~~~~~~~~~~
+ .. autoclass:: FocalLoss
+diff --git a/monai/losses/__init__.py b/monai/losses/__init__.py
+index c9ab109..7c3ca0c 100644
+--- a/monai/losses/__init__.py
++++ b/monai/losses/__init__.py
+@@ -9,6 +9,15 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-from .dice import Dice, DiceLoss, GeneralizedDiceLoss, MaskedDiceLoss, dice, generalized_dice
++from .dice import (
++    Dice,
++    DiceLoss,
++    GeneralizedDiceLoss,
++    GeneralizedWassersteinDiceLoss,
++    MaskedDiceLoss,
++    dice,
++    generalized_dice,
++    generalized_wasserstein_dice,
++)
+ from .focal_loss import FocalLoss
+ from .tversky import TverskyLoss
+diff --git a/monai/losses/dice.py b/monai/losses/dice.py
+index 86823f2..f42c4a8 100644
+--- a/monai/losses/dice.py
++++ b/monai/losses/dice.py
+@@ -10,7 +10,7 @@
+ # limitations under the License.
+ 
+ import warnings
+-from typing import Callable, Optional, Union
++from typing import Callable, Optional, Sequence, Union
+ 
+ import torch
+ from torch.nn.modules.loss import _Loss
+@@ -297,5 +297,117 @@ class GeneralizedDiceLoss(_Loss):
+         return f
+ 
+ 
++class GeneralizedWassersteinDiceLoss(_Loss):
++    """
++    Compute the generalized Wasserstein Dice loss defined in:
++
++        Fidon L. et al. (2017) Generalised Wasserstein Dice Score for Imbalanced Multi-class
++        Segmentation Using Holistic Convolutional Networks. MICCAI 2017 (BrainLes workshop).
++
++    The loss uses a class distance matrix ``dist_matrix`` (CxC) so that confusing two classes
++    that are semantically close (e.g. two adjacent brain tissues) is penalized less than confusing
++    two distant classes. The per-class weights are the inverse squared volume of the ground truth
++    class, as in the generalized Dice loss, so that small structures are not overwhelmed.
++
++    For each sample, with predicted probabilities ``p`` and one-hot ground truth ``g``:
++
++        tp_l = sum_x (sum_k (1 - M[k, l]) * g_k(x)) * p_l(x)
++        union_l = sum_x (p_l(x) + g_l(x))
++        alpha_l = 1 / (sum_x g_l(x))^2   (0 if class l is absent from the ground truth)
++        loss = 1 - 2 * sum_l alpha_l * tp_l / sum_l alpha_l * union_l
++
++    where ``M`` is the normalized distance matrix (values in [0, 1], zero on the diagonal).
++    With a zero diagonal and a perfect prediction the loss is 0.
++    """
++
++    def __init__(
++        self,
++        dist_matrix: Union[torch.Tensor, Sequence[Sequence[float]]],
++        reduction: Union[LossReduction, str] = LossReduction.MEAN,
++    ) -> None:
++        """
++        Args:
++            dist_matrix: square matrix (CxC) of distances between the classes, with values in [0, 1]
++                and zeros on the diagonal (e.g. normalized Euclidean distances between class centroids).
++                Can be a torch tensor, numpy array or nested sequence.
++            reduction: {``"none"``, ``"mean"``, ``"sum"``}
++                Specifies the reduction to apply to the output. Defaults to ``"mean"``.
++
++                - ``"none"``: the loss of each sample in the batch is returned, shape [B].
++                - ``"mean"``: the mean of the per-sample losses.
++                - ``"sum"``: the sum of the per-sample losses.
++
++        Raises:
++            ValueError: dist_matrix is not a square 2D matrix.
++            ValueError: dist_matrix values are not in [0, 1].
++            ValueError: reduction={reduction} is invalid. Valid options are: none, mean or sum.
++
++        """
++        super().__init__(reduction=LossReduction(reduction).value)
++
++        m = torch.as_tensor(dist_matrix, dtype=torch.float32)
++        if m.dim() != 2 or m.shape[0] != m.shape[1]:
++            raise ValueError(f"dist_matrix must be a square 2D matrix, got shape {tuple(m.shape)}.")
++        if m.shape[0] < 2:
++            raise ValueError("dist_matrix must describe at least 2 classes.")
++        if torch.any(m < 0) or torch.any(m > 1):
++            raise ValueError("dist_matrix values must be in [0, 1].")
++        self.dist_matrix = m
++        self.num_classes = int(m.shape[0])
++
++    def forward(self, input: torch.Tensor, target: torch.Tensor, smooth: float = 1e-5) -> torch.Tensor:
++        """
++        Args:
++            input: the shape should be BCH[WD], raw logits; softmax is applied over the channel dim.
++            target: the shape should be BCH[WD], one-hot encoded ground truth.
++            smooth: a small constant to avoid nan.
++
++        Raises:
++            ValueError: the number of channels of input does not match the size of dist_matrix.
++            ValueError: reduction={self.reduction} is invalid.
++
++        """
++        if input.shape != target.shape:
++            raise AssertionError(f"ground truth has differing shape ({target.shape}) from input ({input.shape})")
++        if input.dim() < 3:
++            raise ValueError(f"input must have shape BCH[WD], got {tuple(input.shape)}.")
++        if input.shape[1] != self.num_classes:
++            raise ValueError(
++                f"number of channels of input ({input.shape[1]}) does not match dist_matrix size ({self.num_classes})."
++            )
++
++        m = self.dist_matrix.to(device=input.device, dtype=input.dtype)
++        p = torch.softmax(input, dim=1).flatten(2)  # B, C, N
++        g = target.to(dtype=input.dtype).flatten(2)  # B, C, N
++
++        # closeness between class k (ground truth) and class l (prediction): 1 - M[k, l]
++        # credit_l(x) = sum_k (1 - M[k, l]) * g_k(x) -> B, C, N
++        credit = torch.matmul((1.0 - m).t(), g)
++        # soft true positives: predicting class l where the ground truth is close to l
++        tp = torch.sum(credit * p, dim=2)  # B, C
++        union = torch.sum(p + g, dim=2)  # B, C
++
++        # generalized weights: inverse squared volume of the ground truth class,
++        # empty classes (no ground truth voxel) get zero weight
++        ground_o = torch.sum(g, dim=2)  # B, C
++        alpha = (ground_o > 0).to(dtype=input.dtype) / torch.clamp(ground_o * ground_o, min=smooth)
++
++        numerator = 2.0 * torch.sum(alpha * tp, dim=1) + smooth  # B
++        denominator = torch.sum(alpha * union, dim=1) + smooth  # B
++        f = 1.0 - numerator / denominator  # B
++
++        if self.reduction == LossReduction.MEAN.value:
++            f = torch.mean(f)
++        elif self.reduction == LossReduction.SUM.value:
++            f = torch.sum(f)
++        elif self.reduction == LossReduction.NONE.value:
++            pass  # returns per-sample losses, shape [B]
++        else:
++            raise ValueError(f"reduction={self.reduction} is invalid.")
++
++        return f
++
++
+ dice = Dice = DiceLoss
+ generalized_dice = GeneralizedDiceLoss
++generalized_wasserstein_dice = GeneralizedWassersteinDiceLoss

@@ -1,0 +1,170 @@
+diff --git a/monai/data/grid_dataset.py b/monai/data/grid_dataset.py
+index f85569d..de1442f 100644
+--- a/monai/data/grid_dataset.py
++++ b/monai/data/grid_dataset.py
+@@ -10,15 +10,17 @@
+ # limitations under the License.
+ 
+ import math
+-from typing import Callable, Dict, Optional, Sequence, Union
++import math
++from typing import Any, Callable, Generator, Optional, Sequence, Tuple, Union
+ 
++import numpy as np
+ import torch
+ from torch.utils.data import IterableDataset
+ 
+ from monai.data.dataset import Dataset
+-from monai.data.utils import iter_patch
++from monai.data.utils import get_valid_patch_size, iter_patch_slices
+ from monai.transforms import apply_transform
+-from monai.utils import NumpyPadMode, ensure_tuple
++from monai.utils import NumpyPadMode, ensure_tuple, ensure_tuple_size
+ 
+ __all__ = ["PatchDataset", "GridPatchDataset"]
+ 
+@@ -26,6 +28,8 @@ __all__ = ["PatchDataset", "GridPatchDataset"]
+ class GridPatchDataset(IterableDataset):
+     """
+     Yields patches from arrays read from an input dataset. The patches are chosen in a contiguous grid sampling scheme.
++    Each patch can optionally be processed by a patch-level `transform`, and can optionally be yielded together with
++    its coordinates in the source array.
+     """
+ 
+     def __init__(
+@@ -34,7 +38,9 @@ class GridPatchDataset(IterableDataset):
+         patch_size: Sequence[int],
+         start_pos: Sequence[int] = (),
+         mode: Union[NumpyPadMode, str] = NumpyPadMode.WRAP,
+-        **pad_opts: Dict,
++        transform: Optional[Callable] = None,
++        with_coordinates: bool = False,
++        **pad_opts: Any,
+     ) -> None:
+         """
+         Initializes this dataset in terms of the input dataset and patch size. The `patch_size` is the size of the
+@@ -43,6 +49,9 @@ class GridPatchDataset(IterableDataset):
+         array with 1 channel of size (1, 20, 20, 20) a regular grid sampling of eight patches (1, 10, 10, 10) would be
+         specified by a `patch_size` of (10, 10, 10).
+ 
++        Each item of the input dataset must be a sequence of arrays. For every grid position, one patch is extracted
++        from each array and the patches are yielded together as a tuple (one element per array).
++
+         Args:
+             dataset: the dataset to read array data from
+             patch_size: size of patches to generate slices for, 0/None selects whole dimension
+@@ -51,6 +60,11 @@ class GridPatchDataset(IterableDataset):
+                 ``"median"``, ``"minimum"``, ``"reflect"``, ``"symmetric"``, ``"wrap"``, ``"empty"``}
+                 One of the listed string values or a user supplied function. Defaults to ``"wrap"``.
+                 See also: https://numpy.org/doc/1.18/reference/generated/numpy.pad.html
++            transform: a patch-level transform applied to each extracted patch (each array's patch separately).
++                Applied before the coordinates are attached, so it only sees the patch data.
++            with_coordinates: if True, each element of the yielded tuple is a ``(patch, coordinates)`` pair, where
++                ``coordinates`` is a tuple of ints giving the start index of the patch in the original (unpadded)
++                array for each dimension (including the channel dimension). Defaults to False.
+             pad_opts: padding options, see numpy.pad
+         """
+ 
+@@ -59,6 +73,32 @@ class GridPatchDataset(IterableDataset):
+         self.start_pos = ensure_tuple(start_pos)
+         self.mode: NumpyPadMode = NumpyPadMode(mode)
+         self.pad_opts = pad_opts
++        self.transform = transform
++        self.with_coordinates = with_coordinates
++
++    def _iter_patches(self, arr: np.ndarray) -> Generator[Any, None, None]:
++        """
++        Yield the grid patches of a single array, each processed by `transform` and optionally paired with its
++        coordinates in the unpadded array.
++        """
++        patch_size_ = get_valid_patch_size(arr.shape, self.patch_size)
++        start_pos = ensure_tuple_size(self.start_pos, arr.ndim)
++
++        # pad by the patch size in each dimension so patches can be taken from the border regions
++        arrpad = np.pad(arr, tuple((p, p) for p in patch_size_), NumpyPadMode(self.mode).value, **self.pad_opts)
++
++        start_pos_padded = tuple(s + p for s, p in zip(start_pos, patch_size_))
++        iter_size = tuple(s + p for s, p in zip(arr.shape, patch_size_))
++
++        for slices in iter_patch_slices(iter_size, patch_size_, start_pos_padded):
++            patch = arrpad[slices]
++            if self.transform is not None:
++                patch = apply_transform(self.transform, patch, map_items=False)
++            if self.with_coordinates:
++                coords: Tuple[int, ...] = tuple(int(s.start - p) for s, p in zip(slices, patch_size_))
++                yield patch, coords
++            else:
++                yield patch
+ 
+     def __iter__(self):
+         worker_info = torch.utils.data.get_worker_info()
+@@ -75,7 +115,7 @@ class GridPatchDataset(IterableDataset):
+         for index in range(iter_start, iter_end):
+             arrays = self.dataset[index]
+ 
+-            iters = [iter_patch(a, self.patch_size, self.start_pos, False, self.mode, **self.pad_opts) for a in arrays]
++            iters = [self._iter_patches(a) for a in arrays]
+ 
+             yield from zip(*iters)
+ 
+diff --git a/tests/test_grid_patch_dataset.py b/tests/test_grid_patch_dataset.py
+new file mode 100644
+index 0000000..f28c8e9
+--- /dev/null
++++ b/tests/test_grid_patch_dataset.py
+@@ -0,0 +1,55 @@
++# Copyright 2020 - 2021 MONAI Consortium
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#     http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import unittest
++
++import numpy as np
++
++from monai.data import GridPatchDataset
++
++
++class TestGridPatchDataset(unittest.TestCase):
++    def setUp(self):
++        self.arr = np.arange(16, dtype=float).reshape(1, 4, 4)
++        self.dataset = [[self.arr]]
++
++    def test_no_coordinates(self):
++        ds = GridPatchDataset(dataset=self.dataset, patch_size=(2, 2), mode="constant")
++        items = list(ds)
++        self.assertEqual(len(items), 4)
++        for item in items:
++            self.assertEqual(len(item), 1)
++            self.assertIsInstance(item[0], np.ndarray)
++        np.testing.assert_allclose(items[0][0], np.array([[[0.0, 1.0], [4.0, 5.0]]]))
++
++    def test_with_coordinates(self):
++        ds = GridPatchDataset(dataset=self.dataset, patch_size=(2, 2), mode="constant", with_coordinates=True)
++        items = list(ds)
++        self.assertEqual(len(items), 4)
++        patch, coords = items[0][0]
++        np.testing.assert_allclose(patch, np.array([[[0.0, 1.0], [4.0, 5.0]]]))
++        self.assertEqual(tuple(coords), (0, 0, 0))
++
++    def test_patch_transform(self):
++        ds = GridPatchDataset(
++            dataset=self.dataset,
++            patch_size=(2, 2),
++            mode="constant",
++            transform=lambda x: x + 100.0,
++            with_coordinates=True,
++        )
++        patch, coords = next(iter(ds))[0]
++        np.testing.assert_allclose(patch, np.array([[[100.0, 101.0], [104.0, 105.0]]]))
++        self.assertEqual(tuple(coords), (0, 0, 0))
++
++
++if __name__ == "__main__":
++    unittest.main()

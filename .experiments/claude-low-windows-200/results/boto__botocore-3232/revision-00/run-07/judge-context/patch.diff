@@ -1,0 +1,154 @@
+diff --git a/.changes/next-release/enhancement-S3-expires.json b/.changes/next-release/enhancement-S3-expires.json
+new file mode 100644
+index 0000000..2bf616f
+--- /dev/null
++++ b/.changes/next-release/enhancement-S3-expires.json
+@@ -0,0 +1,7 @@
++[
++  {
++    "category": "S3",
++    "description": "Operations with an ``Expires`` output member now add an ``ExpiresString`` member that holds the raw header value. ``Expires`` is deprecated. If the header cannot be parsed as a timestamp, ``Expires`` is omitted from the response and a warning is logged instead of failing the operation.",
++    "type": "enhancement"
++  }
++]
+diff --git a/botocore/model.py b/botocore/model.py
+index 677266c..ad15289 100644
+--- a/botocore/model.py
++++ b/botocore/model.py
+@@ -482,6 +482,61 @@ class ServiceModel:
+         return f'{self.__class__.__name__}({self.service_name})'
+ 
+ 
++EXPIRES_MEMBER_NAME = 'Expires'
++EXPIRES_STRING_MEMBER_NAME = 'ExpiresString'
++_EXPIRES_DEPRECATION_DOC = (
++    '<p>This member is deprecated because the S3 <code>Expires</code> header '
++    'is not always a valid timestamp. If the value cannot be parsed, this '
++    'member is omitted from the response and a warning is logged. Use '
++    '<code>ExpiresString</code> to read the raw value of the header.</p>'
++)
++_EXPIRES_STRING_DOC = (
++    '<p>The raw value of the <code>Expires</code> header, returned as a '
++    'string. Unlike <code>Expires</code>, this value is not parsed and is '
++    'always present when the header is returned. Prefer this member over the '
++    'deprecated <code>Expires</code> member.</p>'
++)
++
++
++def _add_expires_string_member(shape):
++    """Customize an output shape that contains an ``Expires`` timestamp.
++
++    The ``Expires`` member is deprecated and documented as such, and a
++    synthetic ``ExpiresString`` string member is added that reads the same
++    ``Expires`` header but keeps the raw value without parsing it.
++
++    The shape's member mapping is updated in place, so this is idempotent.
++    Only the members of the given shape are changed; the referenced
++    ``Expires`` shape itself is left untouched.
++    """
++    if not isinstance(shape, StructureShape):
++        return
++    members = shape.members
++    expires = members.get(EXPIRES_MEMBER_NAME)
++    if expires is None or expires.type_name != 'timestamp':
++        return
++    if EXPIRES_STRING_MEMBER_NAME in members:
++        return
++    resolver = shape._shape_resolver
++
++    # Replace Expires with a copy that carries the deprecation documentation.
++    expires_model = dict(expires._shape_model)
++    expires_model['documentation'] = _EXPIRES_DEPRECATION_DOC
++    members[EXPIRES_MEMBER_NAME] = expires.__class__(
++        expires.name, expires_model, resolver
++    )
++
++    # Add ExpiresString, which shares the Expires header location but is a
++    # plain string so the raw header value is retained.
++    expires_string_model = dict(expires._shape_model)
++    expires_string_model['type'] = 'string'
++    expires_string_model['documentation'] = _EXPIRES_STRING_DOC
++    expires_string_model.pop('timestampFormat', None)
++    members[EXPIRES_STRING_MEMBER_NAME] = StringShape(
++        EXPIRES_STRING_MEMBER_NAME, expires_string_model, resolver
++    )
++
++
+ class OperationModel:
+     def __init__(self, operation_model, service_model, name=None):
+         """
+@@ -580,9 +635,11 @@ class OperationModel:
+             # in which case we return None to indicate the
+             # operation has no expected output.
+             return None
+-        return self._service_model.resolve_shape_ref(
++        output_shape = self._service_model.resolve_shape_ref(
+             self._operation_model['output']
+         )
++        _add_expires_string_member(output_shape)
++        return output_shape
+ 
+     @CachedProperty
+     def idempotent_members(self):
+diff --git a/botocore/parsers.py b/botocore/parsers.py
+index 0c7a34f..736da89 100644
+--- a/botocore/parsers.py
++++ b/botocore/parsers.py
+@@ -132,6 +132,21 @@ from botocore.utils import (
+ 
+ LOG = logging.getLogger(__name__)
+ 
++# Errors that parse_timestamp may raise for a value that is not a timestamp.
++_EXPIRES_PARSE_ERRORS = (
++    ValueError,
++    TypeError,
++    OverflowError,
++    OSError,
++    RuntimeError,
++)
++
++
++def _is_expires_member(shape):
++    # The S3 Expires header is modeled as a timestamp. It is parsed leniently
++    # because services can return values that are not valid timestamps.
++    return shape.name == 'Expires' and shape.type_name == 'timestamp'
++
+ DEFAULT_TIMESTAMP_PARSER = parse_timestamp
+ 
+ 
+@@ -966,9 +981,32 @@ class BaseRestParser(ResponseParser):
+             elif location == 'header':
+                 header_name = member_shape.serialization.get('name', name)
+                 if header_name in headers:
+-                    final_parsed[name] = self._parse_shape(
+-                        member_shape, headers[header_name]
+-                    )
++                    if _is_expires_member(member_shape):
++                        self._parse_expires_header(
++                            member_shape,
++                            headers[header_name],
++                            name,
++                            final_parsed,
++                        )
++                    else:
++                        final_parsed[name] = self._parse_shape(
++                            member_shape, headers[header_name]
++                        )
++
++    def _parse_expires_header(self, member_shape, value, name, final_parsed):
++        # The S3 Expires header is not always a valid timestamp. Rather than
++        # failing the whole operation, omit the deprecated member and warn.
++        # The raw value remains available through ExpiresString.
++        try:
++            final_parsed[name] = self._parse_shape(member_shape, value)
++        except _EXPIRES_PARSE_ERRORS:
++            LOG.warning(
++                'Unable to parse the "Expires" header value %r as a '
++                'timestamp. The "%s" member will be omitted from the response. '
++                'The raw value is available in the "ExpiresString" member.',
++                value,
++                name,
++            )
+ 
+     def _parse_header_map(self, shape, headers):
+         # Note that headers are case insensitive, so we .lower()

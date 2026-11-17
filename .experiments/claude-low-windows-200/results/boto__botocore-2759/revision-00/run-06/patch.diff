@@ -1,0 +1,167 @@
+diff --git a/botocore/args.py b/botocore/args.py
+index 0da5bb7..5f87508 100644
+--- a/botocore/args.py
++++ b/botocore/args.py
+@@ -35,6 +35,11 @@ VALID_REGIONAL_ENDPOINTS_CONFIG = [
+     'legacy',
+     'regional',
+ ]
++# Names of the builtin parameters that endpoint rulesets may reference.
++BUILTIN_REGION = 'AWS::Region'
++BUILTIN_USE_FIPS = 'AWS::UseFIPS'
++BUILTIN_USE_DUALSTACK = 'AWS::UseDualStack'
++BUILTIN_SDK_ENDPOINT = 'SDK::Endpoint'
+ LEGACY_GLOBAL_STS_REGIONS = [
+     'ap-northeast-1',
+     'ap-south-1',
+@@ -217,6 +222,12 @@ class ClientArgsCreator:
+         self._compute_retry_config(config_kwargs)
+         self._compute_connect_timeout(config_kwargs)
+         s3_config = self.compute_s3_config(client_config)
++        endpoint_builtins = self.compute_endpoint_builtins(
++            region_name=region_name,
++            endpoint_url=endpoint_url,
++            endpoint_variant_tags=endpoint_variant_tags,
++            client_config=client_config,
++        )
+ 
+         is_s3_service = service_name in ['s3', 's3-control']
+ 
+@@ -234,6 +245,46 @@ class ClientArgsCreator:
+             'config_kwargs': config_kwargs,
+             's3_config': s3_config,
+             'socket_options': self._compute_socket_options(scoped_config),
++            'endpoint_builtins': endpoint_builtins,
++        }
++
++    def compute_endpoint_builtins(
++        self,
++        region_name,
++        endpoint_url,
++        endpoint_variant_tags,
++        client_config,
++    ):
++        """Assign values to the builtin parameters for endpoint rulesets.
++
++        :type region_name: str
++        :param region_name: The region the client was created with.
++
++        :type endpoint_url: str
++        :param endpoint_url: The user-provided endpoint URL, if any.
++
++        :type endpoint_variant_tags: list
++        :param endpoint_variant_tags: Tags (e.g. 'fips', 'dualstack') of the
++            resolved endpoint variant.
++
++        :type client_config: botocore.config.Config
++        :param client_config: The user-provided client config, if any.
++
++        :rtype: dict
++        :return: Mapping of builtin parameter name to its value.
++        """
++        use_fips = 'fips' in endpoint_variant_tags
++        use_dualstack = 'dualstack' in endpoint_variant_tags
++        if client_config is not None:
++            use_fips = use_fips or bool(client_config.use_fips_endpoint)
++            use_dualstack = use_dualstack or bool(
++                client_config.use_dualstack_endpoint
++            )
++        return {
++            BUILTIN_REGION: region_name,
++            BUILTIN_USE_FIPS: use_fips,
++            BUILTIN_USE_DUALSTACK: use_dualstack,
++            BUILTIN_SDK_ENDPOINT: endpoint_url,
+         }
+ 
+     def compute_s3_config(self, client_config):
+diff --git a/tests/unit/test_args.py b/tests/unit/test_args.py
+index b2a2320..759f322 100644
+--- a/tests/unit/test_args.py
++++ b/tests/unit/test_args.py
+@@ -459,3 +459,86 @@ class TestCreateClientArgs(unittest.TestCase):
+             client_config=Config(retries={'mode': 'standard'})
+         )['client_config']
+         self.assertEqual(config.retries['mode'], 'standard')
++
++
++class TestComputeEndpointBuiltins(unittest.TestCase):
++    def setUp(self):
++        self.args_create = args.ClientArgsCreator(
++            mock.Mock(HierarchicalEmitter),
++            None,
++            None,
++            None,
++            None,
++            ConfigValueStore(),
++        )
++
++    def compute(self, **kwargs):
++        defaults = dict(
++            region_name='us-west-2',
++            endpoint_url=None,
++            endpoint_variant_tags=[],
++            client_config=None,
++        )
++        defaults.update(kwargs)
++        return self.args_create.compute_endpoint_builtins(**defaults)
++
++    def test_region_is_assigned(self):
++        builtins = self.compute(region_name='eu-west-1')
++        self.assertEqual(builtins[args.BUILTIN_REGION], 'eu-west-1')
++
++    def test_defaults_are_false_and_none(self):
++        builtins = self.compute()
++        self.assertFalse(builtins[args.BUILTIN_USE_FIPS])
++        self.assertFalse(builtins[args.BUILTIN_USE_DUALSTACK])
++        self.assertIsNone(builtins[args.BUILTIN_SDK_ENDPOINT])
++
++    def test_endpoint_url_is_assigned_to_sdk_endpoint(self):
++        builtins = self.compute(endpoint_url='https://custom/')
++        self.assertEqual(
++            builtins[args.BUILTIN_SDK_ENDPOINT], 'https://custom/'
++        )
++
++    def test_fips_from_variant_tags(self):
++        builtins = self.compute(endpoint_variant_tags=['fips'])
++        self.assertTrue(builtins[args.BUILTIN_USE_FIPS])
++        self.assertFalse(builtins[args.BUILTIN_USE_DUALSTACK])
++
++    def test_dualstack_from_variant_tags(self):
++        builtins = self.compute(endpoint_variant_tags=['dualstack'])
++        self.assertTrue(builtins[args.BUILTIN_USE_DUALSTACK])
++        self.assertFalse(builtins[args.BUILTIN_USE_FIPS])
++
++    def test_fips_and_dualstack_from_client_config(self):
++        config = botocore.config.Config(
++            use_fips_endpoint=True, use_dualstack_endpoint=True
++        )
++        builtins = self.compute(client_config=config)
++        self.assertTrue(builtins[args.BUILTIN_USE_FIPS])
++        self.assertTrue(builtins[args.BUILTIN_USE_DUALSTACK])
++
++    def test_compute_client_args_includes_endpoint_builtins(self):
++        bridge = mock.Mock(ClientEndpointBridge)
++        bridge.resolve.return_value = {
++            'region_name': 'us-west-2',
++            'signature_version': 'v4',
++            'endpoint_url': 'https://ec2/',
++            'signing_name': 'ec2',
++            'signing_region': 'us-west-2',
++            'metadata': {'tags': ['fips']},
++        }
++        service_model = mock.Mock(ServiceModel)
++        service_model.endpoint_prefix = 'ec2'
++        service_model.metadata = {'protocol': 'query'}
++        final = self.args_create.compute_client_args(
++            service_model,
++            None,
++            bridge,
++            'us-west-2',
++            None,
++            True,
++            None,
++        )
++        self.assertTrue(final['endpoint_builtins'][args.BUILTIN_USE_FIPS])
++        self.assertEqual(
++            final['endpoint_builtins'][args.BUILTIN_REGION], 'us-west-2'
++        )

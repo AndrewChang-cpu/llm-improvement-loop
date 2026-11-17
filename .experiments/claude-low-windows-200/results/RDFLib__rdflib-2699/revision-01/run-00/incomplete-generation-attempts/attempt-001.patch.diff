@@ -1,0 +1,132 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 64ab952..54bdd66 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -14,7 +14,7 @@ Iterative specification refinement on FEA-Bench PRs. Each revision of a feature'
+ | `view_experiment.py` | evaluation viewer (HTML file, or live with `--serve PORT`) |
+ | `retire_workspaces.py` | turns judged runs into `patch.diff` (or `generated.tar.gz`) to free disk |
+ | `experiments/build_windows_100.py` | builds `experiments/windows-100/` (the Windows PRs) |
+-| `ghc-health-check.sh`, `windows-watch.sh` | deterministic hourly health check (OK or PROBLEM); the watcher wakes an LLM fixer only on PROBLEM |
++| `ghc-health-check.sh`, `windows-watch.sh` | deterministic hourly health check (OK or PROBLEM); the Windows watcher notifies the existing supervisor only on PROBLEM |
+ 
+ ## Machines and task lists
+ 
+@@ -88,11 +88,11 @@ The code is Unix-only; run it in WSL2, in the Linux filesystem (`~`), not `/mnt/
+ 3. uv and Python: `curl -LsSf https://astral.sh/uv/install.sh | sh`, open a new shell, `uv python install 3.12` and put it on PATH as `python3.12` (`ln -s "$(uv python find 3.12)" ~/.local/bin/python3.12`).
+ 4. Codex CLI (as GHC pins it): `curl -fsSL https://github.com/openai/codex/releases/download/rust-v0.169.0/codex-x86_64-unknown-linux-musl.tar.gz | tar -xz -C ~/.local/bin && mv ~/.local/bin/codex-x86_64-unknown-linux-musl ~/.local/bin/codex`, then `codex login` (ChatGPT login; no API key). Optional Claude: `curl -fsSL https://claude.ai/install.sh | bash && claude auth login`.
+ 5. `git clone https://github.com/AndrewChang-cpu/llm-improvement-loop.git ~/llm-improvement-loop && cd ~/llm-improvement-loop`, then `python3 run_experiment.py smoke --backend codex --output .experiments/codex-smoke-windows`.
+-6. After the user confirms, start the Codex queue in tmux (the same command the watcher's fixer restarts):
++6. After the user confirms, start the Codex queue in tmux:
+    `mkdir -p ~/llm-watch && tmux new-session -d -s queue "BASE=$HOME/llm-watch GHC_TASKS=tasks/windows.txt GHC_OUTPUT=.experiments/codex-low-windows BACKEND=codex MANIFEST=experiments/windows-100/runner-manifest.json ./ghc-run.sh claude 2>&1 | tee -a $PWD/queue.log; exec bash"`
+ 7. Hourly watcher: `sudo apt install -y cron && sudo systemctl enable --now cron`, then add with `crontab -e`:
+    `5 * * * * $HOME/llm-improvement-loop/windows-watch.sh >> $HOME/llm-watch/watch.log 2>&1`.
+-   Each run executes `ghc-health-check.sh` on the Windows queue (no tokens). Only on PROBLEM (queue stopped unfinished, a `failed` task, or a feature with no file changed in 60 minutes) it runs a headless `codex exec` fixer, at most one per hour. Test the fixer path once with `FIXER_TEST=1 ./windows-watch.sh`. Log: `~/llm-watch/watch.log`.
++   Set the existing supervising Orca terminal handle in `~/llm-watch/supervisor-terminal` (one line; discover with `orca terminal list --json`). Each run executes `ghc-health-check.sh` without tokens. On PROBLEM (queue stopped unfinished, a failed task, or no feature file changed in 60 minutes), it sends a prompt to that existing session through `orca terminal send`, at most once per hour. It never launches a separate fixer. The supervising session and Orca must remain available; update the handle if the session is replaced. Test delivery with `NOTIFY_TEST=1 ./windows-watch.sh`. Log: `~/llm-watch/watch.log`.
+ 
+ - Tasks: `tasks/windows.txt` = `experiments/windows-100/`, a seeded uniform random sample of the 1,299 FEA-Bench PRs outside batch-100 and the two pilots (the study's goal is all 1,401). Each PR is installed the way FEA-Bench's harness does it: batch-100's validated install lists for repositories batch-100 covers, otherwise the install table FEA-Bench inherits from SWE-bench (converted to pip; sympy tests selected by name with `pytest -k`). These environments are unvalidated; a task whose reference checks fail ends `failed` during preparation (see its log) and needs a manifest fix, not a rerun.
+ - Sync results back: commit `.experiments/codex-low-windows` (`.gitignore` drops workspaces) on a branch and push, or `rsync -a --exclude tasks/ .experiments/codex-low-windows/ <mac>:<repo>/.experiments/codex-low-windows/`.
+diff --git a/experiments/windows-100/runner-manifest.json b/experiments/windows-100/runner-manifest.json
+index a0d59d6..e42bf20 100644
+--- a/experiments/windows-100/runner-manifest.json
++++ b/experiments/windows-100/runner-manifest.json
+@@ -94,9 +94,18 @@
+     "base_commit": "7ab0711dbd6a67139430a747e7e27e166db599ba",
+     "install": [
+       [
+-        "pytest"
++        "pytest",
++        "parameterized",
++        "wheel",
++        "setuptools<81"
++      ],
++      [
++        "torch==2.8.0+cpu",
++        "--index-url",
++        "https://download.pytorch.org/whl/cpu"
+       ],
+       [
++        "--no-build-isolation",
+         "-e",
+         "."
+       ]
+@@ -159,7 +168,7 @@
+       "convention_fit": "Follow the repository conventions visible in the original and reference code for validation, errors, naming, logging, and tests.",
+       "requirement_intent": "The feature satisfies its behavioral intent and constraints."
+     },
+-    "environment_note": "SWE-bench environment converted to pip"
++    "environment_note": "SWE-bench environment converted to pip; disable build isolation and retain setuptools<81 because historical setup.py imports pkg_resources; include parameterized for reference tests; CPU-only torch 2.8.0 avoids unsupported GTX 970 CUDA kernels (all seven reference checks pass on CPU)"
+   },
+   {
+     "id": "PyThaiNLP__pythainlp-1054",
+diff --git a/run_experiment.py b/run_experiment.py
+index 5eff220..0e56662 100644
+--- a/run_experiment.py
++++ b/run_experiment.py
+@@ -375,7 +375,7 @@ def claude_command(executable, model, schema, effort="low"):
+                 "network": {"allowedDomains": [], "deniedDomains": ["*"]}}}
+     return [executable, "-p", "--model", model, "--effort", effort,
+             "--output-format", "stream-json", "--verbose", "--json-schema", json.dumps(schema),
+-            "--safe-mode", "--disable-slash-commands", "--setting-sources", "", "--settings", json.dumps(settings),
++            "--disable-slash-commands", "--setting-sources", "", "--settings", json.dumps(settings),
+             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+             "--tools", "Bash,Read,Edit,Write,Glob,Grep", "--dangerously-skip-permissions",
+             "--no-session-persistence"]
+@@ -430,6 +430,7 @@ def resume_settings(output, settings):
+             "71d0f58eef5bb673726dfe17df8f3ccd202780b14694252ef39d9e086e13bc3a",
+             "659b8adbf302b69a88522186d36c7558d67ed106e8bb5812b9f8db308ed786d5",
+             "7260356a613b4425b8a0ebaeeec6a15a45ee13fd2ee29d554c3d4b7ec02c1a55",
++            "e0c2f5f51a7834a0168d99b95234fe37fd73add9fb07201fb455fd10d38faf75",
+         }
+         if old.get("runner_sha256") in compatible:
+             if "judge_effort" in current:
+diff --git a/windows-watch.sh b/windows-watch.sh
+index 2faf6d1..6aea2f7 100755
+--- a/windows-watch.sh
++++ b/windows-watch.sh
+@@ -1,32 +1,25 @@
+ #!/usr/bin/env bash
+-# Hourly watcher for the Windows (WSL2) Codex queue, run by cron (see AGENTS.md, Windows).
+-# Runs the deterministic health check; only on PROBLEM, a headless Codex fixer investigates and
+-# resumes the queue. At most one fixer at a time and one per hour. FIXER_TEST=1 fakes a PROBLEM.
+-# Log: ~/llm-watch/watch.log. Settings: STATE (~/llm-watch), QUEUE_OUTPUT, CLOG.
++# Hourly deterministic health check; send problems to the existing supervising Orca session.
+ cd "$(dirname "$0")" || exit 1
+-export PATH="$HOME/.local/bin:$PATH"
++export PATH="$HOME/.orca/cli/bin:$HOME/.local/bin:$PATH"
+ STATE=${STATE:-$HOME/llm-watch}
+ export QUEUE_OUTPUT=${QUEUE_OUTPUT:-.experiments/codex-low-windows} CLOG=${CLOG:-$PWD/queue.log}
+ mkdir -p "$STATE"
+-# The Windows queue command (AGENTS.md); the fixer restarts it with this.
+-RUN="BASE=$STATE GHC_TASKS=tasks/windows.txt GHC_OUTPUT=$QUEUE_OUTPUT BACKEND=codex MANIFEST=experiments/windows-100/runner-manifest.json ./ghc-run.sh claude 2>&1 | tee -a $CLOG; exec bash"
+ echo "=== $(date) watch"
+ health=$(BASE=$STATE bash ghc-health-check.sh 2>&1)
+-[ "${FIXER_TEST:-}" = 1 ] && health="PROBLEM: smoke test of the fixer path; there is no real problem"
++[ "${NOTIFY_TEST:-}" = 1 ] && health="PROBLEM: notification delivery test; no action required"
+ grep -v '^result:' <<< "$health"
+ grep -q '^PROBLEM' <<< "$health" || exit 0
+-if [ "${FIXER_TEST:-}" != 1 ] && [ -f "$STATE/fixer.last" ] \
+-    && [ $(( $(date +%s) - $(cat "$STATE/fixer.last") )) -lt 3300 ]; then
+-    echo "fixer ran less than an hour ago; skipping"; exit 0
++mkdir "$STATE/notify.lock" 2>/dev/null || { echo "another notification is running; skipping"; exit 0; }
++trap 'rmdir "$STATE/notify.lock"' EXIT
++if [ "${NOTIFY_TEST:-}" != 1 ] && [ -f "$STATE/notify.last" ] \
++    && [ $(( $(date +%s) - $(cat "$STATE/notify.last") )) -lt 3300 ]; then
++    echo "notified less than an hour ago; skipping"; exit 0
+ fi
+-mkdir "$STATE/fixer.lock" 2>/dev/null || { echo "another fixer is running; skipping"; exit 0; }
+-trap 'rmdir "$STATE/fixer.lock"' EXIT
+-[ "${FIXER_TEST:-}" = 1 ] || date +%s > "$STATE/fixer.last"
++terminal=${SUPERVISOR_TERMINAL:-$(cat "$STATE/supervisor-terminal" 2>/dev/null)}
++[ -n "$terminal" ] || { echo "ERROR: no supervising terminal configured in $STATE/supervisor-terminal"; exit 1; }
+ problems=$(grep '^PROBLEM' <<< "$health")
+-if [ "${FIXER_TEST:-}" = 1 ]; then
+-    prompt="Smoke test of the unattended fixer: $problems. Do not run any tools or change anything. Reply with exactly: fixer smoke ok"
+-else
+-    prompt="You are the unattended fixer for the Windows (WSL2) Codex queue: tmux session 'queue', log $CLOG, output $QUEUE_OUTPUT (see AGENTS.md, Windows). Health check reported: $problems. Investigate only that, fix per AGENTS.md rules (never alter or redo judgments; keep original model outputs), and resume the queue: tmux kill-session -t queue; tmux new-session -d -s queue \"$RUN\". Do not commit or push. Reply in under 100 words: cause, what you changed, current state."
+-fi
+-echo "fixer: $problems"
+-timeout 50m codex -a never exec --dangerously-bypass-approvals-and-sandbox "$prompt" < /dev/null 2>&1 | tail -20 | sed 's/^/fixer> /'
++prompt="Hourly Windows queue health check: $problems. Investigate and fix the loop/script in this existing session, following AGENTS.md. Preserve original judgments. Do not launch a separate fixer. Logs: $CLOG; output: $QUEUE_OUTPUT."
++[ "${NOTIFY_TEST:-}" = 1 ] && prompt="Watcher notification test: delivery to the existing supervisor works. No separate fixer should run; continue the current task."
++orca terminal send --terminal "$terminal" --text "$prompt" --enter --json || exit 1
++[ "${NOTIFY_TEST:-}" = 1 ] || date +%s > "$STATE/notify.last"

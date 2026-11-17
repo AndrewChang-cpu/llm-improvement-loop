@@ -1,0 +1,156 @@
+diff --git a/astropy/time/formats.py b/astropy/time/formats.py
+index 1d01871..fc19400 100644
+--- a/astropy/time/formats.py
++++ b/astropy/time/formats.py
+@@ -42,6 +42,7 @@ __all__ = [
+     "TimeDeltaFormat",
+     "TimeDeltaSec",
+     "TimeDeltaJD",
++    "TimeDeltaQuantityString",
+     "TimeEpochDateString",
+     "TimeBesselianEpochString",
+     "TimeJulianEpochString",
+@@ -2175,6 +2176,143 @@ class TimeDeltaDatetime(TimeDeltaFormat, TimeUnique):
+         return self.mask_if_needed(iterator.operands[-1])
+ 
+ 
++# Regular expression for the "quantity_str" TimeDelta format. It is kept as a
++# single pattern so that it can be reused in non-Python implementations.
++# Components are optional but must appear in the order yr, d, hr, min, s.
++_QUANTITY_STR_NUM = r"(?:\d+\.?\d*|\.\d+)"
++_QUANTITY_STR_RE = re.compile(
++    r"\s*(?P<sign>[+-])?\s*"
++    rf"(?:(?P<yr>{_QUANTITY_STR_NUM})\s*yr\s*)?"
++    rf"(?:(?P<d>{_QUANTITY_STR_NUM})\s*d\s*)?"
++    rf"(?:(?P<hr>{_QUANTITY_STR_NUM})\s*hr\s*)?"
++    rf"(?:(?P<min>{_QUANTITY_STR_NUM})\s*min\s*)?"
++    rf"(?:(?P<s>{_QUANTITY_STR_NUM})\s*s)?"
++    r"\s*"
++)
++
++
++class TimeDeltaQuantityString(TimeDeltaFormat, TimeUnique):
++    """
++    Time delta as a string with one or more Quantity components.
++
++    The string is a sequence of one or more components, each a number
++    (int or float) followed by a time unit. The allowed units are:
++
++    - 'yr': years (365.25 days)
++    - 'd': days (24 hours)
++    - 'hr': hours (60 minutes)
++    - 'min': minutes (60 seconds)
++    - 's': seconds
++
++    The components must appear in that order, each is optional, and
++    whitespace is allowed but optional. An optional leading sign applies to
++    the whole string. For example, "[-+]? 1yr 2d 3hr 4min 5.6s".
++
++    These are physical time intervals, not calendar intervals.
++
++    The allowed output subformats are 'multi' (default) and the single unit
++    subformats 'yr', 'd', 'hr', 'min', 's'. The 'multi' output has a single
++    space between components. The ``precision`` attribute gives the number of
++    decimal places for the (last) seconds or single-unit value.
++
++    Note that the internal calculations use 64-bit floating point, so this
++    format is not suitable for high-precision applications.
++    """
++
++    name = "quantity_str"
++
++    # Number of seconds in each allowed component unit.
++    _unit_seconds = {
++        "yr": 365.25 * 86400.0,
++        "d": 86400.0,
++        "hr": 3600.0,
++        "min": 60.0,
++        "s": 1.0,
++    }
++
++    subfmts = (
++        ("multi", None, None),
++        ("yr", None, None),
++        ("d", None, None),
++        ("hr", None, None),
++        ("min", None, None),
++        ("s", None, None),
++    )
++
++    def _check_val_type(self, val1, val2):
++        if val1.dtype.kind not in ("S", "U") and val1.size:
++            raise TypeError(f"Input values for {self.name} class must be strings")
++        if val2 is not None:
++            raise ValueError(
++                f"{self.name} objects do not accept a val2 but you provided {val2}"
++            )
++        return val1, None
++
++    @classmethod
++    def _parse_string(cls, timestr):
++        """Return (jd1, jd2) in days for a single quantity string."""
++        match = _QUANTITY_STR_RE.fullmatch(timestr)
++        if match is None or all(
++            match.group(key) is None for key in cls._unit_seconds
++        ):
++            raise ValueError(f"Time {timestr} does not match {cls.name} format")
++
++        sign = -1.0 if match.group("sign") == "-" else 1.0
++        vals = {
++            key: float(match.group(key)) if match.group(key) is not None else 0.0
++            for key in cls._unit_seconds
++        }
++        # Split into a whole-day part and a fractional-day part.
++        jd1 = vals["yr"] * 365.25 + vals["d"]
++        jd2 = vals["hr"] / 24.0 + vals["min"] / 1440.0 + vals["s"] / 86400.0
++        return sign * jd1, sign * jd2
++
++    def set_jds(self, val1, val2):
++        self._check_scale(self._scale)  # Validate scale.
++        jd1 = np.zeros(val1.shape, dtype=float)
++        jd2 = np.zeros(val1.shape, dtype=float)
++        for idx in np.ndindex(val1.shape):
++            timestr = val1[idx]
++            if isinstance(timestr, bytes):
++                timestr = timestr.decode("ascii")
++            jd1[idx], jd2[idx] = self._parse_string(str(timestr))
++        self.jd1, self.jd2 = day_frac(jd1, jd2)
++
++    @classmethod
++    def _format_multi(cls, secs, precision):
++        """Format a number of seconds as a multi-component string."""
++        negative = secs < 0
++        secs = round(abs(secs), precision)
++        sign = "-" if negative and secs > 0 else ""
++        parts = []
++        for unit in ("yr", "d", "hr", "min"):
++            unit_secs = cls._unit_seconds[unit]
++            n = int(secs // unit_secs)
++            if n:
++                parts.append(f"{n}{unit}")
++                secs -= n * unit_secs
++        remainder = max(secs, 0.0)
++        if remainder > 0 or not parts:
++            parts.append(f"{remainder:.{precision}f}s")
++        return sign + " ".join(parts)
++
++    @property
++    def value(self):
++        subfmt = self._select_subfmts(self.out_subfmt)[0][0]
++        precision = self.precision
++
++        outs = []
++        for idx in np.ndindex(self.jd1.shape):
++            secs = (self.jd1[idx] + self.jd2[idx]) * 86400.0
++            if subfmt == "multi":
++                outs.append(self._format_multi(float(secs), precision))
++            else:
++                value = float(secs) / self._unit_seconds[subfmt]
++                outs.append(f"{value:.{precision}f}{subfmt}")
++
++        return np.array(outs).reshape(self.jd1.shape)
++
++
+ def _validate_jd_for_storage(jd):
+     if isinstance(jd, (float, int)):
+         return np.array(jd, dtype=float)

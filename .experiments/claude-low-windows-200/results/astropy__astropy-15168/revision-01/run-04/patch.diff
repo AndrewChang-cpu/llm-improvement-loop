@@ -1,0 +1,198 @@
+diff --git a/astropy/cosmology/core.py b/astropy/cosmology/core.py
+index 3fdc7b1..9dec0a2 100644
+--- a/astropy/cosmology/core.py
++++ b/astropy/cosmology/core.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import abc
+ import inspect
++from types import MappingProxyType
+ from typing import TYPE_CHECKING, Any, TypeVar
+ 
+ import numpy as np
+@@ -54,6 +55,51 @@ class CosmologyError(Exception):
+     pass
+ 
+ 
++class _ParameterMappingDescriptor:
++    """Read-only mapping of parameter names to Parameters or values.
++
++    This is a data descriptor (it defines ``__set__``), so instance attributes
++    cannot shadow it. Its public name is learned from the owning class via
++    ``__set_name__``. The name sets are read from the class' ``__parameters__``
++    and ``__all_parameters__`` tuples, which are computed in
++    ``Cosmology.__init_subclass__``.
++    """
++
++    _name: str
++    _derived: bool
++
++    def __init__(self, *, derived: bool, doc: str) -> None:
++        self._derived = derived
++        self.__doc__ = doc
++
++    def __set_name__(self, owner: type, name: str) -> None:
++        self._name = name
++
++    def _names(self, cosmo_cls: type[Cosmology]) -> tuple[str, ...]:
++        if self._derived:
++            nonderived = cosmo_cls.__parameters__
++            return tuple(n for n in cosmo_cls.__all_parameters__ if n not in nonderived)
++        return cosmo_cls.__parameters__
++
++    def __get__(
++        self, cosmology: Cosmology | None, cosmo_cls: type[Cosmology] | None = None
++    ) -> MappingProxyType[str, Any]:
++        if cosmology is None:
++            # Class access: map names to the Parameter objects themselves.
++            return MappingProxyType(
++                {n: getattr(cosmo_cls, n) for n in self._names(cosmo_cls)}
++            )
++        # Instance access: map names to the current parameter values.
++        return MappingProxyType(
++            {n: getattr(cosmology, n) for n in self._names(type(cosmology))}
++        )
++
++    def __set__(self, cosmology: Cosmology, value: Any) -> None:
++        raise AttributeError(
++            f"cannot set {self._name!r} of {cosmology!r}"
++        )
++
++
+ class Cosmology(metaclass=abc.ABCMeta):
+     """Base-class for all Cosmologies.
+ 
+@@ -96,6 +142,24 @@ class Cosmology(metaclass=abc.ABCMeta):
+     __parameters__: tuple[str, ...] = ()
+     __all_parameters__: tuple[str, ...] = ()
+ 
++    # Read-only mappings of the non-derived and derived parameters.
++    parameters = _ParameterMappingDescriptor(
++        derived=False,
++        doc=(
++            "Immutable mapping of the non-derived parameter names. From the class, "
++            "the values are the `~astropy.cosmology.Parameter` objects; from an "
++            "instance, the values are the current parameter values."
++        ),
++    )
++    derived_parameters = _ParameterMappingDescriptor(
++        derived=True,
++        doc=(
++            "Immutable mapping of the derived parameter names. From the class, "
++            "the values are the `~astropy.cosmology.Parameter` objects; from an "
++            "instance, the values are the current parameter values."
++        ),
++    )
++
+     # ---------------------------------------------------------------
+ 
+     def __init_subclass__(cls):
+@@ -104,17 +168,23 @@ class Cosmology(metaclass=abc.ABCMeta):
+         # -------------------
+         # Parameters
+ 
+-        # Get parameters that are still Parameters, either in this class or above.
++        # Get parameters that are still Parameters, either in this class or above
++        # (derived ones included, so they are inherited by subclasses).
+         parameters = []
+         derived_parameters = []
+-        for n in cls.__parameters__:
++        for n in cls.__all_parameters__:
+             p = getattr(cls, n)
+             if isinstance(p, Parameter):
+                 derived_parameters.append(n) if p.derived else parameters.append(n)
+ 
+         # Add new parameter definitions
+         for n, v in cls.__dict__.items():
+-            if n in parameters or n.startswith("_") or not isinstance(v, Parameter):
++            if (
++                n in parameters
++                or n in derived_parameters
++                or n.startswith("_")
++                or not isinstance(v, Parameter)
++            ):
+                 continue
+             derived_parameters.append(n) if v.derived else parameters.append(n)
+ 
+diff --git a/astropy/cosmology/tests/test_parameter.py b/astropy/cosmology/tests/test_parameter.py
+index 6757a5a..d551adc 100644
+--- a/astropy/cosmology/tests/test_parameter.py
++++ b/astropy/cosmology/tests/test_parameter.py
+@@ -183,6 +183,48 @@ class ParameterTestMixin:
+         with pytest.raises(AttributeError, match="can't set attribute"):
+             setattr(cosmo, all_parameter.name, None)
+ 
++    # -------------------------------------------
++    # parameters & derived_parameters mappings
++
++    def test_parameters_mapping_from_class(self, cosmo_cls):
++        """Class access returns read-only mappings of Parameter objects."""
++        nonderived = set(cosmo_cls.__parameters__)
++        derived = set(cosmo_cls.__all_parameters__) - nonderived
++        for attr, names in (("parameters", nonderived), ("derived_parameters", derived)):
++            mapping = getattr(cosmo_cls, attr)
++            assert set(mapping) == set(names)
++            assert all(isinstance(v, Parameter) for v in mapping.values())
++            with pytest.raises(TypeError):
++                mapping["H0"] = None
++            with pytest.raises(TypeError):
++                del mapping[next(iter(mapping))]
++
++    def test_parameters_mapping_from_instance(self, cosmo_cls, cosmo):
++        """Instance access returns read-only mappings of parameter values."""
++        for attr in ("parameters", "derived_parameters"):
++            mapping = getattr(cosmo, attr)
++            for n, v in mapping.items():
++                np.testing.assert_array_equal(v, getattr(cosmo, n))
++            with pytest.raises(TypeError):
++                mapping[next(iter(mapping))] = None
++
++    def test_parameters_mapping_derived_split(self, cosmo_cls):
++        """The derived and non-derived sets are disjoint and cover all parameters."""
++        nonderived = set(cosmo_cls.parameters)
++        derived = set(cosmo_cls.derived_parameters)
++        assert nonderived.isdisjoint(derived)
++        assert nonderived | derived == set(cosmo_cls.__all_parameters__)
++        assert tuple(cosmo_cls.parameters) == cosmo_cls.__parameters__
++
++    @pytest.mark.parametrize("attr", ["parameters", "derived_parameters"])
++    def test_parameters_mapping_set_rejected(self, cosmo, attr):
++        """Setting the mapping attributes on an instance raises AttributeError."""
++        before = dict(getattr(cosmo, attr))
++        with pytest.raises(AttributeError, match=f"cannot set '{attr}' of"):
++            setattr(cosmo, attr, None)
++        # still behaves as before
++        assert dict(getattr(cosmo, attr)).keys() == before.keys()
++
+     # -------------------------------------------
+     # validate value
+     # tested later.
+@@ -527,3 +569,18 @@ class TestParameter(ParameterTestMixin):
+         # unregister
+         _COSMOLOGY_CLASSES.pop(Example.__qualname__)
+         assert Example.__qualname__ not in _COSMOLOGY_CLASSES
++
++    def test_parameters_mapping_inherited_derived(self):
++        """Subclasses of a flat cosmology keep inherited derived parameters."""
++        from astropy.cosmology import FlatLambdaCDM
++
++        class Example(FlatLambdaCDM):
++            pass
++
++        assert "Ode0" in Example.derived_parameters
++        assert "Ode0" not in Example.parameters
++        assert Example.derived_parameters["Ode0"] is Example.Ode0
++        assert "Ode0" in Example(H0=70, Om0=0.3).derived_parameters
++
++        # unregister
++        _COSMOLOGY_CLASSES.pop(Example.__qualname__)
+diff --git a/docs/changes/cosmology/15168.feature.rst b/docs/changes/cosmology/15168.feature.rst
+new file mode 100644
+index 0000000..8e3f22a
+--- /dev/null
++++ b/docs/changes/cosmology/15168.feature.rst
+@@ -0,0 +1,4 @@
++Added read-only mapping properties ``parameters`` and ``derived_parameters`` to
++``Cosmology``. These return immutable dictionaries keyed by parameter name. From the
++class, the values are the ``Parameter`` objects; from an instance, the values are the
++current parameter values.

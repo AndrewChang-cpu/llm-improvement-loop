@@ -1,0 +1,171 @@
+diff --git a/conan/api/subapi/install.py b/conan/api/subapi/install.py
+index 14e94f1..7163b4d 100644
+--- a/conan/api/subapi/install.py
++++ b/conan/api/subapi/install.py
+@@ -69,4 +69,4 @@ class InstallAPI:
+ 
+         conanfile.generators = list(set(conanfile.generators).union(generators or []))
+         app = ConanApp(self.conan_api.cache_folder)
+-        write_generators(conanfile, app.hook_manager)
++        write_generators(conanfile, app.hook_manager, app.cache)
+diff --git a/conans/client/cache/cache.py b/conans/client/cache/cache.py
+index ea45015..6046854 100644
+--- a/conans/client/cache/cache.py
++++ b/conans/client/cache/cache.py
+@@ -29,6 +29,7 @@ HOOKS_EXTENSION_FOLDER = "hooks"
+ PLUGINS_FOLDER = "plugins"
+ DEPLOYERS_EXTENSION_FOLDER = "deploy"
+ CUSTOM_COMMANDS_FOLDER = "commands"
++GENERATORS_EXTENSION_FOLDER = "generators"
+ 
+ 
+ # TODO: Rename this to ClientHome
+@@ -208,6 +209,13 @@ class ClientCache(object):
+     def deployers_path(self):
+         return os.path.join(self.cache_folder, EXTENSIONS_FOLDER, DEPLOYERS_EXTENSION_FOLDER)
+ 
++    @property
++    def generators_path(self):
++        """
++        :return: Custom global generators folder in client cache
++        """
++        return os.path.join(self.cache_folder, EXTENSIONS_FOLDER, GENERATORS_EXTENSION_FOLDER)
++
+     @property
+     def settings(self):
+         """Returns {setting: [value, ...]} defining all the possible
+diff --git a/conans/client/generators/__init__.py b/conans/client/generators/__init__.py
+index 29a7c52..307504a 100644
+--- a/conans/client/generators/__init__.py
++++ b/conans/client/generators/__init__.py
+@@ -1,3 +1,4 @@
++import inspect
+ import os
+ import traceback
+ import importlib
+@@ -23,34 +24,84 @@ _generators = {"CMakeToolchain": "conan.tools.cmake", "CMakeDeps": "conan.tools.
+                }
+ 
+ 
+-def _get_generator_class(generator_name):
++def _load_custom_generator_class(generator_name, generators_path):
++    """ Look for a class named ``generator_name`` defined in any ``*.py`` file of the
++    cache ``extensions/generators`` folder. Only classes defined in those files are
++    considered, not the ones imported into them.
++    """
++    if not generators_path or not os.path.isdir(generators_path):
++        return None
++    from conans.client.loader import load_python_file  # avoid import cycles at module load
++
++    for filename in sorted(os.listdir(generators_path)):
++        path = os.path.join(generators_path, filename)
++        if not filename.endswith(".py") or not os.path.isfile(path):
++            continue
++        try:
++            module, _ = load_python_file(path)
++        except Exception as e:
++            raise ConanException(f"Error loading custom generator file '{path}': {e}") from e
++        candidate = getattr(module, generator_name, None)
++        if inspect.isclass(candidate) and candidate.__module__ == module.__name__:
++            return candidate
++    return None
++
++
++def _get_generator_class(generator_name, generators_path=None):
+     # QbsToolchain is an alias for QbsProfile
+     if generator_name == "QbsToolchain":
+         generator_name = "QbsProfile"
+ 
+-    try:
+-        generator_class = _generators[generator_name]
+-        # This is identical to import ... form ... in terms of cacheing
+-    except KeyError as e:
++    if generator_name not in _generators:
++        # Not a built-in, try the custom global generators from the cache
++        custom_class = _load_custom_generator_class(generator_name, generators_path)
++        if custom_class is not None:
++            return custom_class
++        available = list(_generators)
++        custom_names = _custom_generator_names(generators_path)
++        available.extend(n for n in custom_names if n not in _generators)
+         raise ConanException(f"Invalid generator '{generator_name}'. "
+-                             f"Available types: {', '.join(_generators)}") from e
++                             f"Available types: {', '.join(available)}")
++
++    generator_module = _generators[generator_name]
+     try:
+-        return getattr(importlib.import_module(generator_class), generator_name)
++        return getattr(importlib.import_module(generator_module), generator_name)
+     except ImportError as e:
+         raise ConanException("Internal Conan error: "
+-                             f"Could not find module {generator_class}") from e
++                             f"Could not find module {generator_module}") from e
+     except AttributeError as e:
+         raise ConanException("Internal Conan error: "
+                              f"Could not find name {generator_name} "
+-                             f"inside module {generator_class}") from e
++                             f"inside module {generator_module}") from e
+ 
+ 
+-def write_generators(conanfile, hook_manager):
++def _custom_generator_names(generators_path):
++    """ Names of the classes defined in the custom global generators files, for messages
++    """
++    names = []
++    if not generators_path or not os.path.isdir(generators_path):
++        return names
++    from conans.client.loader import load_python_file
++    for filename in sorted(os.listdir(generators_path)):
++        path = os.path.join(generators_path, filename)
++        if not filename.endswith(".py") or not os.path.isfile(path):
++            continue
++        try:
++            module, _ = load_python_file(path)
++        except Exception:
++            continue
++        names.extend(name for name, value in vars(module).items()
++                     if inspect.isclass(value) and value.__module__ == module.__name__)
++    return names
++
++
++def write_generators(conanfile, hook_manager, cache=None):
+     new_gen_folder = conanfile.generators_folder
+     _receive_conf(conanfile)
+ 
+     hook_manager.execute("pre_generate", conanfile=conanfile)
+ 
++    generators_path = cache.generators_path if cache is not None else None
+     if conanfile.generators:
+         conanfile.output.highlight(f"Writing generators to {new_gen_folder}")
+     # generators check that they are not present in the generators field,
+@@ -60,7 +111,7 @@ def write_generators(conanfile, hook_manager):
+     conanfile.generators = []
+     try:
+         for generator_name in old_generators:
+-            generator_class = _get_generator_class(generator_name)
++            generator_class = _get_generator_class(generator_name, generators_path)
+             if generator_class:
+                 try:
+                     generator = generator_class(conanfile)
+diff --git a/conans/client/installer.py b/conans/client/installer.py
+index 2f0de5f..4217452 100644
+--- a/conans/client/installer.py
++++ b/conans/client/installer.py
+@@ -88,7 +88,7 @@ class _PackageBuilder(object):
+                 raise ConanException("%s\nError copying sources to build folder" % msg)
+ 
+     def _build(self, conanfile, pref):
+-        write_generators(conanfile, self._hook_manager)
++        write_generators(conanfile, self._hook_manager, self._cache)
+ 
+         try:
+             run_build_method(conanfile, self._hook_manager)
+@@ -351,7 +351,7 @@ class BinaryInstaller:
+         output = conanfile.output
+         output.info("Rewriting files of editable package "
+                     "'{}' at '{}'".format(conanfile.name, conanfile.generators_folder))
+-        write_generators(conanfile, self._hook_manager)
++        write_generators(conanfile, self._hook_manager, self._cache)
+ 
+         if node.binary == BINARY_EDITABLE_BUILD:
+             run_build_method(conanfile, self._hook_manager)

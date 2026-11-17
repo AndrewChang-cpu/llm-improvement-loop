@@ -1,0 +1,253 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 596bd99..ef77cd4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ ### Added
+ 
+ - SVG export functionality https://github.com/Textualize/rich/pull/2101
++- Added `Progress.read` and `rich.progress.read` to track progress while reading from a file
+ 
+ ### Fixed
+ 
+diff --git a/rich/progress.py b/rich/progress.py
+index e4abbdb..1708ec3 100644
+--- a/rich/progress.py
++++ b/rich/progress.py
+@@ -1,17 +1,21 @@
++import os
+ from abc import ABC, abstractmethod
+ from collections import deque
+ from collections.abc import Sized
+ from dataclasses import dataclass, field
+ from datetime import timedelta
+ from math import ceil
++from pathlib import Path
+ from threading import Event, RLock, Thread
+ from types import TracebackType
+ from typing import (
++    IO,
+     Any,
+     Callable,
+     Deque,
+     Dict,
+     Iterable,
++    Iterator,
+     List,
+     NamedTuple,
+     NewType,
+@@ -149,6 +153,174 @@ def track(
+         )
+ 
+ 
++def read(
++    file: Union[str, Path, IO[bytes]],
++    total: Optional[int] = None,
++    description: str = "Reading...",
++    auto_refresh: bool = True,
++    console: Optional[Console] = None,
++    transient: bool = False,
++    get_time: Optional[Callable[[], float]] = None,
++    refresh_per_second: float = 10,
++    style: StyleType = "bar.back",
++    complete_style: StyleType = "bar.complete",
++    finished_style: StyleType = "bar.finished",
++    pulse_style: StyleType = "bar.pulse",
++    disable: bool = False,
++) -> _Reader:
++    """Read a file (or file-like object) while displaying progress.
++
++    The returned object can be used as a context manager; closing it also stops the progress display.
++
++    Args:
++        file (Union[str, Path, IO[bytes]]): A path to a file, or a binary file-like object.
++        total (int, optional): Total number of bytes. Default is the file size for a path; required for file-like objects.
++        description (str, optional): Description of task show next to progress bar. Defaults to "Reading...".
++        auto_refresh (bool, optional): Automatic refresh. Defaults to True.
++        console (Console, optional): Console to write to. Default creates internal Console instance.
++        transient (bool, optional): Clear the progress on exit. Defaults to False.
++        get_time (Callable, optional): A callable that gets the current time, or None to use Console.get_time.
++        refresh_per_second (float): Number of times per second to refresh the progress information. Defaults to 10.
++        style (StyleType, optional): Style for the bar background. Defaults to "bar.back".
++        complete_style (StyleType, optional): Style for the completed bar. Defaults to "bar.complete".
++        finished_style (StyleType, optional): Style for a finished bar. Defaults to "bar.finished".
++        pulse_style (StyleType, optional): Style for pulsing bars. Defaults to "bar.pulse".
++        disable (bool, optional): Disable display of progress.
++    Returns:
++        _Reader: A file-like object that updates progress when read.
++    """
++    columns: List["ProgressColumn"] = (
++        [TextColumn("[progress.description]{task.description}")] if description else []
++    )
++    columns.extend(
++        (
++            BarColumn(
++                style=style,
++                complete_style=complete_style,
++                finished_style=finished_style,
++                pulse_style=pulse_style,
++            ),
++            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
++            TimeRemainingColumn(),
++        )
++    )
++    progress = Progress(
++        *columns,
++        auto_refresh=auto_refresh,
++        console=console,
++        transient=transient,
++        get_time=get_time,
++        refresh_per_second=refresh_per_second or 10,
++        disable=disable,
++    )
++    progress.start()
++    try:
++        reader = progress.read(file, total=total, description=description)
++    except BaseException:
++        progress.stop()
++        raise
++    reader._on_close = _chain_close(reader._on_close, progress.stop)
++    return reader
++
++
++def _chain_close(
++    first: Optional[Callable[[], None]], second: Callable[[], None]
++) -> Callable[[], None]:
++    """Combine two optional close callbacks into one."""
++
++    def _close() -> None:
++        if first is not None:
++            first()
++        second()
++
++    return _close
++
++
++class _Reader:
++    """A file-like wrapper that updates a progress task as data is read.
++
++    This class is private; use ``Progress.read`` or ``rich.progress.read`` to create one.
++    Any attribute not defined here is delegated to the wrapped file object.
++    """
++
++    def __init__(
++        self,
++        handle: IO[bytes],
++        progress: "Progress",
++        task_id: TaskID,
++        close_handle: bool = True,
++        on_close: Optional[Callable[[], None]] = None,
++    ) -> None:
++        self.handle = handle
++        self.progress = progress
++        self.task_id = task_id
++        self.close_handle = close_handle
++        self._on_close = on_close
++        self._closed = False
++
++    def __getattr__(self, name: str) -> Any:
++        return getattr(self.handle, name)
++
++    def __iter__(self) -> Iterator[bytes]:
++        return self
++
++    def __next__(self) -> bytes:
++        line = self.readline()
++        if not line:
++            raise StopIteration
++        return line
++
++    def __enter__(self) -> "_Reader":
++        return self
++
++    def __exit__(
++        self,
++        exc_type: Optional[Type[BaseException]],
++        exc_val: Optional[BaseException],
++        exc_tb: Optional[TracebackType],
++    ) -> None:
++        self.close()
++
++    @property
++    def closed(self) -> bool:
++        return self._closed or self.handle.closed
++
++    def read(self, size: Optional[int] = -1) -> bytes:
++        chunk = self.handle.read(size)
++        self.progress.advance(self.task_id, len(chunk))
++        return chunk
++
++    def readline(self, size: Optional[int] = -1) -> bytes:
++        line = self.handle.readline(size)
++        self.progress.advance(self.task_id, len(line))
++        return line
++
++    def readinto(self, buffer: Any) -> int:
++        count = self.handle.readinto(buffer)
++        if count:
++            self.progress.advance(self.task_id, count)
++        return count
++
++    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
++        position = self.handle.seek(offset, whence)
++        self.progress.update(self.task_id, completed=position)
++        return position
++
++    def tell(self) -> int:
++        return self.handle.tell()
++
++    def close(self) -> None:
++        if self._closed:
++            return
++        self._closed = True
++        try:
++            if self.close_handle:
++                self.handle.close()
++        finally:
++            if self._on_close is not None:
++                self._on_close()
++
++
+ class ProgressColumn(ABC):
+     """Base class for a widget to use in progress display."""
+ 
+@@ -794,6 +966,39 @@ class Progress(JupyterMixin):
+                 advance(task_id, 1)
+                 refresh()
+ 
++    def read(
++        self,
++        file: Union[str, Path, IO[bytes]],
++        total: Optional[int] = None,
++        description: str = "Reading...",
++    ) -> _Reader:
++        """Read a file (or file-like object), advancing a task by the number of bytes read.
++
++        Args:
++            file (Union[str, Path, IO[bytes]]): A path to a file, or a binary file-like object.
++            total (int, optional): Total number of bytes. Default is the file size for a path.
++                Must be specified for a file-like object.
++            description (str, optional): Description of task, if new task is created.
++
++        Returns:
++            _Reader: A file-like object that advances progress as it is read.
++        """
++        if isinstance(file, (str, Path)):
++            if total is None:
++                total = os.stat(file).st_size
++            handle: IO[bytes] = open(file, "rb")
++            close_handle = True
++        else:
++            if total is None:
++                raise ValueError(
++                    f"unable to get size of {file!r}, please specify 'total'"
++                )
++            handle = file
++            close_handle = False
++
++        task_id = self.add_task(description, total=total)
++        return _Reader(handle, self, task_id, close_handle=close_handle)
++
+     def start_task(self, task_id: TaskID) -> None:
+         """Start a task.
+ 

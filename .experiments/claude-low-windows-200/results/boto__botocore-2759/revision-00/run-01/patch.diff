@@ -1,0 +1,185 @@
+diff --git a/botocore/args.py b/botocore/args.py
+index 0da5bb7..e35ed99 100644
+--- a/botocore/args.py
++++ b/botocore/args.py
+@@ -236,6 +236,59 @@ class ClientArgsCreator:
+             'socket_options': self._compute_socket_options(scoped_config),
+         }
+ 
++    def compute_endpoint_resolver_builtin_defaults(
++        self, region_name, endpoint_url, client_config
++    ):
++        """Compute the default values of the endpoint ruleset builtins.
++
++        The returned dictionary is keyed by builtin parameter name (e.g.
++        ``AWS::Region``) and is intended to be consumed by the future
++        ``EndpointProvider``. Values are derived from the client creation
++        arguments, the client config, the S3 config and the config store.
++
++        :type region_name: str
++        :param region_name: The region the client is created for.
++
++        :type endpoint_url: str
++        :param endpoint_url: The custom endpoint URL, if any.
++
++        :type client_config: botocore.config.Config
++        :param client_config: The client config passed by the user, if any.
++
++        :rtype: dict
++        :return: Mapping of builtin parameter name to its value.
++        """
++        use_fips = False
++        use_dualstack = False
++        if client_config is not None:
++            use_fips = bool(client_config.use_fips_endpoint)
++            use_dualstack = bool(client_config.use_dualstack_endpoint)
++
++        s3_config = self.compute_s3_config(client_config) or {}
++        addressing_style = s3_config.get('addressing_style')
++        use_accelerate = s3_config.get('use_accelerate_endpoint', False)
++
++        use_arn_region = self._config_store.get_config_variable(
++            'use_arn_region'
++        )
++        if use_arn_region is None:
++            use_arn_region = True
++        else:
++            use_arn_region = botocore.utils.ensure_boolean(use_arn_region)
++
++        return {
++            'AWS::Region': region_name,
++            'AWS::UseFIPS': use_fips,
++            'AWS::UseDualStack': use_dualstack,
++            'SDK::Endpoint': endpoint_url,
++            'AWS::S3::Accelerate': botocore.utils.ensure_boolean(
++                use_accelerate
++            ),
++            'AWS::S3::ForcePathStyle': addressing_style == 'path',
++            'AWS::S3::UseArnRegion': use_arn_region,
++            'AWS::S3Control::UseArnRegion': use_arn_region,
++        }
++
+     def compute_s3_config(self, client_config):
+         s3_configuration = self._config_store.get_config_variable('s3')
+ 
+diff --git a/botocore/client.py b/botocore/client.py
+index 2bf07e8..38a0e10 100644
+--- a/botocore/client.py
++++ b/botocore/client.py
+@@ -460,14 +460,7 @@ class ClientCreator:
+         endpoint_bridge,
+         auth_token,
+     ):
+-        args_creator = ClientArgsCreator(
+-            self._event_emitter,
+-            self._user_agent,
+-            self._response_parser_factory,
+-            self._loader,
+-            self._exceptions_factory,
+-            config_store=self._config_store,
+-        )
++        args_creator = self._create_client_args_creator()
+         return args_creator.get_client_args(
+             service_model,
+             region_name,
+@@ -481,6 +474,28 @@ class ClientCreator:
+             auth_token,
+         )
+ 
++    def _create_client_args_creator(self):
++        return ClientArgsCreator(
++            self._event_emitter,
++            self._user_agent,
++            self._response_parser_factory,
++            self._loader,
++            self._exceptions_factory,
++            config_store=self._config_store,
++        )
++
++    def _get_endpoint_resolver_builtin_defaults(
++        self, region_name, endpoint_url, client_config
++    ):
++        # Glue between the client creation inputs and the endpoint ruleset
++        # builtins consumed by the EndpointProvider.
++        args_creator = self._create_client_args_creator()
++        return args_creator.compute_endpoint_resolver_builtin_defaults(
++            region_name=region_name,
++            endpoint_url=endpoint_url,
++            client_config=client_config,
++        )
++
+     def _create_methods(self, service_model):
+         op_dict = {}
+         for operation_name in service_model.operation_names:
+diff --git a/tests/unit/test_args.py b/tests/unit/test_args.py
+index b2a2320..3b5173e 100644
+--- a/tests/unit/test_args.py
++++ b/tests/unit/test_args.py
+@@ -459,3 +459,67 @@ class TestCreateClientArgs(unittest.TestCase):
+             client_config=Config(retries={'mode': 'standard'})
+         )['client_config']
+         self.assertEqual(config.retries['mode'], 'standard')
++
++    def test_builtin_defaults_without_client_config(self):
++        builtins = self.args_create.compute_endpoint_resolver_builtin_defaults(
++            region_name=self.region,
++            endpoint_url=None,
++            client_config=None,
++        )
++        self.assertEqual(
++            builtins,
++            {
++                'AWS::Region': self.region,
++                'AWS::UseFIPS': False,
++                'AWS::UseDualStack': False,
++                'SDK::Endpoint': None,
++                'AWS::S3::Accelerate': False,
++                'AWS::S3::ForcePathStyle': False,
++                'AWS::S3::UseArnRegion': True,
++                'AWS::S3Control::UseArnRegion': True,
++            },
++        )
++
++    def test_builtin_defaults_from_client_config(self):
++        builtins = self.args_create.compute_endpoint_resolver_builtin_defaults(
++            region_name=self.region,
++            endpoint_url=self.endpoint_url,
++            client_config=Config(
++                use_fips_endpoint=True,
++                use_dualstack_endpoint=True,
++                s3={
++                    'use_accelerate_endpoint': True,
++                    'addressing_style': 'path',
++                },
++            ),
++        )
++        self.assertTrue(builtins['AWS::UseFIPS'])
++        self.assertTrue(builtins['AWS::UseDualStack'])
++        self.assertEqual(builtins['SDK::Endpoint'], self.endpoint_url)
++        self.assertTrue(builtins['AWS::S3::Accelerate'])
++        self.assertTrue(builtins['AWS::S3::ForcePathStyle'])
++
++    def test_builtin_defaults_s3_config_from_config_store(self):
++        self.config_store.set_config_variable(
++            's3', {'addressing_style': 'virtual'}
++        )
++        self.config_store.set_config_variable('use_arn_region', False)
++        builtins = self.args_create.compute_endpoint_resolver_builtin_defaults(
++            region_name=self.region,
++            endpoint_url=None,
++            client_config=None,
++        )
++        self.assertFalse(builtins['AWS::S3::ForcePathStyle'])
++        self.assertFalse(builtins['AWS::S3::UseArnRegion'])
++        self.assertFalse(builtins['AWS::S3Control::UseArnRegion'])
++
++    def test_builtin_defaults_client_config_s3_beats_config_store(self):
++        self.config_store.set_config_variable(
++            's3', {'addressing_style': 'path'}
++        )
++        builtins = self.args_create.compute_endpoint_resolver_builtin_defaults(
++            region_name=self.region,
++            endpoint_url=None,
++            client_config=Config(s3={'addressing_style': 'virtual'}),
++        )
++        self.assertFalse(builtins['AWS::S3::ForcePathStyle'])

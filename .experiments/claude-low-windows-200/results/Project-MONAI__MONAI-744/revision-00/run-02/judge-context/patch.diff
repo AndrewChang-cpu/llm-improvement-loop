@@ -1,0 +1,281 @@
+diff --git a/docs/source/losses.rst b/docs/source/losses.rst
+index ce2e4a8..3f87f17 100644
+--- a/docs/source/losses.rst
++++ b/docs/source/losses.rst
+@@ -35,6 +35,14 @@ Segmentation Losses
+ .. autoclass:: generalized_dice
+     :members:
+ 
++`GeneralizedWassersteinDiceLoss`
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++.. autoclass:: GeneralizedWassersteinDiceLoss
++    :members:
++
++.. autoclass:: generalized_wasserstein_dice
++    :members:
++
+ `FocalLoss`
+ ~~~~~~~~~~~
+ .. autoclass:: FocalLoss
+diff --git a/monai/losses/__init__.py b/monai/losses/__init__.py
+index c9ab109..7c3ca0c 100644
+--- a/monai/losses/__init__.py
++++ b/monai/losses/__init__.py
+@@ -9,6 +9,15 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-from .dice import Dice, DiceLoss, GeneralizedDiceLoss, MaskedDiceLoss, dice, generalized_dice
++from .dice import (
++    Dice,
++    DiceLoss,
++    GeneralizedDiceLoss,
++    GeneralizedWassersteinDiceLoss,
++    MaskedDiceLoss,
++    dice,
++    generalized_dice,
++    generalized_wasserstein_dice,
++)
+ from .focal_loss import FocalLoss
+ from .tversky import TverskyLoss
+diff --git a/monai/losses/dice.py b/monai/losses/dice.py
+index 86823f2..eda8fcc 100644
+--- a/monai/losses/dice.py
++++ b/monai/losses/dice.py
+@@ -10,8 +10,9 @@
+ # limitations under the License.
+ 
+ import warnings
+-from typing import Callable, Optional, Union
++from typing import Callable, Optional, Sequence, Union
+ 
++import numpy as np
+ import torch
+ from torch.nn.modules.loss import _Loss
+ 
+@@ -297,5 +298,148 @@ class GeneralizedDiceLoss(_Loss):
+         return f
+ 
+ 
++class GeneralizedWassersteinDiceLoss(_Loss):
++    """
++    Compute the generalized Wasserstein Dice loss defined in:
++
++        Fidon, L. et. al. (2017) Generalised Wasserstein Dice Score for Imbalanced Multi-class
++        Segmentation using Holistic Convolutional Networks. MICCAI 2017 (BrainLes workshop).
++
++    The loss uses a class distance matrix `dist_matrix` (C x C, zero on the diagonal, symmetric) to penalise
++    confusions between classes according to how far apart they are. For a prediction `p` (probabilities) and
++    one-hot ground truth `g`, the per-voxel Wasserstein cost of a class `l` is
++    ``W_l(x) = sum_k M[k, l] * p_k(x)``, and the per-class "true positive" mass is
++    ``tp_l = sum_x g_l(x) * (1 - W_l(x))``. The loss is then
++
++        1 - (2 * sum_l w_l * tp_l + smooth) / (sum_l w_l * (sum_x g_l(x) + sum_x p_l(x)) + smooth)
++
++    where ``w_l`` is a per-class weight (by default ``1 / (sum_x g_l(x))^2``, as in the generalized Dice loss,
++    or the user supplied `weight`). With ``dist_matrix = 1 - I`` the loss reduces to the generalized Dice loss
++    with square weights.
++
++    """
++
++    def __init__(
++        self,
++        dist_matrix: Union[torch.Tensor, "np.ndarray", Sequence[Sequence[float]]],
++        weight: Optional[Union[torch.Tensor, Sequence[float]]] = None,
++        to_onehot_y: bool = False,
++        sigmoid: bool = False,
++        softmax: bool = False,
++        reduction: Union[LossReduction, str] = LossReduction.MEAN,
++    ) -> None:
++        """
++        Args:
++            dist_matrix: 2D tensor (or array) of shape (C, C) with the distance between each pair of classes.
++                It is expected to be symmetric with zeros on the diagonal; values are typically normalised to [0, 1].
++            weight: optional 1D tensor (or sequence) of length C giving a fixed weight per class. If None, the
++                weights are computed from the ground truth as ``1 / (sum_x g_l(x))^2``.
++            to_onehot_y: whether to convert `y` into the one-hot format. Defaults to False.
++            sigmoid: If True, apply a sigmoid function to the prediction.
++            softmax: If True, apply a softmax function to the prediction.
++            reduction: {``"none"``, ``"mean"``, ``"sum"``}
++                Specifies the reduction to apply to the output. Defaults to ``"mean"``.
++
++                - ``"none"``: no reduction will be applied.
++                - ``"mean"``: the sum of the output will be divided by the number of elements in the output.
++                - ``"sum"``: the output will be summed.
++
++        Raises:
++            ValueError: reduction={reduction} is invalid. Valid options are: none, mean or sum.
++            ValueError: sigmoid=True and softmax=True are not compatible.
++            ValueError: dist_matrix must be a square 2D matrix.
++
++        """
++        super().__init__(reduction=LossReduction(reduction).value)
++
++        if sigmoid and softmax:
++            raise ValueError("sigmoid=True and softmax=True are not compatible.")
++
++        m = torch.as_tensor(np.asarray(dist_matrix) if not torch.is_tensor(dist_matrix) else dist_matrix)
++        if m.dim() != 2 or m.shape[0] != m.shape[1]:
++            raise ValueError(f"dist_matrix must be a square 2D matrix, got shape {tuple(m.shape)}.")
++        self.dist_matrix = m.float()
++
++        self.weight = None
++        if weight is not None:
++            w = torch.as_tensor(np.asarray(weight) if not torch.is_tensor(weight) else weight).float()
++            if w.dim() != 1 or w.shape[0] != m.shape[0]:
++                raise ValueError(f"weight must be a 1D vector of length {m.shape[0]}, got shape {tuple(w.shape)}.")
++            self.weight = w
++
++        self.to_onehot_y = to_onehot_y
++        self.sigmoid = sigmoid
++        self.softmax = softmax
++
++    def forward(self, input: torch.Tensor, target: torch.Tensor, smooth: float = 1e-5) -> torch.Tensor:
++        """
++        Args:
++            input: the shape should be BNH[WD].
++            target: the shape should be BNH[WD] (one-hot), or B1H[WD] if `to_onehot_y=True`.
++            smooth: a small constant to avoid nan.
++
++        Raises:
++            ValueError: reduction={self.reduction} is invalid.
++            ValueError: dist_matrix size does not match the number of prediction channels.
++
++        """
++        if self.sigmoid:
++            input = torch.sigmoid(input)
++        n_classes = input.shape[1]
++        if self.softmax:
++            if n_classes == 1:
++                warnings.warn("single channel prediction, `softmax=True` ignored.")
++            else:
++                input = torch.softmax(input, 1)
++        if self.to_onehot_y:
++            if n_classes == 1:
++                warnings.warn("single channel prediction, `to_onehot_y=True` ignored.")
++            else:
++                target = one_hot(target, num_classes=n_classes)
++
++        assert (
++            target.shape == input.shape
++        ), f"ground truth has differing shape ({target.shape}) from input ({input.shape})"
++        if self.dist_matrix.shape[0] != n_classes:
++            raise ValueError(
++                f"dist_matrix has size {self.dist_matrix.shape[0]} but input has {n_classes} channels."
++            )
++
++        batch = input.shape[0]
++        # flatten spatial dimensions: (B, C, N)
++        p = input.reshape(batch, n_classes, -1)
++        g = target.reshape(batch, n_classes, -1).to(p.dtype)
++        m = self.dist_matrix.to(device=p.device, dtype=p.dtype)
++
++        # W[b, l, n] = sum_k M[k, l] * p[b, k, n]: Wasserstein cost of predicting each voxel as class l
++        w_cost = torch.einsum("bkn,kl->bln", p, m)
++        # per-class true positive mass, distance weighted: (B, C)
++        tp = torch.sum(g * (1.0 - w_cost), dim=-1)
++        ground_o = torch.sum(g, dim=-1)
++        pred_o = torch.sum(p, dim=-1)
++
++        if self.weight is not None:
++            w = self.weight.to(device=p.device, dtype=p.dtype).expand(batch, n_classes)
++        else:
++            # square inverse of class volume, clamped to avoid division by zero for absent classes
++            w = torch.reciprocal((ground_o * ground_o).clamp_min(smooth))
++
++        numerator = 2.0 * torch.sum(w * tp, dim=1) + smooth
++        denominator = torch.sum(w * (ground_o + pred_o), dim=1) + smooth
++        f = 1.0 - numerator / denominator  # per-sample loss, shape (B,)
++
++        if self.reduction == LossReduction.MEAN.value:
++            f = torch.mean(f)
++        elif self.reduction == LossReduction.SUM.value:
++            f = torch.sum(f)
++        elif self.reduction == LossReduction.NONE.value:
++            pass  # returns [B] losses
++        else:
++            raise ValueError(f"reduction={self.reduction} is invalid.")
++
++        return f
++
++
+ dice = Dice = DiceLoss
+ generalized_dice = GeneralizedDiceLoss
++generalized_wasserstein_dice = GeneralizedWassersteinDiceLoss
+diff --git a/tests/test_generalized_wasserstein_dice_loss.py b/tests/test_generalized_wasserstein_dice_loss.py
+new file mode 100644
+index 0000000..e21bc8f
+--- /dev/null
++++ b/tests/test_generalized_wasserstein_dice_loss.py
+@@ -0,0 +1,71 @@
++# Copyright 2020 MONAI Consortium
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#     http://www.apache.org/licenses/LICENSE-2.0
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import unittest
++
++import numpy as np
++import torch
++
++from monai.losses import GeneralizedDiceLoss, GeneralizedWassersteinDiceLoss
++
++DIST_MATRIX = [[0.0, 1.0, 0.5], [1.0, 0.0, 1.0], [0.5, 1.0, 0.0]]
++
++
++class TestGeneralizedWassersteinDiceLoss(unittest.TestCase):
++    def test_perfect_prediction_is_zero(self):
++        labels = torch.tensor([[0, 0, 1, 2], [2, 1, 1, 0]])
++        # one-hot ground truth; prediction equal to ground truth
++        target = torch.nn.functional.one_hot(labels, 3).permute(0, 2, 1).float()
++        loss = GeneralizedWassersteinDiceLoss(dist_matrix=DIST_MATRIX)(target.clone(), target)
++        np.testing.assert_allclose(loss.detach().cpu().numpy(), 0.0, atol=1e-4)
++
++    def test_matches_generalized_dice_with_unit_distances(self):
++        # with dist_matrix = 1 - I the loss reduces to generalized dice with square weights
++        torch.manual_seed(0)
++        pred = torch.softmax(torch.rand((2, 3, 5, 5)), dim=1)
++        labels = torch.randint(0, 3, (2, 5, 5))
++        target = torch.nn.functional.one_hot(labels, 3).permute(0, 3, 1, 2).float()
++        dist = 1.0 - np.eye(3)
++        wass = GeneralizedWassersteinDiceLoss(dist_matrix=dist, reduction="none")(pred, target)
++        gdl = GeneralizedDiceLoss(reduction="none")(pred, target)
++        self.assertEqual(wass.shape, (2,))
++        np.testing.assert_allclose(
++            wass.mean().detach().cpu().numpy(), gdl.detach().cpu().numpy(), rtol=1e-4
++        )
++
++    def test_reduction_shapes(self):
++        pred = torch.softmax(torch.rand((2, 3, 4)), dim=1)
++        target = torch.nn.functional.one_hot(torch.randint(0, 3, (2, 4)), 3).permute(0, 2, 1).float()
++        none = GeneralizedWassersteinDiceLoss(DIST_MATRIX, reduction="none")(pred, target)
++        mean = GeneralizedWassersteinDiceLoss(DIST_MATRIX, reduction="mean")(pred, target)
++        total = GeneralizedWassersteinDiceLoss(DIST_MATRIX, reduction="sum")(pred, target)
++        self.assertEqual(none.shape, (2,))
++        np.testing.assert_allclose(mean.item(), none.mean().item(), rtol=1e-5)
++        np.testing.assert_allclose(total.item(), none.sum().item(), rtol=1e-5)
++
++    def test_ill_opts(self):
++        with self.assertRaisesRegex(ValueError, ""):
++            GeneralizedWassersteinDiceLoss(DIST_MATRIX, sigmoid=True, softmax=True)
++        with self.assertRaisesRegex(ValueError, ""):
++            GeneralizedWassersteinDiceLoss(DIST_MATRIX, reduction="unknown")
++        with self.assertRaisesRegex(ValueError, ""):
++            GeneralizedWassersteinDiceLoss(torch.ones((2, 3)))
++        with self.assertRaisesRegex(ValueError, ""):
++            GeneralizedWassersteinDiceLoss(DIST_MATRIX)(torch.ones((1, 2, 3)), torch.ones((1, 2, 3)))
++
++    def test_ill_shape(self):
++        loss = GeneralizedWassersteinDiceLoss(DIST_MATRIX)
++        with self.assertRaisesRegex(AssertionError, ""):
++            loss.forward(torch.ones((1, 3, 3)), torch.ones((4, 5, 6)))
++
++
++if __name__ == "__main__":
++    unittest.main()

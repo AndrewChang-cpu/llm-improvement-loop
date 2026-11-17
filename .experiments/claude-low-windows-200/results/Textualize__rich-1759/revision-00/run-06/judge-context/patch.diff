@@ -1,0 +1,293 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 596bd99..ef77cd4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ ### Added
+ 
+ - SVG export functionality https://github.com/Textualize/rich/pull/2101
++- Added `Progress.read` and `rich.progress.read` to track progress while reading from a file
+ 
+ ### Fixed
+ 
+diff --git a/rich/progress.py b/rich/progress.py
+index e4abbdb..c289daa 100644
+--- a/rich/progress.py
++++ b/rich/progress.py
+@@ -1,3 +1,5 @@
++import io
++import os
+ from abc import ABC, abstractmethod
+ from collections import deque
+ from collections.abc import Sized
+@@ -17,6 +19,7 @@ from typing import (
+     NewType,
+     Optional,
+     Sequence,
++    BinaryIO,
+     Tuple,
+     Type,
+     TypeVar,
+@@ -81,6 +84,111 @@ class _TrackThread(Thread):
+         self.join()
+ 
+ 
++class _Reader(io.RawIOBase, BinaryIO):  # type: ignore[misc]
++    """A reader that updates a progress task each time data is read from it.
++
++    This class is private; use `Progress.read` or `rich.progress.read` to obtain one.
++    """
++
++    def __init__(
++        self,
++        handle: BinaryIO,
++        progress: "Progress",
++        task_id: "TaskID",
++        close_handle: bool = False,
++    ) -> None:
++        self.handle = handle
++        self.progress = progress
++        self.task_id = task_id
++        self.close_handle = close_handle
++        super().__init__()
++
++    def __enter__(self) -> "_Reader":
++        return self
++
++    def __exit__(
++        self,
++        exc_type: Optional[Type[BaseException]],
++        exc_val: Optional[BaseException],
++        exc_tb: Optional[TracebackType],
++    ) -> None:
++        self.close()
++
++    def __iter__(self) -> "_Reader":
++        return self
++
++    def __next__(self) -> bytes:
++        line = self.readline()
++        if not line:
++            raise StopIteration
++        return line
++
++    def readable(self) -> bool:
++        return True
++
++    def seekable(self) -> bool:
++        return self.handle.seekable()
++
++    def writable(self) -> bool:
++        return False
++
++    def fileno(self) -> int:
++        return self.handle.fileno()
++
++    def isatty(self) -> bool:
++        return self.handle.isatty()
++
++    @property
++    def closed(self) -> bool:  # type: ignore[override]
++        return self.handle.closed
++
++    def close(self) -> None:
++        if self.close_handle:
++            self.handle.close()
++
++    def read(self, size: Optional[int] = -1) -> bytes:  # type: ignore[override]
++        block = self.handle.read(size)
++        self.progress.advance(self.task_id, len(block))
++        return block
++
++    def read1(self, size: int = -1) -> bytes:
++        block = self.handle.read1(size)  # type: ignore[attr-defined]
++        self.progress.advance(self.task_id, len(block))
++        return block
++
++    def readinto(self, buffer: Any) -> int:  # type: ignore[override]
++        count = self.handle.readinto(buffer)  # type: ignore[attr-defined]
++        self.progress.advance(self.task_id, count)
++        return count
++
++    def readline(self, size: Optional[int] = -1) -> bytes:  # type: ignore[override]
++        line = self.handle.readline(size)
++        self.progress.advance(self.task_id, len(line))
++        return line
++
++    def readlines(self, hint: int = -1) -> List[bytes]:  # type: ignore[override]
++        lines = self.handle.readlines(hint)
++        self.progress.advance(self.task_id, sum(len(line) for line in lines))
++        return lines
++
++    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
++        position = self.handle.seek(offset, whence)
++        self.progress.update(self.task_id, completed=position)
++        return position
++
++    def tell(self) -> int:
++        return self.handle.tell()
++
++    def truncate(self, size: Optional[int] = None) -> int:
++        raise io.UnsupportedOperation("truncate")
++
++    def write(self, data: Any) -> int:  # type: ignore[override]
++        raise io.UnsupportedOperation("write")
++
++    def flush(self) -> None:
++        pass
++
++
+ def track(
+     sequence: Union[Sequence[ProgressType], Iterable[ProgressType]],
+     description: str = "Working...",
+@@ -149,6 +257,106 @@ def track(
+         )
+ 
+ 
++def read(
++    file: Union[str, BinaryIO],
++    total: Optional[int] = None,
++    description: str = "Reading...",
++    auto_refresh: bool = True,
++    console: Optional[Console] = None,
++    transient: bool = False,
++    get_time: Optional[Callable[[], float]] = None,
++    refresh_per_second: float = 10,
++    style: StyleType = "bar.back",
++    complete_style: StyleType = "bar.complete",
++    finished_style: StyleType = "bar.finished",
++    pulse_style: StyleType = "bar.pulse",
++    disable: bool = False,
++) -> BinaryIO:
++    """Read a binary file or path while displaying progress.
++
++    Args:
++        file (Union[str, BinaryIO]): A path, or a binary file-like object to read from.
++        total (int, optional): Total number of bytes to read. Required when a file-like object
++            is given. When a path is given, defaults to the size of the file.
++        description (str, optional): Description of task show next to progress bar. Defaults to "Reading...".
++        auto_refresh (bool, optional): Automatic refresh, disable to force a refresh after each read. Default is True.
++        console (Console, optional): Console to write to. Default creates internal Console instance.
++        transient (bool, optional): Clear the progress on exit. Defaults to False.
++        get_time (Callable, optional): A callable that gets the current time, or None to use Console.get_time.
++        refresh_per_second (float): Number of times per second to refresh the progress information. Defaults to 10.
++        style (StyleType, optional): Style for the bar background. Defaults to "bar.back".
++        complete_style (StyleType, optional): Style for the completed bar. Defaults to "bar.complete".
++        finished_style (StyleType, optional): Style for a finished bar. Defaults to "bar.done".
++        pulse_style (StyleType, optional): Style for pulsing bars. Defaults to "bar.pulse".
++        disable (bool, optional): Disable display of progress.
++
++    Returns:
++        BinaryIO: A file-like object that advances the progress as it is read.
++    """
++    columns: List["ProgressColumn"] = (
++        [TextColumn("[progress.description]{task.description}")] if description else []
++    )
++    columns.extend(
++        (
++            BarColumn(
++                style=style,
++                complete_style=complete_style,
++                finished_style=finished_style,
++                pulse_style=pulse_style,
++            ),
++            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
++            TimeRemainingColumn(),
++        )
++    )
++    progress = Progress(
++        *columns,
++        auto_refresh=auto_refresh,
++        console=console,
++        transient=transient,
++        get_time=get_time,
++        refresh_per_second=refresh_per_second or 10,
++        disable=disable,
++    )
++    progress.start()
++    try:
++        reader = progress.read(file, total=total, description=description)
++    except Exception:
++        progress.stop()
++        raise
++    return _ProgressStopReader(reader, progress)
++
++
++class _ProgressStopReader:
++    """Wraps a reader created by `read` and stops its progress when closed."""
++
++    def __init__(self, reader: BinaryIO, progress: "Progress") -> None:
++        self._reader = reader
++        self._progress = progress
++
++    def __enter__(self) -> BinaryIO:
++        return self
++
++    def __exit__(
++        self,
++        exc_type: Optional[Type[BaseException]],
++        exc_val: Optional[BaseException],
++        exc_tb: Optional[TracebackType],
++    ) -> None:
++        self.close()
++
++    def __getattr__(self, name: str) -> Any:
++        return getattr(self._reader, name)
++
++    def __iter__(self) -> Iterable[bytes]:  # type: ignore[override]
++        return iter(self._reader)
++
++    def close(self) -> None:
++        try:
++            self._reader.close()
++        finally:
++            self._progress.stop()
++
++
+ class ProgressColumn(ABC):
+     """Base class for a widget to use in progress display."""
+ 
+@@ -794,6 +1002,43 @@ class Progress(JupyterMixin):
+                 advance(task_id, 1)
+                 refresh()
+ 
++    def read(
++        self,
++        file: Union[str, BinaryIO],
++        total: Optional[int] = None,
++        task_id: Optional[TaskID] = None,
++        description: str = "Reading...",
++    ) -> BinaryIO:
++        """Track progress while reading from a binary file or path.
++
++        Args:
++            file (Union[str, BinaryIO]): A path, or a binary file-like object to read from.
++            total (int, optional): Total number of bytes to read. Required when a file-like object
++                is given. When a path is given, defaults to the size of the file.
++            task_id (TaskID, optional): Task to track. Default is new task.
++            description (str, optional): Description of task, if new task is created.
++
++        Returns:
++            BinaryIO: A file-like object that advances the progress as it is read.
++        """
++        close_handle = False
++        if isinstance(file, str):
++            if total is None:
++                total = os.stat(file).st_size
++            handle: BinaryIO = open(file, "rb")
++            close_handle = True
++        else:
++            handle = file
++            if total is None:
++                raise ValueError("unable to get size of file, please specify 'total'")
++
++        if task_id is None:
++            task_id = self.add_task(description, total=total)
++        else:
++            self.update(task_id, total=total)
++
++        return _Reader(handle, self, task_id, close_handle=close_handle)
++
+     def start_task(self, task_id: TaskID) -> None:
+         """Start a task.
+ 

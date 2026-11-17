@@ -1,0 +1,270 @@
+diff --git a/src/textual/app.py b/src/textual/app.py
+index b207bbd..9fa36fd 100644
+--- a/src/textual/app.py
++++ b/src/textual/app.py
+@@ -12,12 +12,14 @@ import warnings
+ from asyncio import Task
+ from contextlib import asynccontextmanager, redirect_stderr, redirect_stdout
+ from datetime import datetime
++from functools import partial
+ from pathlib import Path, PurePath
+ from queue import Queue
+ from time import perf_counter
+ from typing import (
+     TYPE_CHECKING,
+     Any,
++    Awaitable,
+     Callable,
+     Generic,
+     Iterable,
+@@ -130,6 +132,7 @@ class CssPathError(Exception):
+ 
+ 
+ ReturnType = TypeVar("ReturnType")
++CallThreadReturnType = TypeVar("CallThreadReturnType")
+ 
+ 
+ class _NullFile:
+@@ -356,6 +359,9 @@ class App(Generic[ReturnType], DOMNode):
+         self._return_value: ReturnType | None = None
+         self._exit = False
+ 
++        self._loop: asyncio.AbstractEventLoop | None = None
++        self._thread_id: int = 0
++
+         self.css_monitor = (
+             FileMonitor(self.css_path, self._on_css_change)
+             if ((watch_css or self.debug) and self.css_path)
+@@ -459,6 +465,47 @@ class App(Generic[ReturnType], DOMNode):
+         """Set this app to be the currently active app."""
+         active_app.set(self)
+ 
++    def call_from_thread(
++        self,
++        callback: Callable[..., Union[Awaitable[CallThreadReturnType], CallThreadReturnType]],
++        *args: Any,
++        **kwargs: Any,
++    ) -> CallThreadReturnType:
++        """Run a callable from another thread, and return the result.
++
++        Textual objects are not thread-safe. This method ensures the callable runs
++        in the correct context (with the app as the active app), and blocks until
++        the callable returns (or raises).
++
++        Args:
++            callback (Callable[..., Union[Awaitable[CallThreadReturnType], CallThreadReturnType]]):
++                A callable to run in the app's thread. It may return a value or an awaitable.
++                All supplied positional and keyword arguments are forwarded to it unchanged.
++            *args: Positional arguments to forward to the callable.
++            **kwargs: Keyword arguments to forward to the callable.
++
++        Raises:
++            RuntimeError: If the app is not running (including before it starts and after it has stopped).
++            RuntimeError: If called from the app's own thread.
++
++        Returns:
++            CallThreadReturnType: The result of the callable.
++        """
++        if self._loop is None:
++            raise RuntimeError("App is not running")
++        if threading.get_ident() == self._thread_id:
++            raise RuntimeError(
++                "The `call_from_thread` method must run in a different thread from the app"
++            )
++
++        async def run_callback() -> CallThreadReturnType:
++            """Run the callable in the app context."""
++            self._set_active()
++            return await invoke(partial(callback, *args, **kwargs))
++
++        future = asyncio.run_coroutine_threadsafe(run_callback(), self._loop)
++        return future.result()
++
+     def compose(self) -> ComposeResult:
+         """Yield child widgets for a container."""
+         yield from ()
+@@ -874,11 +921,17 @@ class App(Generic[ReturnType], DOMNode):
+ 
+         async def run_app() -> None:
+             """Run the app."""
+-            await self.run_async(
+-                headless=headless,
+-                size=size,
+-                auto_pilot=auto_pilot,
+-            )
++            self._loop = asyncio.get_running_loop()
++            self._thread_id = threading.get_ident()
++            try:
++                await self.run_async(
++                    headless=headless,
++                    size=size,
++                    auto_pilot=auto_pilot,
++                )
++            finally:
++                self._loop = None
++                self._thread_id = 0
+ 
+         if _ASYNCIO_GET_EVENT_LOOP_IS_DEPRECATED:
+             # N.B. This doesn't work with Python<3.10, as we end up with 2 event loops:
+diff --git a/tests/test_call_from_thread.py b/tests/test_call_from_thread.py
+new file mode 100644
+index 0000000..1b26a1b
+--- /dev/null
++++ b/tests/test_call_from_thread.py
+@@ -0,0 +1,156 @@
++from __future__ import annotations
++
++import threading
++from typing import Any, Callable
++
++import pytest
++
++from textual import events
++from textual.app import App, ComposeResult
++from textual.widgets import TextLog
++
++JOIN_TIMEOUT = 5
++
++
++class ThreadApp(App[int]):
++    """An app that starts a daemon worker thread once it is mounted."""
++
++    def __init__(self, worker: Callable[[ThreadApp], None]) -> None:
++        super().__init__()
++        self.worker = worker
++        self.outcome: dict[str, Any] = {}
++        self.worker_thread: threading.Thread | None = None
++
++    def compose(self) -> ComposeResult:
++        yield TextLog()
++
++    def on_mount(self, event: events.Mount) -> None:
++        self.worker_thread = threading.Thread(
++            target=self.worker, args=(self,), daemon=True
++        )
++        self.worker_thread.start()
++
++
++def run_thread_app(worker: Callable[[ThreadApp], None]) -> tuple[ThreadApp, Any]:
++    """Run a ThreadApp headless, join its worker thread, and return the app and run result."""
++    app = ThreadApp(worker)
++    result = app.run(headless=True)
++    assert app.worker_thread is not None
++    app.worker_thread.join(JOIN_TIMEOUT)
++    assert not app.worker_thread.is_alive()
++    return app, result
++
++
++def test_call_from_thread_not_running_before_run_raises():
++    app = App()
++    with pytest.raises(RuntimeError, match="App is not running"):
++        app.call_from_thread(lambda: None)
++
++
++def test_call_from_thread_after_run_returns_raises_without_blocking():
++    def worker(app: ThreadApp) -> None:
++        app.call_from_thread(app.exit, 3)
++
++    app, result = run_thread_app(worker)
++    assert result == 3
++
++    with pytest.raises(RuntimeError, match="App is not running"):
++        app.call_from_thread(lambda: None)
++
++
++def test_call_from_thread_same_thread_raises_runtime_error():
++    class SameThreadApp(App[None]):
++        def on_mount(self, event: events.Mount) -> None:
++            try:
++                self.call_from_thread(lambda: None)
++            except RuntimeError as error:
++                self.caught_message = str(error)
++            self.exit()
++
++    app = SameThreadApp()
++    app.run(headless=True)
++    assert app.caught_message == (
++        "The `call_from_thread` method must run in a different thread from the app"
++    )
++
++
++def test_call_from_thread_callable_writes_to_widget():
++    def worker(app: ThreadApp) -> None:
++        def write_to_log() -> None:
++            app.query_one(TextLog).write("hello from thread")
++
++        app.call_from_thread(write_to_log)
++        app.call_from_thread(app.exit, 0)
++
++    app, result = run_thread_app(worker)
++    assert result == 0
++
++
++def test_call_from_thread_returns_result_of_callable():
++    def worker(app: ThreadApp) -> None:
++        app.outcome["value"] = app.call_from_thread(lambda: 17)
++        app.call_from_thread(app.exit, 0)
++
++    app, result = run_thread_app(worker)
++    assert app.outcome["value"] == 17
++
++
++def test_call_from_thread_awaits_awaitable_result():
++    async def coroutine_callable() -> str:
++        return "awaited value"
++
++    def worker(app: ThreadApp) -> None:
++        app.outcome["value"] = app.call_from_thread(coroutine_callable)
++        app.call_from_thread(app.exit, 0)
++
++    app, result = run_thread_app(worker)
++    assert app.outcome["value"] == "awaited value"
++
++
++def test_call_from_thread_reraises_timeout_error_with_same_message_and_args():
++    def raise_timeout() -> None:
++        raise TimeoutError("operation timed out", 5)
++
++    def worker(app: ThreadApp) -> None:
++        try:
++            app.call_from_thread(raise_timeout)
++        except Exception as error:
++            app.outcome["message"] = str(error)
++            app.outcome["args"] = error.args
++        app.call_from_thread(app.exit, 0)
++
++    app, result = run_thread_app(worker)
++    assert app.outcome["message"] == str(TimeoutError("operation timed out", 5))
++    assert app.outcome["args"] == ("operation timed out", 5)
++
++
++def test_call_from_thread_forwards_all_positional_args_to_variadic_callable():
++    def collect(*values: Any, **named: Any) -> tuple[tuple[Any, ...], dict[str, Any]]:
++        return values, named
++
++    def worker(app: ThreadApp) -> None:
++        app.outcome["value"] = app.call_from_thread(collect, 1, 2, 3)
++        app.call_from_thread(app.exit, 0)
++
++    app, result = run_thread_app(worker)
++    assert app.outcome["value"] == ((1, 2, 3), {})
++
++
++def test_call_from_thread_forwards_keyword_args_to_named_parameters():
++    def combine(first: int, second: int) -> int:
++        return first * 10 + second
++
++    def worker(app: ThreadApp) -> None:
++        app.outcome["value"] = app.call_from_thread(combine, second=4, first=2)
++        app.call_from_thread(app.exit, 0)
++
++    app, result = run_thread_app(worker)
++    assert app.outcome["value"] == 24
++
++
++def test_call_from_thread_exit_from_worker_returns_exit_value():
++    def worker(app: ThreadApp) -> None:
++        app.call_from_thread(app.exit, 42)
++
++    app, result = run_thread_app(worker)
++    assert result == 42
